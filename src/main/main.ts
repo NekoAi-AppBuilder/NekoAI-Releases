@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell, webFrameMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell, WebContentsView, webFrameMain } from "electron";
 import path from "node:path";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -12,6 +12,7 @@ import { supabaseManager } from "./supabase/supabase-manager";
 import { parseSupabaseError } from "./supabase/supabase-cli";
 import { SupabaseCreateProjectPayload } from "./supabase/supabase-types";
 import { vercelManager, getSupabaseEnvironmentNames } from "./vercel/vercel-manager";
+import { isValidVercelProjectName } from "./vercel/vercel-types";
 import { licenseManager } from "./license/license-manager";
 import { updaterManager } from "./updater";
 
@@ -230,7 +231,78 @@ function scheduleAgentRetry(sessionId: string, rawError: any) {
 const GITHUB_CLIENT_ID = "Iv23liMdHRjxBRF0WoHo";
 const GITHUB_APP_SLUG = "nekoai-built-for-creators";
 const githubAuthFile = () => path.join(app.getPath("userData"), "github-auth.json");
-let githubPollPromise: Promise<void> | null = null;
+
+// GitHub Device Flow lifecycle state
+interface GithubAuthState {
+  attemptId: string | null;
+  abortController: AbortController | null;
+  pollPromise: Promise<void> | null;
+  activeTimeout: NodeJS.Timeout | null;
+  isStarting: boolean;
+}
+
+const githubAuthState: GithubAuthState = {
+  attemptId: null,
+  abortController: null,
+  pollPromise: null,
+  activeTimeout: null,
+  isStarting: false,
+};
+
+function cancelGithubAuthorization(reason: string = "unspecified"): void {
+  console.log(`[GitHub OAuth] Cleanup started (reason: ${reason})`);
+  console.log("[GitHub OAuth] Authorization cancelled");
+
+  if (githubAuthState.activeTimeout) {
+    try {
+      clearTimeout(githubAuthState.activeTimeout);
+    } catch {}
+    githubAuthState.activeTimeout = null;
+  }
+
+  if (githubAuthState.abortController) {
+    try {
+      console.log("[GitHub OAuth] Polling aborted");
+      githubAuthState.abortController.abort();
+    } catch {}
+    githubAuthState.abortController = null;
+  }
+
+  githubAuthState.attemptId = null;
+  githubAuthState.pollPromise = null;
+  githubAuthState.isStarting = false;
+
+  console.log("[GitHub OAuth] Authorization state cleared");
+  console.log("[GitHub OAuth] Cleanup completed");
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      return reject(new DOMException("Aborted", "AbortError"));
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      if (githubAuthState.activeTimeout === timer) {
+        githubAuthState.activeTimeout = null;
+      }
+      resolve();
+    }, ms);
+
+    githubAuthState.activeTimeout = timer;
+
+    const onAbort = () => {
+      clearTimeout(timer);
+      if (githubAuthState.activeTimeout === timer) {
+        githubAuthState.activeTimeout = null;
+      }
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 type GithubUser = { login: string; name?: string | null; avatarUrl?: string | null; id?: number | null; email?: string | null };
 type GithubRepo = { id: number; name: string; fullName: string; private: boolean; htmlUrl: string; defaultBranch?: string | null };
@@ -972,50 +1044,85 @@ async function getGithubStatus() {
   }
 }
 
-async function pollGithubDevice(deviceCode: string, intervalSeconds: number) {
+async function pollGithubDevice(deviceCode: string, intervalSeconds: number, attemptId: string, signal: AbortSignal) {
   let waitSeconds = Math.max(5, Number(intervalSeconds) || 5);
   const deadline = Date.now() + 15 * 60 * 1000;
 
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
-    const response = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        client_id: GITHUB_CLIENT_ID,
-        device_code: deviceCode,
-        grant_type: "urn:ietf:params:oauth:grant-type:device_code"
-      })
-    });
+  try {
+    while (Date.now() < deadline) {
+      if (signal.aborted || githubAuthState.attemptId !== attemptId) {
+        return;
+      }
 
-    const data: any = await response.json().catch(() => ({}));
-    if (data.access_token) {
-      writeGithubAuth({
-        token: String(data.access_token),
-        expiresAt: typeof data.expires_in === "number" ? Date.now() + data.expires_in * 1000 : undefined,
-        refreshToken: data.refresh_token ? String(data.refresh_token) : undefined,
-        refreshExpiresAt: typeof data.refresh_token_expires_in === "number" ? Date.now() + data.refresh_token_expires_in * 1000 : undefined
+      await abortableDelay(waitSeconds * 1000, signal);
+
+      if (signal.aborted || githubAuthState.attemptId !== attemptId) {
+        return;
+      }
+
+      const response = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          client_id: GITHUB_CLIENT_ID,
+          device_code: deviceCode,
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code"
+        }),
+        signal
       });
-      const status = await getGithubStatus();
-      mainWindow?.webContents.send("github:event", { type: "github.connected", properties: status });
+
+      if (signal.aborted || githubAuthState.attemptId !== attemptId) {
+        return;
+      }
+
+      const data: any = await response.json().catch(() => ({}));
+
+      if (signal.aborted || githubAuthState.attemptId !== attemptId) {
+        return;
+      }
+
+      if (data.access_token) {
+        writeGithubAuth({
+          token: String(data.access_token),
+          expiresAt: typeof data.expires_in === "number" ? Date.now() + data.expires_in * 1000 : undefined,
+          refreshToken: data.refresh_token ? String(data.refresh_token) : undefined,
+          refreshExpiresAt: typeof data.refresh_token_expires_in === "number" ? Date.now() + data.refresh_token_expires_in * 1000 : undefined
+        });
+
+        // Clean up pending session state on completion
+        if (githubAuthState.attemptId === attemptId) {
+          githubAuthState.attemptId = null;
+          githubAuthState.abortController = null;
+          githubAuthState.pollPromise = null;
+          githubAuthState.isStarting = false;
+        }
+
+        const status = await getGithubStatus();
+        mainWindow?.webContents.send("github:event", { type: "github.connected", properties: status });
+        return;
+      }
+
+      const error = String(data.error || "");
+      if (error === "authorization_pending") continue;
+      if (error === "slow_down") {
+        waitSeconds = Math.max(waitSeconds + 5, Number(data.interval) || waitSeconds + 5);
+        continue;
+      }
+      if (error === "expired_token") throw new Error("O código de autorização do GitHub expirou.");
+      if (error === "access_denied") throw new Error("A autorização do GitHub foi recusada.");
+      if (error) throw new Error(`GitHub: ${error}`);
+    }
+
+    throw new Error("O tempo para autorizar o GitHub terminou. Inicie a conexão novamente.");
+  } catch (error: any) {
+    if (signal.aborted || error?.name === "AbortError" || githubAuthState.attemptId !== attemptId) {
       return;
     }
-
-    const error = String(data.error || "");
-    if (error === "authorization_pending") continue;
-    if (error === "slow_down") {
-      waitSeconds = Math.max(waitSeconds + 5, Number(data.interval) || waitSeconds + 5);
-      continue;
-    }
-    if (error === "expired_token") throw new Error("O código de autorização do GitHub expirou.");
-    if (error === "access_denied") throw new Error("A autorização do GitHub foi recusada.");
-    if (error) throw new Error(`GitHub: ${error}`);
+    throw error;
   }
-
-  throw new Error("O tempo para autorizar o GitHub terminou. Inicie a conexão novamente.");
 }
 
 function opencodeDirectoryHeaders(): Record<string, string> {
@@ -1716,6 +1823,73 @@ let previewSessionCounter = 0;
 let activePreviewSessionId = 0;
 let previewRestartDebounceTimer: NodeJS.Timeout | null = null;
 
+// The iframe renderer remains available as a reversible fallback.  The view
+// below is the opt-in internal surface: it loads the already-running Preview
+// URL in a top-level guest WebContents, avoiding iframe-only behavior in SSR
+// applications while keeping the dev-server lifecycle unchanged.
+type InternalPreviewState = "idle" | "loading" | "ready" | "failed" | "crashed";
+let internalPreviewView: WebContentsView | null = null;
+let internalPreviewUrl = "";
+let internalPreviewState: InternalPreviewState = "idle";
+let internalPreviewSession = 0;
+
+function logInternalPreview(state: InternalPreviewState, extra = "") {
+  internalPreviewState = state;
+  console.log(`[Preview/Internal] session=${internalPreviewSession} url=${internalPreviewUrl || "none"} state=${state}${extra ? ` ${extra}` : ""}`);
+  try {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+    mainWindow.webContents.send("preview:event", {
+      type: `preview.internal.${state}`,
+      properties: { session: internalPreviewSession, url: internalPreviewUrl || null, state, message: extra || undefined }
+    });
+  } catch {}
+}
+
+function detachInternalPreviewView(destroy = false) {
+  const view = internalPreviewView;
+  if (!view) return;
+  try { mainWindow?.contentView.removeChildView(view); } catch {}
+  if (destroy) {
+    try { if (!view.webContents.isDestroyed()) view.webContents.close(); } catch {}
+    internalPreviewView = null;
+    internalPreviewUrl = "";
+    logInternalPreview("idle");
+  }
+}
+
+function isAllowedInternalPreviewUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return /^https?:$/.test(url.protocol) && (url.hostname === "127.0.0.1" || url.hostname === "localhost");
+  } catch { return false; }
+}
+
+function ensureInternalPreviewView(): WebContentsView | null {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  if (internalPreviewView && !internalPreviewView.webContents.isDestroyed()) return internalPreviewView;
+  const view = new WebContentsView({
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true }
+  });
+  internalPreviewView = view;
+  view.webContents.setWindowOpenHandler(({ url }) => ({ action: "deny" }));
+  view.webContents.on("did-start-loading", () => logInternalPreview("loading"));
+  view.webContents.on("did-finish-load", () => logInternalPreview("ready"));
+  view.webContents.on("did-fail-load", (_event, code, description, url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return;
+    logInternalPreview("failed", `error=${code} description=${logSafeText(description, 160)} url=${sanitizeExternalPreviewUrl(url)}`);
+  });
+  view.webContents.on("render-process-gone", (_event, details) => {
+    logInternalPreview("crashed", `reason=${details.reason} exitCode=${details.exitCode}`);
+  });
+  view.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    mainWindow?.webContents.send("preview:event", {
+      type: "preview.console",
+      properties: { level, message, lineNumber: line, sourceId, internal: true }
+    });
+  });
+  return view;
+}
+
 function emitPreview(type: string, properties: Record<string, any> = {}) {
   previewState = { ...previewState, ...properties };
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
@@ -1772,21 +1946,24 @@ async function detectProject(projectPath: string) {
       framework: "Node",
       preferredPort: 3000,
       devScript: null,
-      packageManager: "npm"
+      packageManager: "npm",
+      runtimeEntry: null
     };
   }
 
   const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
   let framework = "Node";
   let preferredPort = 3000;
+  let runtimeEntry: string | null = null;
 
-  if (deps.next) { framework = "Next.js"; preferredPort = 3000; }
-  else if (deps.astro) { framework = "Astro"; preferredPort = 4321; }
-  else if (deps.vite) { framework = "Vite"; preferredPort = 5173; }
-  else if (deps["react-scripts"]) { framework = "Create React App"; preferredPort = 3000; }
-  else if (deps.nuxt) { framework = "Nuxt"; preferredPort = 3000; }
-  else if (deps.vue) { framework = "Vue"; preferredPort = 5173; }
-  else if (deps.svelte || deps["@sveltejs/kit"]) { framework = "Svelte"; preferredPort = 5173; }
+  if (deps.next) { framework = "Next.js"; preferredPort = 3000; runtimeEntry = "next"; }
+  else if (deps.astro) { framework = "Astro"; preferredPort = 4321; runtimeEntry = "astro"; }
+  else if (deps.remix || deps["@remix-run/react"]) { framework = "Remix"; preferredPort = 3000; runtimeEntry = "@remix-run/dev"; }
+  else if (deps.nuxt) { framework = "Nuxt"; preferredPort = 3000; runtimeEntry = "nuxt"; }
+  else if (deps.svelte || deps["@sveltejs/kit"]) { framework = "Svelte"; preferredPort = 5173; runtimeEntry = deps.vite ? "vite" : "@sveltejs/kit"; }
+  else if (deps.vue) { framework = "Vue"; preferredPort = 5173; runtimeEntry = deps.vite ? "vite" : "vue"; }
+  else if (deps["react-scripts"]) { framework = "Create React App"; preferredPort = 3000; runtimeEntry = "react-scripts"; }
+  else if (deps.vite) { framework = "Vite"; preferredPort = 5173; runtimeEntry = "vite"; }
 
   const scripts = pkg.scripts || {};
   let devScript: string | null = null;
@@ -1797,9 +1974,32 @@ async function detectProject(projectPath: string) {
 
   const files: string[] = await fs.promises.readdir(projectPath).catch((): string[] => []);
   let packageManager = "npm";
-  if (files.includes("pnpm-lock.yaml")) packageManager = "pnpm";
-  else if (files.includes("yarn.lock")) packageManager = "yarn";
-  else if (files.includes("bun.lockb") || files.includes("bun.lock")) packageManager = "bun";
+
+  // Check packageManager field first (e.g. "pnpm@8.0.0", "yarn@3.0.0", "bun@1.0.0")
+  if (typeof pkg.packageManager === "string") {
+    const pmLower = pkg.packageManager.toLowerCase();
+    if (pmLower.startsWith("pnpm")) packageManager = "pnpm";
+    else if (pmLower.startsWith("yarn")) packageManager = "yarn";
+    else if (pmLower.startsWith("bun")) packageManager = "bun";
+    else if (pmLower.startsWith("npm")) packageManager = "npm";
+  } else if (files.includes("pnpm-lock.yaml")) {
+    packageManager = "pnpm";
+  } else if (files.includes("yarn.lock")) {
+    packageManager = "yarn";
+  } else if (files.includes("bun.lockb") || files.includes("bun.lock")) {
+    packageManager = "bun";
+  } else if (files.includes("package-lock.json")) {
+    packageManager = "npm";
+  }
+
+  // Infer runtime entry from dev script command if not found from deps
+  if (!runtimeEntry && devScript && typeof scripts[devScript] === "string") {
+    const cmd = scripts[devScript].trim();
+    const firstWord = cmd.split(/\s+/)[0]?.toLowerCase();
+    if (["vite", "next", "astro", "nuxt", "remix", "react-scripts"].includes(firstWord)) {
+      runtimeEntry = firstWord;
+    }
+  }
 
   return {
     exists: true,
@@ -1807,7 +2007,8 @@ async function detectProject(projectPath: string) {
     framework,
     preferredPort,
     devScript,
-    packageManager
+    packageManager,
+    runtimeEntry
   };
 }
 
@@ -1835,29 +2036,103 @@ function dependencyResolutionFailure(output: string) {
     "err_pnpm_",
     "missing package",
     "failed to resolve dependency",
-    "could not resolve"
+    "could not resolve",
+    "tar_entry_error",
+    "enotempty",
+    "missing peer dependency"
   ].some(marker => text.includes(marker));
 }
 
-async function removeNodeModules(projectPath: string) {
-  await fs.promises.rm(path.join(projectPath, "node_modules"), { recursive: true, force: true });
+async function removeNodeModules(projectPath: string): Promise<void> {
+  const nodeModulesPath = path.join(projectPath, "node_modules");
+  try {
+    const exists = await fs.promises.stat(nodeModulesPath).then(() => true).catch(() => false);
+    if (!exists) return;
+  } catch {
+    return;
+  }
+
+  console.log(`[Preview/Cleanup] started path=${nodeModulesPath}`);
+
+  // Stop any active preview process first to release file locks on Windows
+  await stopPreviewProcessOnly();
+
+  // Retry loop with progressive backoff (up to 5 attempts) to accommodate Windows filesystem / OneDrive locks
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await fs.promises.rm(nodeModulesPath, { recursive: true, force: true, maxRetries: 4, retryDelay: 500 });
+      const stillExists = await fs.promises.stat(nodeModulesPath).then(() => true).catch(() => false);
+      if (!stillExists) {
+        console.log(`[Preview/Cleanup] completed`);
+        return;
+      }
+    } catch (fsErr: any) {
+      console.warn(`[Preview/Cleanup] tentativa ${attempt} de remoção direta falhou:`, fsErr?.message);
+    }
+
+    if (process.platform === "win32") {
+      const trashDir = path.join(projectPath, `.trash_nm_${Date.now()}_${attempt}`);
+      try {
+        await fs.promises.rename(nodeModulesPath, trashDir);
+        // Spawn cmd rmdir in background to clean up trash directory asynchronously
+        spawn("cmd.exe", ["/c", `rmdir /s /q "${trashDir}"`], { windowsHide: true, stdio: "ignore", detached: true }).unref();
+        console.log(`[Preview/Cleanup] completed (renamed to ${trashDir})`);
+        return;
+      } catch (renameErr: any) {
+        console.warn(`[Preview/Cleanup] tentativa ${attempt} de rename fallback falhou:`, renameErr?.message);
+        await new Promise<void>(resolve => {
+          const killer = spawn("cmd.exe", ["/c", `rmdir /s /q "${nodeModulesPath}"`], { windowsHide: true, stdio: "ignore" });
+          killer.once("error", () => resolve());
+          killer.once("exit", () => resolve());
+        });
+      }
+    }
+
+    const check = await fs.promises.stat(nodeModulesPath).then(() => true).catch(() => false);
+    if (!check) {
+      console.log(`[Preview/Cleanup] completed`);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, attempt * 400));
+  }
+
+  console.log(`[Preview/Cleanup] completed (final attempt finished)`);
 }
 
-async function verifyRuntimeDependency(projectPath: string, framework: string) {
-  const entryByFramework: Record<string, string> = {
-    Vite: "vite",
-    "Next.js": "next",
-    Astro: "astro",
-    Nuxt: "nuxt",
-    Vue: "vite",
-    Svelte: "vite",
-    "Create React App": "react-scripts"
-  };
-  const entry = entryByFramework[framework];
-  if (!entry) return;
+async function verifyRuntimeDependency(projectPath: string, info: any) {
+  console.log(`[Preview/Install] validation started`);
+  const entry = info.runtimeEntry || (info.framework === "Vite" ? "vite" : null);
+  
+  // 1. Basic node_modules check
+  const nmPath = path.join(projectPath, "node_modules");
+  const nmExists = await fs.promises.stat(nmPath).then(s => s.isDirectory()).catch(() => false);
+  if (!nmExists) {
+    console.warn(`[Preview/Install] validation failed: diretório node_modules não existe.`);
+    throw new Error("Diretório node_modules não existe.");
+  }
 
+  if (!entry) {
+    console.log(`[Preview/Install] validation passed (basic node_modules verified)`);
+    return;
+  }
+
+  // 2. Fast check: package directory exists inside node_modules
+  const pkgDir = path.join(nmPath, entry);
+  const pkgDirExists = await fs.promises.stat(pkgDir).then(s => s.isDirectory()).catch(() => false);
+  if (!pkgDirExists) {
+    console.warn(`[Preview/Install] validation failed: Pacote runtime '${entry}' não encontrado em node_modules.`);
+    throw new Error(`Pacote runtime '${entry}' não encontrado em node_modules.`);
+  }
+
+  // 3. Deep runtime import validation via Node process
   const script = `import(${JSON.stringify(entry)}).then(()=>process.exit(0)).catch((error)=>{console.error(error);process.exit(1)})`;
-  await runCommand(process.platform === "win32" ? "node.exe" : "node", ["--input-type=module", "-e", script], projectPath, "Dependency-Check");
+  try {
+    await runCommand(process.platform === "win32" ? "node.exe" : "node", ["--input-type=module", "-e", script], projectPath, "Dependency-Check");
+    console.log(`[Preview/Install] validation passed`);
+  } catch (err: any) {
+    console.warn(`[Preview/Install] validation failed: erro ao importar '${entry}':`, err?.message || err);
+    throw new Error(`Validação de integridade do runtime '${entry}' falhou.`);
+  }
 }
 
 function quoteWindowsArg(value: string) {
@@ -1902,26 +2177,80 @@ async function runCommand(command: string, args: string[], cwd: string, label: s
 }
 
 async function installDependencies(projectPath: string, packageManager: string) {
-  await runCommand(packageManagerExecutable(packageManager), ["install"], projectPath, "Install");
+  console.log(`[Preview/Install] started pm=${packageManager}`);
+  const files: string[] = await fs.promises.readdir(projectPath).catch((): string[] => []);
+  const hasLock = files.includes("package-lock.json");
+
+  // Prefer clean/frozen install if lockfile is present
+  if (packageManager === "npm" && hasLock) {
+    try {
+      await runCommand(packageManagerExecutable("npm"), ["ci"], projectPath, "Install-CI");
+      console.log(`[Preview/Install] completed pm=${packageManager}`);
+      return;
+    } catch (ciErr) {
+      console.warn("[Neko/Preview/Install] npm ci falhou, tentando fallback com npm install:", ciErr);
+    }
+  }
+
+  let installArgs = ["install"];
+  if (packageManager === "pnpm" && files.includes("pnpm-lock.yaml")) {
+    installArgs = ["install", "--frozen-lockfile"];
+  } else if (packageManager === "yarn" && files.includes("yarn.lock")) {
+    installArgs = ["install", "--frozen-lockfile"];
+  } else if (packageManager === "bun" && (files.includes("bun.lockb") || files.includes("bun.lock"))) {
+    installArgs = ["install", "--frozen-lockfile"];
+  }
+
+  try {
+    await runCommand(packageManagerExecutable(packageManager), installArgs, projectPath, "Install");
+  } catch (err) {
+    if (installArgs.includes("--frozen-lockfile")) {
+      // Fallback without frozen lockfile
+      await runCommand(packageManagerExecutable(packageManager), ["install"], projectPath, "Install-Relaxed");
+    } else {
+      throw err;
+    }
+  }
+  console.log(`[Preview/Install] completed pm=${packageManager}`);
 }
 
-async function installDependenciesWithFallback(projectPath: string, preferredManager: string) {
+async function installDependenciesWithFallback(projectPath: string, preferredManager: string, info: any) {
+  // Step 1: Attempt installation with preferred package manager
+  let primaryPassed = false;
   try {
     await installDependencies(projectPath, preferredManager);
+    await verifyRuntimeDependency(projectPath, info);
+    primaryPassed = true;
     return preferredManager;
-  } catch (error: any) {
-    if (preferredManager !== "bun") throw error;
-    const output = `${error?.message || ""}\n${error?.stdout || ""}\n${error?.stderr || ""}`;
-    if (!dependencyResolutionFailure(output)) throw error;
+  } catch (primaryErr: any) {
+    console.warn(`[Preview/Install] Falha na instalação/validação com ${preferredManager}:`, primaryErr?.message || primaryErr);
+  }
 
-    emitPreview("preview.installing", {
-      status: "installing",
-      packageManager: "npm",
-      message: "Ajustando as dependências para iniciar o preview..."
-    });
+  if (primaryPassed) return preferredManager;
+
+  // If preferred manager was already npm and failed, we reached terminal failure
+  if (preferredManager === "npm") {
+    console.error(`[Preview] terminal failure: npm install failed`);
+    throw new Error("Falha ao instalar dependências. A instalação foi tentada com npm, mas o node_modules permaneceu inválido.");
+  }
+
+  // Step 2: Single bounded fallback to npm
+  console.log(`[Preview/Fallback] npm started`);
+  emitPreview("preview.installing", {
+    status: "installing",
+    packageManager: "npm",
+    message: "Ajustando as dependências com npm para iniciar o preview..."
+  });
+
+  try {
     await removeNodeModules(projectPath);
-    await runCommand(packageManagerExecutable("npm"), ["install", "--no-package-lock"], projectPath, "Install-Fallback");
+    await installDependencies(projectPath, "npm");
+    await verifyRuntimeDependency(projectPath, info);
+    console.log(`[Preview/Fallback] npm completed`);
     return "npm";
+  } catch (fallbackErr: any) {
+    console.error(`[Preview] terminal failure: fallback to npm also failed:`, fallbackErr?.message || fallbackErr);
+    throw new Error("Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido.");
   }
 }
 
@@ -2007,6 +2336,7 @@ async function stopPreview(): Promise<void> {
   const currentSession = ++previewSessionCounter;
   activePreviewSessionId = currentSession;
   console.log(`[Preview] stop session=${currentSession} path=${previewProjectPath || "none"}`);
+  detachInternalPreviewView(true);
   await stopPreviewProcessOnly();
   previewProjectPath = null;
   if (activeWorkspace) {
@@ -2022,42 +2352,41 @@ function handleProjectFileChange(projectPath: string, changedPath: string) {
   if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
   const normalized = (changedPath || "").replaceAll("\\", "/").toLowerCase();
 
-  // 1. Se o preview não estiver rodando (idle, stopped ou error),
-  // e um package.json surgir, inicia o preview de forma autônoma!
-  if (!previewProcess || previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error") {
+  // Concurrency guard: Only ONE install/boot per projectPath and generation
+  if (previewStartPromise || ["detecting", "installing", "starting", "ready"].includes(previewState.status)) {
+    // If preview is active or currently booting, only trigger restart on config file change
+    const isConfigFile = normalized.endsWith("package.json") ||
+      normalized.includes("vite.config") ||
+      normalized.includes("next.config") ||
+      normalized.includes("astro.config") ||
+      normalized.includes("nuxt.config") ||
+      normalized.includes("webpack.config") ||
+      normalized.includes("tsconfig.json");
+
+    if (isConfigFile && previewState.status === "ready") {
+      if (previewRestartDebounceTimer) clearTimeout(previewRestartDebounceTimer);
+      previewRestartDebounceTimer = setTimeout(async () => {
+        previewRestartDebounceTimer = null;
+        if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
+        console.log(`[Neko/PreviewWatcher] Arquivo de configuração modificado (${changedPath}). Reiniciando dev server...`);
+        void startPreview(projectPath, undefined, true).catch(err => {
+          console.warn("[Neko/PreviewWatcher] Falha ao reiniciar preview:", err);
+        });
+      }, 1000);
+    }
+    return;
+  }
+
+  // If preview is idle/stopped/error and package.json appeared, trigger auto start
+  if (!previewProcess && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error")) {
     void resolvePreviewProjectRoot(projectPath).then(root => {
-      if (root && (!previewProcess || previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error")) {
+      if (root && (!previewProcess && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error"))) {
         console.log(`[Neko/PreviewWatcher] package.json detectado em ${root}. Iniciando preview automaticamente...`);
         void startPreview(projectPath).catch(err => {
           console.warn("[Neko/PreviewWatcher] Falha na auto-inicialização do preview:", err);
         });
       }
     });
-    return;
-  }
-
-  // 2. Se o preview já está rodando (ready, starting, etc.):
-  // Para alterações de código comum (src/**, index.html, App.tsx, etc.), não faz nada
-  // pois o Vite / Next / Astro HMR atualiza em tempo real.
-  // Apenas alterações em package.json ou configs do bundler requerem reinicialização do dev server.
-  const isConfigFile = normalized.endsWith("package.json") ||
-    normalized.includes("vite.config") ||
-    normalized.includes("next.config") ||
-    normalized.includes("astro.config") ||
-    normalized.includes("nuxt.config") ||
-    normalized.includes("webpack.config") ||
-    normalized.includes("tsconfig.json");
-
-  if (isConfigFile) {
-    if (previewRestartDebounceTimer) clearTimeout(previewRestartDebounceTimer);
-    previewRestartDebounceTimer = setTimeout(async () => {
-      previewRestartDebounceTimer = null;
-      if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
-      console.log(`[Neko/PreviewWatcher] Arquivo de configuração modificado (${changedPath}). Reiniciando dev server...`);
-      void startPreview(projectPath, undefined, true).catch(err => {
-        console.warn("[Neko/PreviewWatcher] Falha ao reiniciar preview:", err);
-      });
-    }, 1000);
   }
 }
 
@@ -2143,46 +2472,29 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
     return previewState;
   }
 
-  if (!(await hasDependencies(projectRoot))) {
-    if (sessionId !== activePreviewSessionId) return previewState;
-    emitPreview("preview.installing", { status: "installing", message: `Instalando dependências com ${packageManager}...` });
+  // 1. Initial dependency check and installation
+  const hasNM = await hasDependencies(projectRoot);
+  let needsInstall = !hasNM;
+
+  if (hasNM) {
     try {
-      packageManager = await installDependenciesWithFallback(projectRoot, packageManager);
-    } catch (error: any) {
-      if (sessionId !== activePreviewSessionId) return previewState;
-      emitPreview("preview.error", { status: "error", message: `Falha ao instalar dependências: ${String(error?.message ?? error)}` });
-      return previewState;
+      await verifyRuntimeDependency(projectRoot, info);
+    } catch (checkErr: any) {
+      console.warn("[Neko/Preview] Integridade de dependências falhou:", checkErr?.message);
+      needsInstall = true;
     }
   }
 
-  if (sessionId !== activePreviewSessionId) return previewState;
-
-  if (packageManager === "bun") {
+  if (needsInstall) {
+    if (sessionId !== activePreviewSessionId) return previewState;
+    emitPreview("preview.installing", { status: "installing", packageManager, message: `Instalando dependências com ${packageManager}...` });
     try {
-      await verifyRuntimeDependency(projectRoot, info.framework);
+      packageManager = await installDependenciesWithFallback(projectRoot, packageManager, info);
     } catch (error: any) {
       if (sessionId !== activePreviewSessionId) return previewState;
-      console.error("[Neko/Preview] Bun dependency check failed:", error);
-      emitPreview("preview.installing", {
-        status: "installing",
-        packageManager: "npm",
-        message: "O Neko encontrou uma incompatibilidade nas dependências. Ajustando e tentando novamente..."
-      });
-      try {
-        await removeNodeModules(projectRoot);
-        await runCommand(packageManagerExecutable("npm"), ["install", "--no-package-lock"], projectRoot, "Install-Fallback");
-        packageManager = "npm";
-      } catch (fallbackError: any) {
-        console.error("[Neko/Preview] Falha na recuperação das dependências:", fallbackError);
-        emitPreview("preview.error", {
-          status: "error",
-          packageManager,
-          message: "Não foi possível preparar as dependências para iniciar o preview.",
-          port: null,
-          url: null
-        });
-        return previewState;
-      }
+      const errorMsg = String(error?.message ?? error);
+      emitPreview("preview.error", { status: "error", message: errorMsg, port: null, url: null });
+      return previewState;
     }
   }
 
@@ -2229,7 +2541,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
         return previewState;
       }
       previewPort = port;
-      const ready = { status: "ready" as const, framework: info.framework, packageManager, port, url, message: "Preview pronto." };
+      const ready = { status: "ready" as const, framework: info.framework, packageManager, port, url, message: "Preview pronto.", internalSession: sessionId };
       previewState = ready;
       if (activeWorkspace) {
         activeWorkspace.previewProcess = processRef;
@@ -2244,20 +2556,25 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       const output = launch.getOutput();
       const message = String(error?.message ?? error);
 
-      if (packageManager === "bun" && (dependencyResolutionFailure(output) || dependencyResolutionFailure(message) || (processRef.exitCode !== null && processRef.exitCode !== 0))) {
+      // Clean recovery cycle: if server failed to start due to dependency resolution error or early crash
+      // Limit to ONE fallback repair with npm
+      if (packageManager !== "npm" && (dependencyResolutionFailure(output) || dependencyResolutionFailure(message) || (processRef.exitCode !== null && processRef.exitCode !== 0))) {
         await stopPreviewProcessOnly();
+        console.log(`[Preview/Fallback] npm started`);
         emitPreview("preview.installing", {
           status: "installing",
           packageManager: "npm",
-          message: "O Neko encontrou uma incompatibilidade nas dependências. Ajustando e tentando novamente..."
+          message: "O Neko encontrou um problema nas dependências. Reparando com npm e tentando novamente..."
         });
         try {
           await removeNodeModules(projectRoot);
-          await runCommand(packageManagerExecutable("npm"), ["install", "--no-package-lock"], projectRoot, "Install-Fallback");
+          await installDependencies(projectRoot, "npm");
+          await verifyRuntimeDependency(projectRoot, info);
+          console.log(`[Preview/Fallback] npm completed`);
           packageManager = "npm";
           const retryPort = await findFreePort(info.preferredPort);
-          emitPreview("preview.starting", { status: "starting", packageManager, port: retryPort, message: `Tentando iniciar ${info.framework} novamente...` });
-          const retry = await launchPreviewProcess(projectRoot, info, packageManager, retryPort);
+          emitPreview("preview.starting", { status: "starting", packageManager: "npm", port: retryPort, message: `Tentando iniciar ${info.framework} novamente...` });
+          const retry = await launchPreviewProcess(projectRoot, info, "npm", retryPort);
           if (sessionId !== activePreviewSessionId) {
             try {
               if (process.platform === "win32" && retry.processRef.pid) {
@@ -2290,15 +2607,16 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
             return previewState;
           }
           previewPort = retryPort;
-          const ready = { status: "ready" as const, framework: info.framework, packageManager, port: retryPort, url: retryUrl, message: "Preview pronto." };
+          const ready = { status: "ready" as const, framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Preview pronto.", internalSession: sessionId };
           previewState = ready;
           mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
           return ready;
         } catch (fallbackError: any) {
+          console.error(`[Preview] terminal failure: npm recovery failed:`, fallbackError?.message || fallbackError);
           await stopPreviewProcessOnly();
           emitPreview("preview.error", {
             status: "error",
-            message: "Não foi possível iniciar o preview após ajustar as dependências. Verifique o projeto e tente novamente.",
+            message: "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido.",
             port: null,
             url: null
           });
@@ -2310,7 +2628,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       emitPreview("preview.error", {
         status: "error",
         message: dependencyResolutionFailure(output)
-          ? "Não foi possível resolver as dependências deste projeto."
+          ? "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido."
           : message,
         port: null,
         url: null
@@ -2337,7 +2655,7 @@ async function startPreview(projectPath: string, _sourceGen?: number, forceResta
     }
   }
 
-  // 2. Se já existe uma inicialização em andamento para este mesmo projeto, aguarda a mesma
+  // 2. Concurrency guard: Se já existe uma inicialização em andamento para este mesmo projeto, aguarda a mesma
   if (!forceRestart && previewProjectPath === workspace && previewStartPromise) {
     return previewStartPromise;
   }
@@ -2707,40 +3025,97 @@ ipcMain.handle("github:open", async (_event, url: string) => {
 ipcMain.handle("github:start", async (_event, forceReauthorize: boolean = false) => {
   const existing = await getGithubStatus();
   if (existing.connected && !forceReauthorize && !existing.needsReauthorization) return { device: null, status: existing };
-  if (githubPollPromise) throw new Error("Já existe uma autorização do GitHub em andamento.");
 
-  const response = await fetch("https://github.com/login/device/code", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ client_id: GITHUB_CLIENT_ID })
-  });
-  const data: any = await response.json().catch(() => ({}));
-  if (!response.ok || !data.device_code || !data.user_code) {
-    throw new Error(`Não foi possível iniciar o Device Flow do GitHub${data.error ? `: ${data.error}` : "."}`);
+  // Prevent multiple concurrent initiations within the exact same tick / double-click
+  if (githubAuthState.isStarting) {
+    console.warn("[GitHub OAuth] Initiation already in progress, ignoring duplicate call.");
+    return { device: null, status: { connected: false, repos: [] } };
   }
 
-  const device = {
-    userCode: String(data.user_code),
-    verificationUri: String(data.verification_uri || "https://github.com/login/device"),
-    expiresIn: Number(data.expires_in || 900),
-    interval: Number(data.interval || 5)
-  };
+  githubAuthState.isStarting = true;
 
-  await shell.openExternal(device.verificationUri);
-  githubPollPromise = pollGithubDevice(String(data.device_code), device.interval)
-    .catch(error => {
-      console.error("[Neko/GitHub] Device Flow error:", error);
-      mainWindow?.webContents.send("github:event", { type: "github.error", properties: { message: error instanceof Error ? error.message : String(error) } });
-    })
-    .finally(() => { githubPollPromise = null; });
+  try {
+    // If there is any existing polling attempt from before, cancel it cleanly
+    if (githubAuthState.attemptId || githubAuthState.pollPromise || githubAuthState.abortController) {
+      cancelGithubAuthorization("superseded_by_new_start");
+      githubAuthState.isStarting = true;
+    }
 
-  return { device, status: { connected: false, repos: [] } };
+    console.log("[GitHub OAuth] Authorization started");
+
+    const attemptId = crypto.randomUUID();
+    const abortController = new AbortController();
+
+    githubAuthState.attemptId = attemptId;
+    githubAuthState.abortController = abortController;
+
+    const response = await fetch("https://github.com/login/device/code", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ client_id: GITHUB_CLIENT_ID }),
+      signal: abortController.signal
+    });
+
+    if (abortController.signal.aborted || githubAuthState.attemptId !== attemptId) {
+      return { device: null, status: { connected: false, repos: [] } };
+    }
+
+    const data: any = await response.json().catch(() => ({}));
+    if (!response.ok || !data.device_code || !data.user_code) {
+      throw new Error(`Não foi possível iniciar o Device Flow do GitHub${data.error ? `: ${data.error}` : "."}`);
+    }
+
+    const device = {
+      userCode: String(data.user_code),
+      verificationUri: String(data.verification_uri || "https://github.com/login/device"),
+      expiresIn: Number(data.expires_in || 900),
+      interval: Number(data.interval || 5)
+    };
+
+    await shell.openExternal(device.verificationUri);
+
+    console.log("[GitHub OAuth] Polling started");
+
+    const pollPromise = pollGithubDevice(String(data.device_code), device.interval, attemptId, abortController.signal)
+      .catch(error => {
+        if (abortController.signal.aborted || githubAuthState.attemptId !== attemptId) return;
+        console.error("[Neko/GitHub] Device Flow error:", error);
+        mainWindow?.webContents.send("github:event", { type: "github.error", properties: { message: error instanceof Error ? error.message : String(error) } });
+      })
+      .finally(() => {
+        if (githubAuthState.attemptId === attemptId) {
+          githubAuthState.pollPromise = null;
+          githubAuthState.abortController = null;
+          githubAuthState.attemptId = null;
+          githubAuthState.isStarting = false;
+        }
+      });
+
+    githubAuthState.pollPromise = pollPromise;
+    githubAuthState.isStarting = false;
+
+    return { device, status: { connected: false, repos: [] } };
+  } catch (error) {
+    githubAuthState.isStarting = false;
+    if (githubAuthState.abortController?.signal.aborted) {
+      return { device: null, status: { connected: false, repos: [] } };
+    }
+    cancelGithubAuthorization("start_failed");
+    throw error;
+  }
+});
+
+ipcMain.handle("github:cancel", async () => {
+  cancelGithubAuthorization("renderer_requested");
+  mainWindow?.webContents.send("github:event", { type: "github.cancelled" });
+  return { ok: true };
 });
 
 ipcMain.handle("github:disconnect", async () => {
+  cancelGithubAuthorization("disconnect");
   clearGithubAuth();
   mainWindow?.webContents.send("github:event", { type: "github.disconnected", properties: { connected: false, repos: [] } });
   return true;
@@ -3289,9 +3664,58 @@ ipcMain.handle("github:discardChanges", async () => {
   });
 });
 
-ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: string; replaceRemote?: boolean }) => {
+const SAFE_IGNORED_ENTRIES_FOR_CLONE = new Set([
+  ".git",
+  ".neko",
+  ".vscode",
+  ".idea",
+  ".ds_store",
+  "thumbs.db",
+  "desktop.ini"
+]);
+
+async function inspectFolderForClone(folderPath: string): Promise<{ isEmptyOrSafe: boolean; fileCount: number; nonSafeEntries: string[] }> {
+  try {
+    const entries = await fs.promises.readdir(folderPath, { withFileTypes: true });
+    const nonSafe: string[] = [];
+    let totalFiles = 0;
+
+    for (const entry of entries) {
+      const nameLower = entry.name.toLowerCase();
+      if (!SAFE_IGNORED_ENTRIES_FOR_CLONE.has(nameLower)) {
+        nonSafe.push(entry.name);
+      }
+      totalFiles++;
+    }
+
+    return {
+      isEmptyOrSafe: nonSafe.length === 0,
+      fileCount: totalFiles,
+      nonSafeEntries: nonSafe
+    };
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      return { isEmptyOrSafe: true, fileCount: 0, nonSafeEntries: [] };
+    }
+    throw error;
+  }
+}
+
+async function cleanFolderForClone(folderPath: string): Promise<void> {
+  const entries = await fs.promises.readdir(folderPath, { withFileTypes: true }).catch(() => [] as fs.Dirent[]);
+  for (const entry of entries) {
+    const fullPath = path.join(folderPath, entry.name);
+    try {
+      await fs.promises.rm(fullPath, { recursive: true, force: true });
+    } catch (e) {
+      console.warn(`[Neko/Git] Não foi possível remover item ao limpar pasta: ${fullPath}`, e);
+    }
+  }
+}
+
+ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: string; replaceRemote?: boolean; overwriteLocalContent?: boolean }) => {
   licenseManager.assertAccess("vinculação de repositórios no GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de vinculá-lo ao GitHub.");
+  if (!currentProject) throw new Error("Abra um projeto antes de conectá-lo ao GitHub.");
   const projectPath = currentProject;
 
   const repoFullName = String(payload?.repoFullName || "").trim();
@@ -3303,44 +3727,128 @@ ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: str
     const token = await getGithubAccessToken();
     const desiredRemote = `https://github.com/${repoFullName}.git`;
 
-    // Validate access before changing the local project remote. This prevents a
-    // project from being linked to a repository the current GitHub authorization
-    // cannot actually reach.
-    const accessCheck = await runGitWithGithubAuth(projectPath, ["ls-remote", "--heads", desiredRemote], token, 20000);
-    if (accessCheck.code !== 0) {
-      throw new Error(formatGitHubGitError(accessCheck, `validar o acesso a ${repoFullName}`));
+    // 1. Validate repository access and discover default branch / heads
+    const lsRemote = await runGitWithGithubAuth(projectPath, ["ls-remote", "--symref", desiredRemote], token, 20000);
+    if (lsRemote.code !== 0) {
+      throw new Error(formatGitHubGitError(lsRemote, `validar o acesso a ${repoFullName}`));
     }
 
-    const existing = await getGitStatus();
-    if (!existing.initialized) {
-      const init = await runGit(projectPath, ["init"], {}, 15000);
-      if (init.code !== 0) {
-        throw new Error(init.stderr || "Não foi possível inicializar o Git neste projeto.");
+    // Check if remote repository is completely empty (no branches/heads)
+    const headsCheck = await runGitWithGithubAuth(projectPath, ["ls-remote", "--heads", desiredRemote], token, 20000);
+    const hasRemoteHeads = headsCheck.code === 0 && Boolean(headsCheck.stdout.trim());
+
+    if (!hasRemoteHeads) {
+      return {
+        ok: false,
+        emptyRemote: true,
+        repoFullName,
+        message: "Este repositório está vazio. Utilize a opção de publicar projeto para enviar seu código para ele.",
+        status: await getGitStatus()
+      };
+    }
+
+    // Determine remote default branch
+    let defaultBranch = "main";
+    const symrefMatch = lsRemote.stdout.match(/ref:\s+refs\/heads\/([^\s]+)\s+HEAD/);
+    if (symrefMatch?.[1]) {
+      defaultBranch = symrefMatch[1];
+    } else {
+      // Fallback: check heads
+      const heads = headsCheck.stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      if (heads.some(h => h.endsWith("/main"))) defaultBranch = "main";
+      else if (heads.some(h => h.endsWith("/master"))) defaultBranch = "master";
+      else if (heads.length > 0) {
+        const firstHead = heads[0].split(/\s+/)[1]?.replace(/^refs\/heads\//, "");
+        if (firstHead) defaultBranch = firstHead;
       }
     }
 
-    const currentRemote = await runGit(projectPath, ["remote", "get-url", "origin"], {}, 10000);
+    // 2. Check if local directory already contains a working clone of this repo (FLUXO 3: Abrir repositório existente)
+    const currentGitStatus = await getGitStatus();
+    if (currentGitStatus.initialized && currentGitStatus.remote) {
+      const isSameRepo = currentGitStatus.linkedRepo?.toLowerCase() === repoFullName.toLowerCase();
+      const headVerify = await runGit(projectPath, ["rev-parse", "--verify", "HEAD"], {}, 5000);
+      const isCompleteClone = headVerify.code === 0;
 
-    if (currentRemote.code === 0 && currentRemote.stdout && currentRemote.stdout !== desiredRemote) {
-      if (!payload?.replaceRemote) {
-        throw new Error(`O projeto já possui um remote "origin": ${currentRemote.stdout}. Confirme a substituição para vincular este repositório.`);
-      }
-
-      const set = await runGit(projectPath, ["remote", "set-url", "origin", desiredRemote], {}, 10000);
-      if (set.code !== 0) {
-        throw new Error(set.stderr || "Não foi possível substituir o remote origin.");
-      }
-    } else if (currentRemote.code !== 0 || !currentRemote.stdout) {
-      const add = await runGit(projectPath, ["remote", "add", "origin", desiredRemote], {}, 10000);
-      if (add.code !== 0) {
-        throw new Error(add.stderr || "Não foi possível adicionar o remote origin.");
+      if (isSameRepo && isCompleteClone) {
+        // Already fully linked and cloned
+        return {
+          ok: true,
+          repoFullName,
+          alreadyCloned: true,
+          status: currentGitStatus,
+          message: "Projeto já conectado ao repositório GitHub."
+        };
       }
     }
+
+    // 3. Inspect local directory content
+    const folderInspection = await inspectFolderForClone(projectPath);
+
+    if (!folderInspection.isEmptyOrSafe && !payload?.overwriteLocalContent) {
+      return {
+        ok: false,
+        requiresConfirmation: true,
+        repoFullName,
+        nonSafeEntries: folderInspection.nonSafeEntries,
+        message: "Esta pasta já contém arquivos. Para conectar ao repositório existente, o NekoAI precisa trazer os arquivos do GitHub.",
+        status: currentGitStatus
+      };
+    }
+
+    // 4. Perform TRUE CLONE into the current project directory (FLUXO 2)
+    // If folder was not empty and user explicitly approved overwrite, clean it first
+    if (!folderInspection.isEmptyOrSafe && payload?.overwriteLocalContent) {
+      await cleanFolderForClone(projectPath);
+    } else {
+      // Clean stale/partial .git if it was just an empty init
+      const gitDir = path.join(projectPath, ".git");
+      if (fs.existsSync(gitDir)) {
+        await fs.promises.rm(gitDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+
+    // Execute authenticated clone into current folder (.)
+    const cloneResult = await runGitWithGithubAuth(projectPath, ["clone", desiredRemote, "."], token, 60000);
+    if (cloneResult.code !== 0) {
+      throw new Error(formatGitHubGitError(cloneResult, `clonar o repositório ${repoFullName}`));
+    }
+
+    // 5. Post-clone Validations
+    const insideWorkTree = await runGit(projectPath, ["rev-parse", "--is-inside-work-tree"], {}, 5000);
+    if (insideWorkTree.code !== 0 || insideWorkTree.stdout !== "true") {
+      throw new Error("O clone foi finalizado mas o diretório não contém uma árvore Git de trabalho válida.");
+    }
+
+    const verifiedRemote = await runGit(projectPath, ["remote", "get-url", "origin"], {}, 5000);
+    if (verifiedRemote.code !== 0 || !verifiedRemote.stdout.includes(repoFullName)) {
+      await runGit(projectPath, ["remote", "set-url", "origin", desiredRemote], {}, 5000);
+    }
+
+    // Ensure proper default branch checkout and HEAD
+    const currentBranchCheck = await runGit(projectPath, ["branch", "--show-current"], {}, 5000);
+    const checkedOutBranch = (currentBranchCheck.code === 0 && currentBranchCheck.stdout.trim()) ? currentBranchCheck.stdout.trim() : defaultBranch;
+
+    if (!checkedOutBranch || checkedOutBranch === "HEAD") {
+      await runGit(projectPath, ["checkout", defaultBranch], {}, 10000).catch(() => {});
+    }
+
+    // Invalidate checkpoints, reload trees and notify workspace
+    invalidateProjectCheckpoints(projectPath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: projectPath, reason: "git.clone" }
+    });
+
+    const finalStatus = await getGitStatus();
 
     return {
       ok: true,
       repoFullName,
-      status: await getGitStatus()
+      cloned: true,
+      branch: finalStatus.branch || defaultBranch,
+      status: finalStatus,
+      message: "Repositório clonado com sucesso."
     };
   });
 });
@@ -4116,13 +4624,48 @@ ipcMain.handle("preview:styleFrame", async () => {
   for (const frame of frames) {
     const frameUrl = String(frame?.url || "");
     if (!frameUrl.includes("127.0.0.1") && !frameUrl.includes("localhost")) continue;
-    styled = (await injectPreviewScrollbar(frame)) || styled;
+    try {
+      styled = (await injectPreviewScrollbar(frame)) || styled;
+    } catch (err) {
+      console.warn("[Neko/Preview] scrollbar inject failed for frame", frameUrl, err instanceof Error ? err.message : String(err));
+    }
   }
-  if (styled) {
-    perfMark("t6");
-    mainWindow.webContents.send("preview:event", { type: "preview.frame-ready", properties: {} });
+  if (styled) perfMark("t6");
+  // ALWAYS emit frame-ready — scrollbar theming is cosmetic, visibility is mandatory
+  mainWindow.webContents.send("preview:event", { type: "preview.frame-ready", properties: {} });
+  return true;
+});
+
+ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
+  const visible = Boolean(payload?.visible);
+  const url = typeof payload?.url === "string" ? payload.url : "";
+  const session = Number(payload?.session);
+  const rawBounds = payload?.bounds;
+  if (!visible) {
+    detachInternalPreviewView(false);
+    return { enabled: false, state: internalPreviewState };
   }
-  return styled;
+  if (!Number.isInteger(session) || session !== activePreviewSessionId || !isAllowedInternalPreviewUrl(url)) {
+    throw new Error("Preview interno recusou uma sessão ou URL inválida.");
+  }
+  if (!previewState.url || !previewUrlsMatch(url, previewState.url)) {
+    throw new Error("A URL do Preview interno não corresponde ao servidor ativo.");
+  }
+  const x = Math.max(0, Math.round(Number(rawBounds?.x)) || 0);
+  const y = Math.max(0, Math.round(Number(rawBounds?.y)) || 0);
+  const width = Math.max(1, Math.round(Number(rawBounds?.width)) || 0);
+  const height = Math.max(1, Math.round(Number(rawBounds?.height)) || 0);
+  const view = ensureInternalPreviewView();
+  if (!view) return { enabled: false, state: "idle" as const };
+  try { mainWindow?.contentView.addChildView(view); } catch {}
+  view.setBounds({ x, y, width, height });
+  internalPreviewSession = session;
+  if (!previewUrlsMatch(internalPreviewUrl, url)) {
+    internalPreviewUrl = url;
+    logInternalPreview("loading", "navigation=requested");
+    await view.webContents.loadURL(url);
+  }
+  return { enabled: true, state: internalPreviewState };
 });
 
 // The external Preview window is created once and reused while open. The
@@ -4446,7 +4989,7 @@ ipcMain.handle("vercel:disconnect", async () => {
   return await vercelManager.disconnect();
 });
 
-ipcMain.handle("vercel:publish", async () => {
+ipcMain.handle("vercel:publish", async (_event, customProjectName?: string) => {
   licenseManager.assertAccess("publicação na Vercel");
   if (vercelPublishInProgress) {
     throw new Error("Já existe uma publicação na Vercel em andamento.");
@@ -4454,6 +4997,23 @@ ipcMain.handle("vercel:publish", async () => {
   if (!currentProject) {
     throw new Error("Selecione um projeto antes de publicar na Vercel.");
   }
+
+  const isLinked = fs.existsSync(path.join(currentProject, ".vercel", "project.json"));
+  let validatedProjectName: string | undefined;
+
+  if (!isLinked) {
+    const rawName = String(customProjectName || "").trim();
+    if (!rawName) {
+      throw new Error("Informe o nome do projeto na Vercel.");
+    }
+    if (!isValidVercelProjectName(rawName)) {
+      throw new Error(
+        "Nome do projeto inválido. O nome deve ter até 100 caracteres, estar em minúsculas e conter apenas letras, números, '.', '_' e '-' (sem '---')."
+      );
+    }
+    validatedProjectName = rawName;
+  }
+
   vercelPublishInProgress = true;
   try {
     const environment: Record<string, string> = {};
@@ -4464,7 +5024,7 @@ ipcMain.handle("vercel:publish", async () => {
       environment[names.url] = supabaseIntegration.projectUrl;
       environment[names.publishableKey] = supabaseIntegration.publishableKey;
     }
-    return await vercelManager.deploy(currentProject, environment);
+    return await vercelManager.deploy(currentProject, environment, validatedProjectName);
   } finally {
     vercelPublishInProgress = false;
   }
@@ -4599,8 +5159,15 @@ function createWindow() {
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
 
-  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
-    console.error("[Neko/Renderer] did-fail-load", { errorCode, errorDescription, validatedURL });
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    console.error("[Neko/Renderer] did-fail-load", { errorCode, errorDescription, validatedURL, isMainFrame });
+    // Detect preview subframe load failures and notify the renderer
+    if (!isMainFrame && (validatedURL.includes("127.0.0.1") || validatedURL.includes("localhost"))) {
+      mainWindow?.webContents.send("preview:event", {
+        type: "preview.frame-error",
+        properties: { errorCode, errorDescription, url: validatedURL }
+      });
+    }
   });
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
@@ -4907,6 +5474,7 @@ app.whenReady().then(() => {
 });
 
 app.on("before-quit", () => {
+  cancelGithubAuthorization("app_before_quit");
   licenseManager.shutdown();
   supabaseManager.shutdown();
   vercelManager.shutdown();
@@ -4915,17 +5483,20 @@ app.on("before-quit", () => {
 });
 
 app.on("will-quit", () => {
+  cancelGithubAuthorization("app_will_quit");
   void stopPreview();
   void stopOpenCode();
 });
 
 app.on("window-all-closed", () => {
+  cancelGithubAuthorization("window_all_closed");
   if (process.platform !== "darwin") app.quit();
 });
 
 // Process-level safety net: se o processo Node/Electron sofrer encerramento abrupto,
 // garantir a eliminação síncrona de processos órfãos no SO.
 process.on("exit", () => {
+  cancelGithubAuthorization("process_exit");
   if (process.platform === "win32") {
     if (opencodeProcess?.pid) {
       try { spawnSync("taskkill.exe", ["/PID", String(opencodeProcess.pid), "/T", "/F"], { windowsHide: true }); } catch {}
@@ -4937,12 +5508,14 @@ process.on("exit", () => {
 });
 
 process.on("SIGINT", () => {
+  cancelGithubAuthorization("sigint");
   void stopPreview();
   void stopOpenCode();
   app.quit();
 });
 
 process.on("SIGTERM", () => {
+  cancelGithubAuthorization("sigterm");
   void stopPreview();
   void stopOpenCode();
   app.quit();

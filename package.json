@@ -1,6 +1,6 @@
 {
   "name": "nekoai",
-  "version": "0.4.76",
+  "version": "0.4.78",
   "private": true,
   "description": "NekoAI - AI software builder",
   "main": "dist/main/main.js",
@@ -52,7 +52,7 @@
       "node_modules/js-yaml/**/*",
       "node_modules/lazy-val/**/*",
       "node_modules/semver/**/*",
-      "node_modules/typed-emitter/**/*",
+      "node_modules/tiny-typed-emitter/**/*",
       "package.json"
     ],
     "publish": [
