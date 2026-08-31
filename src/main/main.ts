@@ -353,6 +353,201 @@ function invalidateProjectCheckpoints(projectPath: string) {
   }
 }
 
+type ActiveGitProcess = {
+  pid: number;
+  projectPath: string;
+  args: string[];
+  startTime: number;
+  child: ChildProcess;
+};
+const activeGitProcesses = new Map<number, ActiveGitProcess>();
+let activePublishAbortController: AbortController | null = null;
+
+function killChildProcessTree(pid: number) {
+  if (!pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    } else {
+      process.kill(-pid, "SIGKILL");
+    }
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+}
+
+async function isGitProcessRunningForProject(projectPath: string): Promise<boolean> {
+  const normPath = path.resolve(projectPath).toLowerCase();
+
+  // 1. Check internal NekoAI git processes
+  for (const proc of activeGitProcesses.values()) {
+    if (path.resolve(proc.projectPath).toLowerCase() === normPath) {
+      return true;
+    }
+  }
+
+  // 2. Check external OS processes (Windows)
+  if (process.platform === "win32") {
+    try {
+      const check = await new Promise<boolean>((resolve) => {
+        const ps = spawn("powershell.exe", [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Get-CimInstance Win32_Process -Filter "Name = 'git.exe' or Name = 'git-remote-https.exe'" | Select-Object -ExpandProperty CommandLine`
+        ], { windowsHide: true });
+        let out = "";
+        ps.stdout?.on("data", c => { out += c.toString(); });
+        ps.on("close", () => {
+          const lines = out.toLowerCase();
+          if (lines.includes(normPath) || lines.includes(normPath.replace(/\\/g, "/"))) {
+            resolve(true);
+          } else {
+            resolve(false);
+          }
+        });
+        ps.on("error", () => resolve(false));
+        setTimeout(() => {
+          try { ps.kill(); } catch {}
+          resolve(false);
+        }, 1500);
+      });
+      if (check) return true;
+    } catch {}
+  }
+
+  return false;
+}
+
+function isFileHandleLocked(filePath: string): boolean {
+  try {
+    const fd = fs.openSync(filePath, "r+");
+    fs.closeSync(fd);
+    return false;
+  } catch (err: any) {
+    if (err?.code === "EBUSY" || err?.code === "EPERM" || err?.code === "EACCES") {
+      return true;
+    }
+    return false;
+  }
+}
+
+async function cleanupStaleGitLocks(projectPath: string): Promise<void> {
+  const gitDir = path.join(projectPath, ".git");
+  if (!fs.existsSync(gitDir)) return;
+
+  const lockFiles: string[] = [];
+  const indexLock = path.join(gitDir, "index.lock");
+  if (fs.existsSync(indexLock)) lockFiles.push(indexLock);
+
+  const headLock = path.join(gitDir, "HEAD.lock");
+  if (fs.existsSync(headLock)) lockFiles.push(headLock);
+
+  const configLock = path.join(gitDir, "config.lock");
+  if (fs.existsSync(configLock)) lockFiles.push(configLock);
+
+  const refsDir = path.join(gitDir, "refs");
+  if (fs.existsSync(refsDir)) {
+    const findRefLocks = (dir: string) => {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) findRefLocks(full);
+          else if (entry.isFile() && entry.name.endsWith(".lock")) lockFiles.push(full);
+        }
+      } catch {}
+    };
+    findRefLocks(refsDir);
+  }
+
+  if (lockFiles.length === 0) return;
+
+  // Check if an active git process is running
+  let isRunning = await isGitProcessRunningForProject(projectPath);
+  if (isRunning) {
+    for (let i = 0; i < 5; i++) {
+      await new Promise(r => setTimeout(r, 300));
+      isRunning = await isGitProcessRunningForProject(projectPath);
+      if (!isRunning) break;
+    }
+  }
+
+  if (isRunning) {
+    throw new Error(
+      "Existe outro processo do Git em execução neste repositório. Aguarde o término da operação ou finalize o processo antes de continuar."
+    );
+  }
+
+  // No active git process running - lock is stale/orphaned
+  for (const lockFile of lockFiles) {
+    try {
+      if (fs.existsSync(lockFile)) {
+        if (isFileHandleLocked(lockFile)) {
+          await new Promise(r => setTimeout(r, 400));
+        }
+        fs.rmSync(lockFile, { force: true });
+        console.log(`[Neko/Git] Lock órfão removido com sucesso: ${path.relative(projectPath, lockFile)}`);
+      }
+    } catch (err) {
+      console.warn(`[Neko/Git] Não foi possível remover lock órfão ${lockFile}:`, err);
+    }
+  }
+}
+
+function cancelCurrentPublishOperation(projectPath?: string) {
+  if (activePublishAbortController) {
+    try { activePublishAbortController.abort(); } catch {}
+    activePublishAbortController = null;
+  }
+  if (projectPath) {
+    const norm = path.resolve(projectPath).toLowerCase();
+    for (const [pid, proc] of activeGitProcesses) {
+      if (path.resolve(proc.projectPath).toLowerCase() === norm) {
+        killChildProcessTree(pid);
+        activeGitProcesses.delete(pid);
+      }
+    }
+    setTimeout(() => {
+      cleanupStaleGitLocks(projectPath).catch(() => {});
+    }, 200);
+  }
+}
+
+async function ensureGitignore(projectPath: string): Promise<void> {
+  const gitignorePath = path.join(projectPath, ".gitignore");
+  const defaultEntries = [
+    "node_modules",
+    "dist",
+    "build",
+    ".neko",
+    ".env",
+    ".env.local",
+    ".env.*.local",
+    "*.log",
+    ".DS_Store",
+    "Thumbs.db"
+  ];
+
+  if (!fs.existsSync(gitignorePath)) {
+    const content = defaultEntries.join("\n") + "\n";
+    await fs.promises.writeFile(gitignorePath, content, "utf8");
+    console.log("[Neko/Git] Arquivo .gitignore criado com sucesso.");
+  } else {
+    try {
+      const existing = await fs.promises.readFile(gitignorePath, "utf8");
+      const lines = existing.split(/\r?\n/).map(l => l.trim());
+      const missing = defaultEntries.filter(e => !lines.includes(e));
+      if (missing.length > 0) {
+        const append = (existing.endsWith("\n") ? "" : "\n") + missing.join("\n") + "\n";
+        await fs.promises.writeFile(gitignorePath, existing + append, "utf8");
+      }
+    } catch {}
+  }
+}
+
 const gitProjectLocks = new Map<string, Promise<any>>();
 
 async function withProjectGitLock<T>(projectPath: string, task: () => Promise<T>): Promise<T> {
@@ -364,8 +559,12 @@ async function withProjectGitLock<T>(projectPath: string, task: () => Promise<T>
 
   try {
     await previous;
+    await cleanupStaleGitLocks(projectPath);
     return await task();
   } finally {
+    try {
+      await cleanupStaleGitLocks(projectPath);
+    } catch {}
     release!();
     if (gitProjectLocks.get(key) === current) {
       gitProjectLocks.delete(key);
@@ -422,8 +621,18 @@ async function githubApi(pathname: string, init: RequestInit = {}) {
 }
 
 
-function runGit(projectPath: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}, timeoutMs = 45000) {
+function runGit(
+  projectPath: string,
+  args: string[],
+  extraEnv: NodeJS.ProcessEnv = {},
+  timeoutMs = 45000,
+  signal?: AbortSignal
+) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
+    if (signal?.aborted) {
+      return reject(new Error("Operação Git cancelada."));
+    }
+
     let resolved = false;
     let timer: NodeJS.Timeout | null = null;
 
@@ -435,6 +644,34 @@ function runGit(projectPath: string, args: string[], extraEnv: NodeJS.ProcessEnv
       stdio: ["ignore", "pipe", "pipe"]
     });
 
+    const pid = child.pid;
+    if (pid) {
+      activeGitProcesses.set(pid, {
+        pid,
+        projectPath,
+        args,
+        startTime: Date.now(),
+        child
+      });
+    }
+
+    const cleanupProcess = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (pid) activeGitProcesses.delete(pid);
+    };
+
+    const abortHandler = () => {
+      if (resolved) return;
+      resolved = true;
+      cleanupProcess();
+      if (pid) killChildProcessTree(pid);
+      reject(new Error("Operação Git cancelada."));
+    };
+
+    if (signal) {
+      signal.addEventListener("abort", abortHandler, { once: true });
+    }
+
     let stdout = "";
     let stderr = "";
 
@@ -442,13 +679,8 @@ function runGit(projectPath: string, args: string[], extraEnv: NodeJS.ProcessEnv
       timer = setTimeout(() => {
         if (resolved) return;
         resolved = true;
-        try {
-          if (process.platform === "win32" && child.pid) {
-            spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-          } else {
-            child.kill("SIGKILL");
-          }
-        } catch {}
+        cleanupProcess();
+        if (pid) killChildProcessTree(pid);
         resolve({
           code: 124,
           stdout: stdout.trim(),
@@ -460,13 +692,15 @@ function runGit(projectPath: string, args: string[], extraEnv: NodeJS.ProcessEnv
     child.stdout?.on("data", chunk => { stdout += chunk.toString(); });
     child.stderr?.on("data", chunk => { stderr += chunk.toString(); });
     child.on("error", err => {
-      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", abortHandler);
+      cleanupProcess();
       if (resolved) return;
       resolved = true;
       reject(err);
     });
     child.on("exit", code => {
-      if (timer) clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", abortHandler);
+      cleanupProcess();
       if (resolved) return;
       resolved = true;
       resolve({
@@ -478,7 +712,13 @@ function runGit(projectPath: string, args: string[], extraEnv: NodeJS.ProcessEnv
   });
 }
 
-async function runGitWithGithubAuth(projectPath: string, args: string[], token: string, timeoutMs = 45000) {
+async function runGitWithGithubAuth(
+  projectPath: string,
+  args: string[],
+  token: string,
+  timeoutMs = 45000,
+  signal?: AbortSignal
+) {
   const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "nekoai-git-auth-"));
   const askpassPath = path.join(tempRoot, process.platform === "win32" ? "askpass.cmd" : "askpass.sh");
 
@@ -512,7 +752,7 @@ async function runGitWithGithubAuth(projectPath: string, args: string[], token: 
       GIT_ASKPASS_REQUIRE: "force",
       GIT_TERMINAL_PROMPT: "0",
       NEKO_GITHUB_TOKEN: token
-    }, timeoutMs);
+    }, timeoutMs, signal);
   } finally {
     await fs.promises.rm(tempRoot, { recursive: true, force: true }).catch(() => {});
   }
@@ -2745,12 +2985,13 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string })
     if (!status.initialized || !status.remote || !status.linkedRepo) {
       throw new Error("Este projeto ainda não está conectado a um repositório GitHub.");
     }
-    if (!status.branch) throw new Error("Não foi possível identificar a branch atual.");
     const token = await getGithubAccessToken();
+    const branch = status.branch || "main";
 
-    const add = await runGit(projectPath, ["add", "-A"], {}, 15000);
-    if (add.code !== 0) throw new Error(formatGitHubGitError(add, "preparar arquivos para o commit"));
+    // Ensure .gitignore exists and is populated
+    await ensureGitignore(projectPath);
 
+    // Configure user.name and user.email if not set
     const name = await runGit(projectPath, ["config", "user.name"], {}, 5000);
     if (name.code !== 0 || !name.stdout) {
       const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
@@ -2769,15 +3010,43 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string })
       if (setEmail.code !== 0) throw new Error("Não foi possível configurar o e-mail do commit.");
     }
 
+    // Check if HEAD has commits
+    const headCheck = await runGit(projectPath, ["rev-parse", "--verify", "HEAD"], {}, 5000);
+    const hasExistingCommits = headCheck.code === 0;
+
+    // If no branch is currently active and no commits exist, ensure branch is main
+    if (!hasExistingCommits) {
+      await runGit(projectPath, ["branch", "-M", branch], {}, 5000);
+    }
+
+    const add = await runGit(projectPath, ["add", "-A"], {}, 20000);
+    if (add.code !== 0) throw new Error(formatGitHubGitError(add, "preparar arquivos para o commit"));
+
     const commit = await runGit(projectPath, ["commit", "-m", message], {}, 20000);
     if (commit.code !== 0) {
       const raw = `${commit.stderr} ${commit.stdout}`.toLowerCase();
-      if (raw.includes("nothing to commit")) return { ok: true, committed: false, pushed: false, status: await getGitStatus(), message: "Não há alterações para enviar." };
+      if (raw.includes("nothing to commit")) {
+        if (hasExistingCommits) {
+          const push = await runGitWithGithubAuth(projectPath, ["push", "origin", branch], token, 35000);
+          if (push.code !== 0) {
+            const pushTrack = await runGitWithGithubAuth(projectPath, ["push", "-u", "origin", branch], token, 35000);
+            if (pushTrack.code !== 0) throw new Error(formatGitHubGitError(pushTrack, `enviar o commit para a branch "${branch}"`));
+          }
+          return { ok: true, committed: false, pushed: true, status: await getGitStatus(), message: "Alterações enviadas para o GitHub." };
+        }
+        return { ok: true, committed: false, pushed: false, status: await getGitStatus(), message: "Não há alterações para enviar." };
+      }
       throw new Error(formatGitHubGitError(commit, "criar o commit"));
     }
 
-    const push = await runGitWithGithubAuth(projectPath, ["push", "origin", status.branch], token, 35000);
-    if (push.code !== 0) throw new Error(formatGitHubGitError(push, `enviar o commit para a branch "${status.branch}"`));
+    // Push with upstream fallback
+    let push = await runGitWithGithubAuth(projectPath, ["push", "-u", "origin", branch], token, 35000);
+    if (push.code !== 0) {
+      push = await runGitWithGithubAuth(projectPath, ["push", "origin", branch], token, 35000);
+      if (push.code !== 0) {
+        throw new Error(formatGitHubGitError(push, `enviar o commit para a branch "${branch}"`));
+      }
+    }
 
     return { ok: true, committed: true, pushed: true, status: await getGitStatus(), message: "Commit criado e enviado para o GitHub." };
   });
@@ -2794,101 +3063,167 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
     throw new Error("Escolha um nome de repositório válido para o GitHub.");
   }
 
+  // Cancel any existing publish operation on this project before starting
+  cancelCurrentPublishOperation(projectPath);
+  const abortController = new AbortController();
+  activePublishAbortController = abortController;
+  const signal = abortController.signal;
+
   return withProjectGitLock(projectPath, async () => {
-    const token = await getGithubAccessToken();
+    try {
+      const token = await getGithubAccessToken();
 
-    const createResponse = await fetchWithTimeout("https://api.github.com/user/repos", {
-      method: "POST",
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        name: repoName,
-        private: isPrivate,
-        auto_init: false
-      })
-    }, 20000);
+      let createdRepo: any = null;
+      let cloneUrl = "";
+      let defaultBranch = "main";
 
-    if (!createResponse.ok) {
-      const body = await createResponse.text().catch(() => "");
-      let detail = "";
-      try {
-        const parsed = JSON.parse(body);
-        detail = parsed?.message || "";
-        if (Array.isArray(parsed?.errors) && parsed.errors[0]?.message) {
-          detail = `${detail} (${parsed.errors[0].message})`;
+      const createResponse = await fetchWithTimeout("https://api.github.com/user/repos", {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          name: repoName,
+          private: isPrivate,
+          auto_init: false
+        })
+      }, 20000);
+
+      if (!createResponse.ok) {
+        const body = await createResponse.text().catch(() => "");
+        let isAlreadyExists = false;
+        try {
+          const parsed = JSON.parse(body);
+          if (Array.isArray(parsed?.errors) && parsed.errors.some((e: any) => String(e?.message || "").toLowerCase().includes("already exists"))) {
+            isAlreadyExists = true;
+          }
+        } catch {}
+
+        if (isAlreadyExists || createResponse.status === 422) {
+          // Check if repo exists on authenticated user's account and reuse it
+          const userAuth = await githubApi("/user").then(r => r.json()).catch(() => null);
+          if (userAuth?.login) {
+            const existingRepoRes = await fetchWithTimeout(`https://api.github.com/repos/${userAuth.login}/${repoName}`, {
+              headers: {
+                Accept: "application/vnd.github+json",
+                Authorization: `Bearer ${token}`,
+                "X-GitHub-Api-Version": "2022-11-28"
+              }
+            }, 10000).catch(() => null);
+            if (existingRepoRes && existingRepoRes.ok) {
+              createdRepo = await existingRepoRes.json();
+              cloneUrl = String(createdRepo?.clone_url || `https://github.com/${createdRepo?.full_name}.git`);
+              defaultBranch = String(createdRepo?.default_branch || "main");
+            }
+          }
         }
-      } catch {}
-      throw new Error(`Não foi possível criar o repositório no GitHub (HTTP ${createResponse.status})${detail ? `: ${detail}` : ""}.`);
+
+        if (!createdRepo) {
+          let detail = "";
+          try {
+            const parsed = JSON.parse(body);
+            detail = parsed?.message || "";
+            if (Array.isArray(parsed?.errors) && parsed.errors[0]?.message) {
+              detail = `${detail} (${parsed.errors[0].message})`;
+            }
+          } catch {}
+          throw new Error(`Não foi possível criar o repositório no GitHub (HTTP ${createResponse.status})${detail ? `: ${detail}` : ""}.`);
+        }
+      } else {
+        createdRepo = await createResponse.json();
+        cloneUrl = String(createdRepo?.clone_url || `https://github.com/${createdRepo?.full_name}.git`);
+        defaultBranch = String(createdRepo?.default_branch || "main");
+      }
+
+      if (signal.aborted) throw new Error("Publicação cancelada pelo usuário.");
+
+      // Ensure .gitignore
+      await ensureGitignore(projectPath);
+
+      // Verify/init git
+      const inside = await runGit(projectPath, ["rev-parse", "--is-inside-work-tree"], {}, 5000, signal);
+      if (inside.code !== 0 || inside.stdout !== "true") {
+        const init = await runGit(projectPath, ["init", "-b", defaultBranch], {}, 15000, signal);
+        if (init.code !== 0) throw new Error(formatGitHubGitError(init, "inicializar o Git"));
+      }
+
+      const currentBranch = await runGit(projectPath, ["rev-parse", "--abbrev-ref", "HEAD"], {}, 5000, signal);
+      const branchName = (currentBranch.code === 0 && currentBranch.stdout.trim()) ? currentBranch.stdout.trim() : defaultBranch;
+      if (branchName !== defaultBranch) {
+        await runGit(projectPath, ["branch", "-M", defaultBranch], {}, 5000, signal);
+      }
+
+      const remoteCheck = await runGit(projectPath, ["remote", "get-url", "origin"], {}, 5000, signal);
+      if (remoteCheck.code === 0) {
+        await runGit(projectPath, ["remote", "set-url", "origin", cloneUrl], {}, 10000, signal);
+      } else {
+        const remoteAdd = await runGit(projectPath, ["remote", "add", "origin", cloneUrl], {}, 10000, signal);
+        if (remoteAdd.code !== 0) throw new Error(formatGitHubGitError(remoteAdd, "configurar o remote origin"));
+      }
+
+      const name = await runGit(projectPath, ["config", "user.name"], {}, 5000, signal);
+      if (name.code !== 0 || !name.stdout) {
+        const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
+        const fallbackName = String((auth as any)?.name || (auth as any)?.login || "NekoAI User");
+        await runGit(projectPath, ["config", "user.name", fallbackName], {}, 10000, signal);
+      }
+
+      const email = await runGit(projectPath, ["config", "user.email"], {}, 5000, signal);
+      if (email.code !== 0 || !email.stdout) {
+        const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
+        const id = typeof (auth as any)?.id === "number" ? (auth as any).id : null;
+        const login = String((auth as any)?.login || "nekoai");
+        const fallbackEmail = id ? `${id}+${login}@users.noreply.github.com` : `${login}@users.noreply.github.com`;
+        await runGit(projectPath, ["config", "user.email", fallbackEmail], {}, 10000, signal);
+      }
+
+      await runGit(projectPath, ["add", "-A"], {}, 20000, signal);
+
+      const commitCheck = await runGit(projectPath, ["rev-parse", "--verify", "HEAD"], {}, 5000, signal);
+      if (commitCheck.code !== 0) {
+        const commit = await runGit(projectPath, ["commit", "-m", "Initial commit from NekoAI"], {}, 20000, signal);
+        if (commit.code !== 0 && !commit.stdout.includes("nothing to commit")) {
+          throw new Error(formatGitHubGitError(commit, "criar o commit inicial"));
+        }
+      } else {
+        await runGit(projectPath, ["commit", "-m", "Update from NekoAI"], {}, 20000, signal);
+      }
+
+      const push = await runGitWithGithubAuth(projectPath, ["push", "-u", "origin", defaultBranch], token, 35000, signal);
+      if (push.code !== 0) {
+        throw new Error(formatGitHubGitError(push, `publicar os arquivos na branch "${defaultBranch}"`));
+      }
+
+      return {
+        ok: true,
+        repo: {
+          id: createdRepo.id,
+          name: createdRepo.name,
+          fullName: createdRepo.full_name,
+          private: createdRepo.private,
+          htmlUrl: createdRepo.html_url,
+          defaultBranch
+        },
+        status: await getGitStatus()
+      };
+    } finally {
+      if (activePublishAbortController === abortController) {
+        activePublishAbortController = null;
+      }
     }
-
-    const createdRepo = await createResponse.json();
-    const cloneUrl = String(createdRepo?.clone_url || `https://github.com/${createdRepo?.full_name}.git`);
-    const defaultBranch = String(createdRepo?.default_branch || "main");
-
-    const status = await getGitStatus();
-    if (!status.initialized) {
-      const init = await runGit(projectPath, ["init", "-b", defaultBranch]);
-      if (init.code !== 0) throw new Error(formatGitHubGitError(init, "inicializar o Git"));
-    }
-
-    const currentBranch = await runGit(projectPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
-    const branchName = (currentBranch.code === 0 && currentBranch.stdout.trim()) ? currentBranch.stdout.trim() : defaultBranch;
-    if (branchName !== defaultBranch) {
-      await runGit(projectPath, ["branch", "-M", defaultBranch]);
-    }
-
-    const remoteCheck = await runGit(projectPath, ["remote", "get-url", "origin"]);
-    if (remoteCheck.code === 0) {
-      await runGit(projectPath, ["remote", "set-url", "origin", cloneUrl]);
-    } else {
-      const remoteAdd = await runGit(projectPath, ["remote", "add", "origin", cloneUrl]);
-      if (remoteAdd.code !== 0) throw new Error(formatGitHubGitError(remoteAdd, "configurar o remote origin"));
-    }
-
-    const name = await runGit(projectPath, ["config", "user.name"], {}, 5000);
-    if (name.code !== 0 || !name.stdout) {
-      const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
-      const fallbackName = String((auth as any)?.name || (auth as any)?.login || "NekoAI User");
-      await runGit(projectPath, ["config", "user.name", fallbackName], {}, 10000);
-    }
-
-    const email = await runGit(projectPath, ["config", "user.email"], {}, 5000);
-    if (email.code !== 0 || !email.stdout) {
-      const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
-      const id = typeof (auth as any)?.id === "number" ? (auth as any).id : null;
-      const login = String((auth as any)?.login || "nekoai");
-      const fallbackEmail = id ? `${id}+${login}@users.noreply.github.com` : `${login}@users.noreply.github.com`;
-      await runGit(projectPath, ["config", "user.email", fallbackEmail], {}, 10000);
-    }
-
-    await runGit(projectPath, ["add", "-A"], {}, 15000);
-    const commit = await runGit(projectPath, ["commit", "-m", "Initial commit from NekoAI"], {}, 20000);
-    if (commit.code !== 0 && !commit.stdout.includes("nothing to commit")) {
-      // Non-fatal if tree already committed
-    }
-
-    const push = await runGitWithGithubAuth(projectPath, ["push", "-u", "origin", defaultBranch], token, 35000);
-    if (push.code !== 0) {
-      throw new Error(formatGitHubGitError(push, `publicar os arquivos na branch "${defaultBranch}"`));
-    }
-
-    return {
-      ok: true,
-      repo: {
-        id: createdRepo.id,
-        name: createdRepo.name,
-        fullName: createdRepo.full_name,
-        private: createdRepo.private,
-        htmlUrl: createdRepo.html_url,
-        defaultBranch
-      },
-      status: await getGitStatus()
-    };
   });
+});
+
+ipcMain.handle("github:cancelPublish", async () => {
+  if (currentProject) {
+    cancelCurrentPublishOperation(currentProject);
+  } else {
+    cancelCurrentPublishOperation();
+  }
+  return { ok: true, canceled: true };
 });
 
 ipcMain.handle("github:gitStatus", async () => getGitStatus());
