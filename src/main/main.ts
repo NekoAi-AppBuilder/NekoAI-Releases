@@ -15,7 +15,11 @@ import { vercelManager, getSupabaseEnvironmentNames } from "./vercel/vercel-mana
 import { isValidVercelProjectName } from "./vercel/vercel-types";
 import { licenseManager } from "./license/license-manager";
 import { updaterManager } from "./updater";
-
+import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES } from "../shared/vision";
+import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession } from "./vision-fallback";
+import { discoverPreviewRoutes, routeFromUrl, normalizeRoutePath, isDynamicSegment, type PreviewRoute } from "./preview-routes";
+import { analyzeSite, cancelAllSiteClones, importSiteAssets, type SiteCloneAnalysis, type SiteCloneLimits } from "./site-clone";
+import { captureSiteChromium } from "./site-capture";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -75,6 +79,77 @@ let isStoppingOpencodeIntentionally = false;
 
 function logService(step: string, extra?: string) {
   console.log(`[Neko/Service] ${step}${extra ? ` ${extra}` : ""}`);
+}
+
+// ============================================================
+// PROJECT ROOT vs APPLICATION ROOT
+// ------------------------------------------------------------
+// applicationRoot: where NekoAI is installed/running (its own code).
+// projectRoot: the user's open workspace. These can NEVER be the same.
+//
+// The active workspace (activeWorkspace.projectPath) is the single source
+// of truth. There is NO fallback to process.cwd(), __dirname or
+// app.getAppPath() when resolving the user project: if the root cannot be
+// determined or points inside NekoAI itself, the operation is blocked.
+// ============================================================
+
+let cachedApplicationRoot: string | null = null;
+
+function getApplicationRoot(): string {
+  if (cachedApplicationRoot) return cachedApplicationRoot;
+  try {
+    cachedApplicationRoot = path.resolve(app.getAppPath());
+  } catch {
+    cachedApplicationRoot = path.resolve(process.cwd());
+  }
+  return cachedApplicationRoot;
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedCandidate = path.resolve(candidate);
+  if (resolvedCandidate === resolvedRoot) return true;
+  return resolvedCandidate.startsWith(resolvedRoot + path.sep);
+}
+
+function isInsideNekoApplication(root: string): boolean {
+  try {
+    return isPathInside(getApplicationRoot(), root);
+  } catch {
+    return true;
+  }
+}
+
+// Validates a candidate project root. Throws when the root is missing or
+// when it points inside the NekoAI application itself. Never falls back.
+function assertProjectRootSafe(root: string | null | undefined, operation: string): string {
+  if (!root || !String(root).trim()) {
+    throw new Error("Não foi possível determinar o diretório do projeto ativo.");
+  }
+  const resolved = path.resolve(String(root).trim());
+  if (isInsideNekoApplication(resolved)) {
+    console.warn(`[PROJECT WORKSPACE] operation=${operation} blocked reason=nekoai-directory projectRoot=${resolved} applicationRoot=${getApplicationRoot()}`);
+    throw new Error("Não é permitido utilizar o diretório do NekoAI como workspace do projeto.");
+  }
+  return resolved;
+}
+
+// Best-effort read of the current project root. Returns null instead of
+// throwing so headers/SSE streams can degrade safely without a fallback.
+function getActiveProjectRoot(): string | null {
+  const candidate = activeWorkspace?.projectPath ?? currentProject;
+  if (!candidate) return null;
+  try {
+    const resolved = path.resolve(candidate);
+    if (isInsideNekoApplication(resolved)) return null;
+    return resolved;
+  } catch {
+    return null;
+  }
+}
+
+function logProjectWorkspace(operation: string, projectRoot: string | null) {
+  console.log(`[PROJECT WORKSPACE] operation=${operation} projectId=${projectRoot ? path.basename(projectRoot) : "none"} projectRoot=${projectRoot ?? "none"} applicationRoot=${getApplicationRoot()}`);
 }
 
 function invalidateServiceGate() {
@@ -141,13 +216,339 @@ function newTaskCorrelationId(sessionId: string): string {
   return id;
 }
 
+// ============================================================
+// TASK STATE MACHINE
+// ------------------------------------------------------------
+// TASK / AGENT / TOOL / PREVIEW / UI are independent concepts.
+// The agent session is the only source of truth for task progress; the
+// Preview (Vite/HMR) never influences task states. This machine is owned by
+// the main process and every transition is pushed to the renderer through
+// the authoritative `neko.task.state` event.
+//
+// States: idle, running, waiting_for_user, waiting_for_approval,
+//         completed, cancelled, failed
+// ============================================================
+type TaskState = "idle" | "running" | "waiting_for_user" | "waiting_for_approval" | "completed" | "cancelled" | "failed";
+type TaskRecord = {
+  taskId: string;
+  sessionId: string;
+  state: TaskState;
+  planMode: boolean;
+  createdAt: number;
+  stateAt: number;
+  // True once the engine actually started processing this task (busy status
+  // or real tool/file activity). An idle BEFORE the task started is engine
+  // chatter and can never finalize the task.
+  sawBusy: boolean;
+  // Timestamp of the last busy status / real activity. Used to debounce the
+  // completion determination against transient idle chatter mid-cycle.
+  lastActivityAt: number;
+  lastAssistantMessageId: string;
+  askedQuestionIds: string[];
+};
+const taskRecords = new Map<string, TaskRecord>();
+let taskQuestionCounter = 0;
+const idleDeterminationGate = new Map<string, { running: boolean; lastAt: number }>();
+const idleRecheckTimers = new Map<string, NodeJS.Timeout>();
+const previewErrorEmissionAt = new Map<string, number>();
+
+// In-memory capability cache for the provider catalog, refreshed whenever
+// the renderer loads providers. Vision capability decisions never trigger
+// an additional providers:list request — they only read this cache.
+const providerCatalogCache = new Map<string, { attachment: boolean }>();
+
+// Resolves the REAL provider id for the Vision Fallback model against the
+// catalog cache. The catalog of OpenCode 1.18.x exposes OpenCode Zen as
+// `opencode` (historically `opencode-zen`); candidates are checked in order
+// so both catalogs keep working. No providers:list request is made here.
+function resolveVisionFallbackProvider(): string {
+  for (const candidate of VISION_FALLBACK_PROVIDER_CANDIDATES) {
+    if (providerCatalogCache.has(`${candidate}:${VISION_FALLBACK_MODEL.modelID}`)) return candidate;
+  }
+  return VISION_FALLBACK_MODEL.providerID;
+}
+
+function logTask(event: string, taskId: string, sessionId: string, extra = "") {
+  console.log(`[TASK] ${event} taskId=${taskId || "none"} sessionId=${(sessionId || "none").slice(0, 8)} at=${Date.now()}${extra ? ` ${extra}` : ""}`);
+}
+
+function setTaskState(sessionId: string, state: TaskState, reason: string, extra: Record<string, any> = {}): boolean {
+  if (!sessionId) return false;
+  let record = taskRecords.get(sessionId);
+  if (!record) {
+    record = {
+      taskId: sessionTaskIds.get(sessionId) ?? "",
+      sessionId,
+      state: "idle",
+      planMode: false,
+      createdAt: Date.now(),
+      stateAt: 0,
+      sawBusy: false,
+      lastActivityAt: 0,
+      lastAssistantMessageId: "",
+      askedQuestionIds: []
+    };
+    taskRecords.set(sessionId, record);
+  }
+  const previous = record.state;
+  if (previous === state) return false;
+  record.state = state;
+  record.stateAt = Date.now();
+  logTask("state-change", record.taskId, sessionId, `state=${state} previous=${previous} reason=${logSafeText(reason)}`);
+  mainWindow?.webContents.send("opencode:event", {
+    type: "neko.task.state",
+    properties: {
+      sessionID: sessionId,
+      taskId: record.taskId || undefined,
+      state,
+      previous,
+      reason: logSafeText(reason),
+      at: Date.now(),
+      ...extra
+    }
+  });
+  return true;
+}
+
+function resolveTaskIdForSession(sessionId: string): string {
+  const record = taskRecords.get(sessionId);
+  if (record?.taskId) return record.taskId;
+  let taskId = sessionTaskIds.get(sessionId) ?? "";
+  if (!taskId && sessionTaskIds.size === 1) {
+    taskId = Array.from(sessionTaskIds.values())[0] || "";
+  }
+  return taskId;
+}
+
+// Pending permissions are the engine's approval requests. Only permissions
+// created after the current task started count: an old permission must never
+// block or influence a new task.
+async function fetchPendingPermissions(sessionId: string, timeoutMs = 4000): Promise<any[]> {
+  try {
+    const response = await fetchWithTimeout(`${opencodeUrl}/permission`, { headers: opencodeDirectoryHeaders() }, timeoutMs);
+    if (!response.ok) return [];
+    const payload = await response.json();
+    const list = Array.isArray(payload) ? payload : (payload?.data ?? payload?.permissions ?? []);
+    if (!Array.isArray(list)) return [];
+    const record = taskRecords.get(sessionId);
+    const since = record?.createdAt ?? 0;
+    return list
+      .filter((item: any) => item?.sessionID === sessionId)
+      .filter((item: any) => Number(item?.time?.created ?? 0) >= since)
+      .sort((a: any, b: any) => Number(a?.time?.created ?? 0) - Number(b?.time?.created ?? 0));
+  } catch {
+    return [];
+  }
+}
+
+async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000): Promise<{ id: string; text: string; created: number } | null> {
+  try {
+    const response = await fetchWithTimeout(
+      `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
+      { headers: opencodeDirectoryHeaders() },
+      timeoutMs
+    );
+    if (!response.ok) return null;
+    const payload: any = await response.json();
+    const entries: any[] = Array.isArray(payload) ? payload : (payload?.data ?? []);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      const role = entry?.info?.role ?? entry?.role;
+      if (role !== "assistant") continue;
+      const parts = Array.isArray(entry?.parts) ? entry.parts : [];
+      const text = parts
+        .filter((part: any) => part?.type === "text" && typeof part?.text === "string")
+        .map((part: any) => part.text.trim())
+        .filter(Boolean)
+        .join("\n\n")
+        .trim();
+      if (!text) continue;
+      const created = Number(entry?.info?.time?.created ?? entry?.time?.created ?? entry?.createdAt ?? 0);
+      return { id: String(entry?.info?.id ?? entry?.id ?? ""), text, created };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// The engine has no dedicated "question" event in this protocol version: an
+// interactive question is an assistant message that ends asking the user.
+// Only that exact shape (trailing question mark) turns an idle session into
+// waiting_for_user; everything else is a real completion.
+function detectQuestion(text: string): boolean {
+  const normalized = String(text ?? "").trim();
+  if (!normalized) return false;
+  return /[?？]\s*$/.test(normalized);
+}
+
+function extractQuestionOptions(text: string): string[] {
+  const options: string[] = [];
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const match = line.trim().match(/^(?:(\d+)[.)]|[-*])\s+(.{2,140})$/);
+    if (match) options.push((match[1] ? `${match[1]}. ` : "") + match[2].trim());
+  }
+  return options.length >= 2 ? options : [];
+}
+
+// Authoritative cross-check of the engine state. The determination only
+// finalizes while the engine reports itself idle: an idle event that races a
+// busy engine (long tool execution, mid-cycle pause) must never conclude a
+// task that is still being processed.
+async function fetchSessionEngineStatus(sessionId: string, timeoutMs = 4000): Promise<"busy" | "retry" | "idle" | "unknown"> {
+  try {
+    const response = await fetchWithTimeout(`${opencodeUrl}/session/status`, { headers: opencodeDirectoryHeaders() }, timeoutMs);
+    if (!response.ok) return "unknown";
+    const payload: any = await response.json();
+    const statuses = payload?.data ?? payload ?? {};
+    const status = statuses?.[sessionId];
+    const engineStatus = String(status?.type ?? status ?? "").toLowerCase();
+    if (engineStatus === "busy" || engineStatus === "retry" || engineStatus === "idle") return engineStatus;
+    return "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+// Authoritative completion/queue determination, executed every time the
+// engine signals the session finished its current cycle (session.idle).
+// 1) pending permission  -> waiting_for_approval (UI shows the approval)
+// 2) trailing question   -> waiting_for_user     (UI shows the question)
+// 3) otherwise           -> completed            (real completion)
+// The determination runs BEFORE the idle event is forwarded, so the renderer
+// can never conclude a task that actually needs user input.
+function scheduleIdleRecheck(sessionId: string, taskId: string) {
+  if (idleRecheckTimers.has(sessionId)) return;
+  const timer = setTimeout(() => {
+    idleRecheckTimers.delete(sessionId);
+    void runIdleDetermination(sessionId, taskId);
+  }, 1100);
+  idleRecheckTimers.set(sessionId, timer);
+}
+
+async function runIdleDetermination(sessionId: string, taskId: string) {
+  if (!sessionId) return;
+  const record = taskRecords.get(sessionId);
+  if (!record) return; // idle without an in-flight task is not a task event
+  if (record.state === "completed" || record.state === "cancelled" || record.state === "failed") return;
+  // An idle before the engine ever started processing this task is chatter
+  // (for example the idle state left by the previous task). Never conclude.
+  if (!record.sawBusy) return;
+  // Debounce: OpenCode can emit transient idle between queued actions. Only
+  // finalize after the engine stayed quiet for ~1s; a recheck is scheduled
+  // in case no further idle event arrives.
+  const quietFor = Date.now() - (record.lastActivityAt || record.createdAt);
+  if (quietFor < 900) {
+    scheduleIdleRecheck(sessionId, taskId);
+    return;
+  }
+
+  if (record.state === "waiting_for_user" || record.state === "waiting_for_approval") {
+    // Re-check pending permissions: an approval can appear after a question
+    // was already detected.
+    if (record.state === "waiting_for_user") {
+      const pending = await fetchPendingPermissions(sessionId);
+      const current = taskRecords.get(sessionId);
+      if (current !== record) return; // a new task replaced this one
+      if (pending.length) {
+        const latest = pending[pending.length - 1];
+        setTaskState(sessionId, "waiting_for_approval", "permission-pending", { permission: latest });
+        logTask("approval-required", taskId, sessionId, `permission=${String(latest?.id ?? "").slice(0, 12)}`);
+      }
+    }
+    return;
+  }
+
+  const gate = idleDeterminationGate.get(sessionId);
+  const now = Date.now();
+  if (gate?.running) return;
+  if (gate && now - gate.lastAt < 750) return;
+  idleDeterminationGate.set(sessionId, { running: true, lastAt: now });
+  try {
+    // The engine must be idle for the completion/queue decision. A busy or
+    // retrying engine means the task is still being processed: schedule a
+    // recheck instead of finalizing prematurely.
+    const engineStatus = await fetchSessionEngineStatus(sessionId);
+    const currentBeforePermission = taskRecords.get(sessionId);
+    if (currentBeforePermission !== record) return; // a new task replaced this one mid-check
+    if (engineStatus === "busy" || engineStatus === "retry") {
+      scheduleIdleRecheck(sessionId, taskId);
+      return;
+    }
+    const pending = await fetchPendingPermissions(sessionId);
+    const current = taskRecords.get(sessionId);
+    if (current !== record) return; // a new task replaced this one mid-check
+    if (pending.length) {
+      const latest = pending[pending.length - 1];
+      setTaskState(sessionId, "waiting_for_approval", "permission-pending", { permission: latest });
+      logTask("approval-required", taskId, sessionId, `permission=${String(latest?.id ?? "").slice(0, 12)}`);
+      return;
+    }
+    const latest = await fetchLatestAssistantMessage(sessionId);
+    const currentAfterMessages = taskRecords.get(sessionId);
+    if (currentAfterMessages !== record) return; // a new task replaced this one mid-check
+    // Messages created before this task started belong to older tasks and
+    // can never trigger a question for this one.
+    const messageIsFresh = Boolean(latest?.id) && latest != null && latest.created >= record.createdAt;
+    if (latest?.text && messageIsFresh && !record.planMode) {
+      const alreadyAsked = record.lastAssistantMessageId === latest.id && record.askedQuestionIds.length > 0;
+      if (detectQuestion(latest.text) && !alreadyAsked) {
+        record.lastAssistantMessageId = latest.id;
+        const questionId = `q${(++taskQuestionCounter).toString(36)}`;
+        record.askedQuestionIds.push(questionId);
+        setTaskState(sessionId, "waiting_for_user", "question-asked", {
+          questionId,
+          question: latest.text,
+          options: extractQuestionOptions(latest.text),
+          allowFreeText: true
+        });
+        logTask("question", taskId, sessionId, `questionId=${questionId}`);
+        return;
+      }
+    }
+    clearActiveAgentRequest(sessionId);
+    setTaskState(sessionId, "completed", "session-idle");
+    logTask("completion-detected", taskId, sessionId);
+    logTask("completed", taskId, sessionId);
+  } finally {
+    const gateEntry = idleDeterminationGate.get(sessionId);
+    if (gateEntry) {
+      gateEntry.running = false;
+      gateEntry.lastAt = Date.now();
+    }
+  }
+}
+
+function resetTaskRuntime() {
+  for (const active of activeAgentRequests.values()) {
+    if (active.retryTimer) clearTimeout(active.retryTimer);
+  }
+  activeAgentRequests.clear();
+  forwardedSessionStatus.clear();
+  engineRetryStates.clear();
+  retryExhaustedSessions.clear();
+  taskRecords.clear();
+  sessionTaskIds.clear();
+  taskQuestionCounter = 0;
+  idleDeterminationGate.clear();
+  for (const timer of idleRecheckTimers.values()) clearTimeout(timer);
+  idleRecheckTimers.clear();
+  previewErrorEmissionAt.clear();
+  clearVisionFallbackSessions();
+  cancelAllSiteClones();
+  clearStatusCache();
+}
+
 // True when the event shows the agent doing real work (tools, commands,
 // permissions or a real project file), as opposed to status chatter.
+// file.watcher.updated is NOT agent activity: the filesystem watcher fires
+// for HMR writes, external editors and build caches as well, so it must
+// never count as agent progress.
 function isRealAgentActivity(eventType: string, props: any): boolean {
   if (eventType.startsWith("tool.")) return true;
   if (eventType === "command.executed" || eventType === "permission.asked") return true;
   if (eventType === "message.part.updated" && String(props?.part?.type ?? "") === "tool") return true;
-  if (eventType.startsWith("file.")) {
+  if (eventType === "file.edited") {
     const filePath = String(props?.file?.path ?? props?.filePath ?? props?.path ?? (typeof props?.file === "string" ? props.file : "") ?? "");
     return Boolean(filePath) && !shouldIgnoreEventPath(filePath);
   }
@@ -1126,12 +1527,18 @@ async function pollGithubDevice(deviceCode: string, intervalSeconds: number, att
 }
 
 function opencodeDirectoryHeaders(): Record<string, string> {
-  return currentProject ? { "x-opencode-directory": encodeURIComponent(currentProject) } : {};
+  const root = getActiveProjectRoot();
+  return root ? { "x-opencode-directory": encodeURIComponent(root) } : {};
 }
 
 async function getOpencodeClient() {
   const sdk = await import("@opencode-ai/sdk");
-  return sdk.createOpencodeClient({ baseUrl: opencodeUrl, throwOnError: true });
+  const directory = getActiveProjectRoot();
+  return sdk.createOpencodeClient({
+    baseUrl: opencodeUrl,
+    throwOnError: true,
+    ...(directory ? { directory } : {})
+  });
 }
 
 function resolveExecutableFromPath(name: string): string | null {
@@ -1331,17 +1738,19 @@ function startProjectWatcher(projectPath: string, gen?: number) {
 }
 
 async function startOpenCodeInternal(projectPath: string, transitionGen?: number) {
+  const safeProjectPath = assertProjectRootSafe(projectPath, "start-service");
+  logProjectWorkspace("start-service", safeProjectPath);
   clearStatusCache();
   forwardedSessionStatus.clear();
 
   const executable = getOpencodePath();
   const port = await findFreePort(4097);
   opencodeUrl = `http://127.0.0.1:${port}`;
-  currentProject = projectPath;
-  startProjectWatcher(projectPath, transitionGen);
+  currentProject = safeProjectPath;
+  startProjectWatcher(safeProjectPath, transitionGen);
 
-  console.log("[Neko/OpenCode] starting", { executable, projectPath, port, generation: transitionGen });
-  logService("starting", `project=${projectPath} port=${port} gen=${transitionGen}`);
+  console.log("[Neko/OpenCode] starting", { executable, projectPath: safeProjectPath, port, generation: transitionGen });
+  logService("starting", `project=${safeProjectPath} port=${port} gen=${transitionGen}`);
 
   const isWindows = process.platform === "win32";
   const isCmdLauncher = isWindows && /\.(cmd|bat)$/i.test(executable);
@@ -1355,7 +1764,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     spawnExecutable,
     spawnArgs,
     {
-      cwd: projectPath,
+      cwd: safeProjectPath,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     }
@@ -1458,7 +1867,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
             try {
               mainWindow.webContents.send("opencode:event", {
                 type: "neko.opencode.ready",
-                properties: { projectPath, url: opencodeUrl, port, generation: transitionGen }
+                properties: { projectPath: safeProjectPath, url: opencodeUrl, port, generation: transitionGen }
               });
             } catch {}
           }
@@ -1576,6 +1985,13 @@ async function subscribeEvents(gen?: number) {
           const props = event?.properties ?? {};
           perfCountEvent("received");
           const perfSessionId = String(props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? event?.sessionID ?? event?.sessionId ?? "");
+          // The Vision Fallback runs on an auxiliary session. Its events must
+          // never reach the renderer: no terminal noise, no busy revival, no
+          // permission cards, no task state influence.
+          const fallbackIdCandidates = [perfSessionId, String(props?.info?.id ?? ""), String(event?.sessionID ?? "")];
+          if (fallbackIdCandidates.some(id => id && isVisionFallbackSession(id))) {
+            continue;
+          }
           if (eventType.startsWith("tool.execute") || eventType.startsWith("file.") || eventType.startsWith("permission.") || eventType.startsWith("session.") || eventType === "command.executed") {
             const toolName = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
             const toolInput = props?.input ?? props?.part?.state?.input ?? {};
@@ -1612,24 +2028,30 @@ async function subscribeEvents(gen?: number) {
           if (realActivity && perfSessionId) {
             const retryState = engineRetryStates.get(perfSessionId);
             if (retryState) retryState.cycles = 0;
+            const taskRecord = taskRecords.get(perfSessionId);
+            if (taskRecord) {
+              taskRecord.sawBusy = true;
+              taskRecord.lastActivityAt = Date.now();
+            }
           }
           // session.idle is the engine's completion confirmation for the task.
-          // Attach the task correlation id so the renderer can tell task A's
-          // idle from task B's idle.
+          // Before forwarding it, the state machine decides whether this idle
+          // is a real completion, an approval request or an interactive
+          // question. The resulting state is pushed first so the renderer can
+          // never conclude a task that needs user input.
           if (eventType === "session.idle") {
-            const active = activeAgentRequests.get(perfSessionId);
+            const idleSessionId = perfSessionId;
+            const active = activeAgentRequests.get(idleSessionId);
             if (active?.retryTimer || active?.isRetrying) {
-              console.log(`[Neko/Agent] session.idle recebido durante retry ativo (ignorado) session=${perfSessionId}`);
+              console.log(`[Neko/Agent] session.idle recebido durante retry ativo (ignorado) session=${idleSessionId}`);
               continue;
             }
-            let taskId = sessionTaskIds.get(perfSessionId) ?? "";
-            if (!taskId && sessionTaskIds.size === 1) {
-              taskId = Array.from(sessionTaskIds.values())[0] || "";
-            }
-            event.properties = { ...(event.properties ?? {}), taskId, sessionID: perfSessionId || undefined };
-            console.log(`[TaskLifecycle] event=session.idle session=${perfSessionId || "default"} taskId=${taskId || "none"}`);
-            perfMark("t8", perfSessionId);
-            perfFlushTask(perfSessionId, "idle");
+            const taskId = resolveTaskIdForSession(idleSessionId);
+            console.log(`[TaskLifecycle] event=session.idle session=${idleSessionId || "default"} taskId=${taskId || "none"}`);
+            perfMark("t8", idleSessionId);
+            perfFlushTask(idleSessionId, "idle");
+            await runIdleDetermination(idleSessionId, taskId);
+            event.properties = { ...(event.properties ?? {}), taskId: taskId || undefined, sessionID: idleSessionId || undefined };
           }
           if (perfEnabled) {
             // First event of the session after acceptance (T3).
@@ -1646,8 +2068,14 @@ async function subscribeEvents(gen?: number) {
           if (eventType === "session.error") {
             const sessionId = String(props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? "");
             if (sessionId && isRecoverableAgentError(event) && scheduleAgentRetry(sessionId, event)) continue;
-            if (sessionId) clearActiveAgentRequest(sessionId);
-            engineRetryStates.delete(sessionId);
+            if (sessionId) {
+              clearActiveAgentRequest(sessionId);
+              engineRetryStates.delete(sessionId);
+              if (taskRecords.has(sessionId)) {
+                setTaskState(sessionId, "failed", "session-error");
+                logTask("failed", resolveTaskIdForSession(sessionId), sessionId);
+              }
+            }
             perfFlushTask(sessionId, "error");
           }
           if (eventType === "session.status") {
@@ -1678,6 +2106,10 @@ async function subscribeEvents(gen?: number) {
                 engineRetryStates.delete(sessionId);
                 retryExhaustedSessions.add(sessionId);
                 clearActiveAgentRequest(sessionId);
+                if (taskRecords.has(sessionId)) {
+                  setTaskState(sessionId, "failed", "retry-exhausted");
+                  logTask("failed", resolveTaskIdForSession(sessionId), sessionId);
+                }
                 // Ask the engine to stop its internal retry loop.
                 void fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
                   method: "POST",
@@ -1703,16 +2135,26 @@ async function subscribeEvents(gen?: number) {
               perfRetryEnd();
               const retryState = engineRetryStates.get(sessionId);
               if (retryState) retryState.phase = "busy";
+              // The engine resumed by itself (for example an auto-approved
+              // permission): any waiting state goes back to running.
+              const record = taskRecords.get(sessionId);
+              if (record) {
+                record.sawBusy = true;
+                record.lastActivityAt = Date.now();
+                if (record.state === "waiting_for_user" || record.state === "waiting_for_approval") {
+                  setTaskState(sessionId, "running", "engine-resumed");
+                }
+              }
             } else if (statusType === "idle" || statusType === "completed" || statusType === "done") {
               engineRetryStates.delete(sessionId);
-              let taskId = sessionTaskIds.get(sessionId) ?? "";
-              if (!taskId && sessionTaskIds.size === 1) {
-                taskId = Array.from(sessionTaskIds.values())[0] || "";
-              }
+              const taskId = resolveTaskIdForSession(sessionId);
               event.properties = { ...(event.properties ?? {}), taskId: taskId || undefined, sessionID: sessionId || undefined };
               console.log(`[TaskLifecycle] event=session.status(${statusType}) session=${sessionId || "default"} taskId=${taskId || "none"}`);
               perfMark("t8", sessionId);
               perfFlushTask(sessionId, "idle");
+              // Some engine builds only surface completion through status
+              // idle. The determination is deduplicated and safe to run here.
+              void runIdleDetermination(sessionId, taskId);
             }
             if (sessionId && (statusType === "idle" || statusType === "completed" || statusType === "done")) {
               const active = activeAgentRequests.get(sessionId);
@@ -1734,6 +2176,27 @@ async function subscribeEvents(gen?: number) {
           // session.updated/diff are internal synchronization chatter. Nothing in
           // the Neko renderer consumes them, so keep them inside the main process.
           if (eventType === "session.updated" || eventType === "session.diff") continue;
+          // Approval protocol: permission.updated is the engine asking for an
+          // approval. It is normalized to permission.asked for the renderer and
+          // the task machine moves to waiting_for_approval. permission.replied
+          // is the user's decision (approve or reject); the agent continues
+          // from where it stopped — a rejection is never a technical error.
+          if (eventType === "permission.updated") {
+            const permissionSessionId = String(props?.sessionID ?? props?.sessionId ?? "");
+            if (permissionSessionId && taskRecords.has(permissionSessionId)) {
+              setTaskState(permissionSessionId, "waiting_for_approval", "permission-asked", { permission: props });
+              logTask("approval-required", resolveTaskIdForSession(permissionSessionId), permissionSessionId, `permission=${String(props?.id ?? "").slice(0, 12)}`);
+            }
+            event.type = "permission.asked";
+          }
+          if (eventType === "permission.replied") {
+            const permissionSessionId = String(props?.sessionID ?? props?.sessionId ?? "");
+            if (permissionSessionId && taskRecords.has(permissionSessionId)) {
+              const response = String(props?.response ?? "");
+              setTaskState(permissionSessionId, "running", "permission-replied");
+              logTask("user-approval", resolveTaskIdForSession(permissionSessionId), permissionSessionId, `response=${response || "answered"}`);
+            }
+          }
           const nekoEvent = normalizeOpenCodeEvent(event);
           if (nekoEvent) {
             perfCountEvent("forwarded");
@@ -1873,7 +2336,20 @@ function ensureInternalPreviewView(): WebContentsView | null {
   internalPreviewView = view;
   view.webContents.setWindowOpenHandler(({ url }) => ({ action: "deny" }));
   view.webContents.on("did-start-loading", () => logInternalPreview("loading"));
-  view.webContents.on("did-finish-load", () => logInternalPreview("ready"));
+  view.webContents.on("did-finish-load", () => {
+    logInternalPreview("ready");
+    emitInternalPreviewRoute(view.webContents.getURL());
+  });
+  // SPA history routing uses pushState/replaceState (did-navigate-in-page).
+  // Keep the Page Selector in sync when the user clicks an internal link.
+  view.webContents.on("did-navigate-in-page", (_event, url, _isMainFrame) => {
+    if (!url || !isAllowedInternalPreviewUrl(url)) return;
+    emitInternalPreviewRoute(url);
+  });
+  view.webContents.on("did-navigate", (_event, url) => {
+    if (!url || !isAllowedInternalPreviewUrl(url)) return;
+    emitInternalPreviewRoute(url);
+  });
   view.webContents.on("did-fail-load", (_event, code, description, url, isMainFrame) => {
     if (!isMainFrame || code === -3) return;
     logInternalPreview("failed", `error=${code} description=${logSafeText(description, 160)} url=${sanitizeExternalPreviewUrl(url)}`);
@@ -1895,6 +2371,33 @@ function emitPreview(type: string, properties: Record<string, any> = {}) {
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
   try {
     mainWindow.webContents.send("preview:event", { type, properties: previewState });
+  } catch {}
+}
+
+// Preview Page Selector: per-project route cache to avoid rescanning on every
+// call. Re-discovered on project change or explicit request; never polled.
+type PreviewRoutesCache = { projectPath: string; routes: PreviewRoute[]; at: number };
+let previewRoutesCache: PreviewRoutesCache | null = null;
+const PREVIEW_ROUTES_CACHE_MS = 8000;
+
+async function getPreviewRoutes(force = false): Promise<PreviewRoute[]> {
+  const root = getActiveProjectRoot();
+  if (!root) return [];
+  if (!force && previewRoutesCache && previewRoutesCache.projectPath === root && Date.now() - previewRoutesCache.at < PREVIEW_ROUTES_CACHE_MS) {
+    return previewRoutesCache.routes;
+  }
+  const routes = await discoverPreviewRoutes(root);
+  previewRoutesCache = { projectPath: root, routes, at: Date.now() };
+  return routes;
+}
+
+// Emits the current internal-preview route to the renderer so the selector
+// stays in sync (used after navigate, internal link clicks and HMR reloads).
+function emitInternalPreviewRoute(url: string) {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+    const path = routeFromUrl(url);
+    mainWindow.webContents.send("preview:event", { type: "preview.route-changed", properties: { path } });
   } catch {}
 }
 
@@ -2643,6 +3146,9 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
 }
 
 async function startPreview(projectPath: string, _sourceGen?: number, forceRestart = false): Promise<PreviewManagerState> {
+  if (isInsideNekoApplication(projectPath)) {
+    throw new Error("Não é permitido utilizar o diretório do NekoAI como workspace do projeto.");
+  }
   const workspace = path.resolve(projectPath);
 
   // 1. Se já está rodando e saudável no mesmo projeto, NÃO matar! Reutilizar e reemitir ready!
@@ -2775,6 +3281,10 @@ async function getProviders() {
         const key = `${providerID}:${modelID}`;
         const catalogEnabled = model?.enabled !== false;
         const userEnabled = disabledSettings[key] !== false;
+        // Capability cache: vision decisions read this without any extra
+        // providers:list request. Catalog metadata may be untrustworthy, so
+        // getModelCapabilities applies the NekoAI overrides on top.
+        providerCatalogCache.set(key, { attachment: model?.attachment === true });
 
         return {
           providerID,
@@ -2785,6 +3295,7 @@ async function getProviders() {
           enabled: providerEnabled && catalogEnabled && userEnabled,
           connected: isConnected,
           catalogEnabled,
+          attachment: model?.attachment === true,
         };
       });
 
@@ -2921,8 +3432,7 @@ ipcMain.handle("attachments:clipboard", async (_event, payload: {dataUrl:string;
 ipcMain.handle("attachments:paths", async (_event, filePaths: string[]) => collectAttachmentPaths(Array.isArray(filePaths)?filePaths:[]));
 
 
-async function searchProjectFiles(query: string) {
-  if (!currentProject) return [];
+async function searchProjectFiles(query: string, projectRoot: string) {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return [];
 
@@ -2933,7 +3443,7 @@ async function searchProjectFiles(query: string) {
   }> = [];
 
   async function walk(relative = ""): Promise<void> {
-    const absolute = safePathWithinProject(currentProject!, relative);
+    const absolute = safePathWithinProject(projectRoot, relative);
 
     let entries: import("node:fs").Dirent[];
     try {
@@ -2976,7 +3486,8 @@ async function searchProjectFiles(query: string) {
 
 ipcMain.handle("project:search", async (_event, query: string) => {
   licenseManager.assertAccess("pesquisa de arquivos");
-  return searchProjectFiles(query);
+  const projectRoot = assertProjectRootSafe(currentProject, "search");
+  return searchProjectFiles(query, projectRoot);
 });
 
 ipcMain.handle("commands:list", async () => {
@@ -2990,11 +3501,12 @@ ipcMain.handle("commands:list", async () => {
 
 ipcMain.handle("opencode:command", async (_event, payload: { sessionId: string; command: string; arguments?: string; model?: { providerID: string; modelID: string } }) => {
   licenseManager.assertAccess("comandos do assistente");
-  if (!currentProject) throw new Error("Nenhum projeto aberto.");
+  const projectRoot = assertProjectRootSafe(currentProject, "command");
+  logProjectWorkspace("command", projectRoot);
   if (!payload.sessionId) throw new Error("Sessão do Neko não encontrada.");
   const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/command`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...opencodeDirectoryHeaders() },
     body: JSON.stringify({
       command: payload.command.replace(/^\//, ""),
       arguments: payload.arguments ?? "",
@@ -3125,7 +3637,7 @@ ipcMain.handle("github:disconnect", async () => {
 
 ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
   if (!currentProject) return [];
-  const projectPath = currentProject;
+  const projectPath = assertProjectRootSafe(currentProject, "git-list");
 
   return withProjectGitLock(projectPath, async () => {
     const status = await getGitStatus();
@@ -3191,7 +3703,7 @@ ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
 
 ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
   if (!currentProject) throw new Error("Abra um projeto antes de trocar de branch.");
-  const projectPath = currentProject;
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
 
   if (activeAgentRequests.size > 0) {
     throw new Error("Uma tarefa do assistente está em execução no momento. Aguarde a conclusão da tarefa antes de trocar de branch.");
@@ -3302,14 +3814,15 @@ ipcMain.handle("github:cloneProject", async (_event, payload: { repoFullName: st
 
   const parent = String(payload?.parentPath || "").trim();
   if (!parent) throw new Error("Escolha uma pasta para salvar o projeto.");
-  const parentStat = await fs.promises.stat(parent).catch(() => null);
+  const safeParent = assertProjectRootSafe(parent, "git-clone-parent");
+  const parentStat = await fs.promises.stat(safeParent).catch(() => null);
   if (!parentStat?.isDirectory()) throw new Error("A pasta escolhida não existe ou não é válida.");
   const repoName = repoFullName.split("/").pop() || "projeto";
   const projectName = String(payload?.projectName || repoName).trim();
   if (!/^[^\\/:*?"<>|]+$/.test(projectName) || projectName === "." || projectName === "..") {
     throw new Error("Escolha um nome de projeto válido.");
   }
-  const target = path.join(parent, projectName);
+  const target = path.join(safeParent, projectName);
 
   try {
     await fs.promises.access(target, fs.constants.F_OK);
@@ -3319,7 +3832,7 @@ ipcMain.handle("github:cloneProject", async (_event, payload: { repoFullName: st
   }
 
   const cloneUrl = `https://github.com/${repoFullName}.git`;
-  const clone = await runGitWithGithubAuth(parent, ["clone", cloneUrl, projectName], token);
+  const clone = await runGitWithGithubAuth(safeParent, ["clone", cloneUrl, projectName], token);
 
   if (clone.code !== 0) {
     // Git may leave a partial destination after an interrupted/failed clone.
@@ -3351,7 +3864,7 @@ ipcMain.handle("github:cloneProject", async (_event, payload: { repoFullName: st
 ipcMain.handle("github:commitPush", async (_event, payload: { message: string }) => {
   licenseManager.assertAccess("envio de commits para o GitHub");
   if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
-  const projectPath = currentProject;
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
   const message = String(payload?.message || "").trim();
   if (!message) throw new Error("Digite uma mensagem para o commit.");
 
@@ -3430,7 +3943,7 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string })
 ipcMain.handle("github:publishProject", async (_event, payload: { repoName: string; private?: boolean }) => {
   licenseManager.assertAccess("publicação de repositórios no GitHub");
   if (!currentProject) throw new Error("Abra um projeto antes de publicá-lo no GitHub.");
-  const projectPath = currentProject;
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
 
   const repoName = String(payload?.repoName || "").trim();
   const isPrivate = Boolean(payload?.private);
@@ -3606,7 +4119,7 @@ ipcMain.handle("github:gitStatus", async () => getGitStatus());
 ipcMain.handle("github:discardChanges", async () => {
   licenseManager.assertAccess("descarte de alterações no Git");
   if (!currentProject) throw new Error("Abra um projeto antes de descartar alterações.");
-  const projectPath = currentProject;
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
 
   return withProjectGitLock(projectPath, async () => {
     const status = await getGitStatus();
@@ -3716,7 +4229,7 @@ async function cleanFolderForClone(folderPath: string): Promise<void> {
 ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: string; replaceRemote?: boolean; overwriteLocalContent?: boolean }) => {
   licenseManager.assertAccess("vinculação de repositórios no GitHub");
   if (!currentProject) throw new Error("Abra um projeto antes de conectá-lo ao GitHub.");
-  const projectPath = currentProject;
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
 
   const repoFullName = String(payload?.repoFullName || "").trim();
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
@@ -3881,6 +4394,10 @@ ipcMain.handle("project:saveThumbnail", async (_event, payload: { projectPath: s
   const root = String(payload?.projectPath || "").trim();
   const dataUrl = String(payload?.dataUrl || "").trim();
   if (!root || !dataUrl.startsWith("data:image/")) return { ok: false };
+  if (isInsideNekoApplication(root)) {
+    console.warn(`[PROJECT WORKSPACE] operation=saveThumbnail blocked reason=nekoai-directory projectRoot=${path.resolve(root)} applicationRoot=${getApplicationRoot()}`);
+    return { ok: false };
+  }
   try {
     const nekoDir = path.join(root, ".neko");
     await fs.promises.mkdir(nekoDir, { recursive: true });
@@ -3932,10 +4449,16 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
 
   if (!projectPath) throw new Error("Pasta do projeto não informada.");
 
-  const targetPath = path.resolve(projectPath);
+  const targetPath = assertProjectRootSafe(projectPath, "switch");
   const transitionGen = ++projectTransitionGeneration;
+  logProjectWorkspace("switch", targetPath);
   console.log(`[ProjectSwitch] REQUEST source=${source} target=${targetPath} generation=${transitionGen}`);
   logService("transition-start", `target=${targetPath} gen=${transitionGen}`);
+
+  // A new workspace gets a completely fresh task runtime: no old task,
+  // permission, question, retry or listener state can leak across projects.
+  resetTaskRuntime();
+  logTask("runtime-reset", "-", "-", `target=${path.basename(targetPath)} generation=${transitionGen}`);
 
   // Create WorkspaceContext immediately
   const newWorkspace: WorkspaceContext = {
@@ -4126,25 +4649,30 @@ async function undoTaskCheckpoint(taskId: string) {
 
 ipcMain.handle("project:checkpointTask", async () => {
   licenseManager.assertAccess("checkpoints do projeto");
-  if (!currentProject) throw new Error("Nenhum projeto aberto.");
-  return createTaskCheckpoint(currentProject);
+  const projectRoot = assertProjectRootSafe(currentProject, "checkpoint");
+  logProjectWorkspace("checkpoint", projectRoot);
+  return createTaskCheckpoint(projectRoot);
 });
 
 ipcMain.handle("project:undoTask", async (_event, taskId: string) => {
   licenseManager.assertAccess("restauração de checkpoint");
+  const projectRoot = assertProjectRootSafe(currentProject, "undo");
+  logProjectWorkspace("undo", projectRoot);
   return undoTaskCheckpoint(taskId);
 });
 
 ipcMain.handle("project:tree", async () => {
   licenseManager.assertAccess("árvore de arquivos do projeto");
-  if (!currentProject) return [];
-  return readTree(currentProject);
+  const projectRoot = assertProjectRootSafe(currentProject, "tree");
+  logProjectWorkspace("tree", projectRoot);
+  return readTree(projectRoot);
 });
 
 ipcMain.handle("project:file", async (_event, relativePath: string) => {
   licenseManager.assertAccess("leitura de arquivos");
-  if (!currentProject) throw new Error("Nenhum projeto aberto.");
-  const filePath = safePathWithinProject(currentProject, relativePath);
+  const projectRoot = assertProjectRootSafe(currentProject, "read");
+  logProjectWorkspace("read", projectRoot);
+  const filePath = safePathWithinProject(projectRoot, relativePath);
   const stat = await fs.promises.stat(filePath);
   if (!stat.isFile()) throw new Error("Não é um arquivo.");
   const content = await fs.promises.readFile(filePath, "utf8");
@@ -4153,8 +4681,10 @@ ipcMain.handle("project:file", async (_event, relativePath: string) => {
 
 ipcMain.handle("project:refresh", async () => {
   licenseManager.assertAccess("atualização do workspace");
-  if (!currentProject) return { tree: [], preview: null };
-  const tree = await readTree(currentProject);
+  if (!getActiveProjectRoot()) return { tree: [], preview: null };
+  const projectRoot = assertProjectRootSafe(currentProject, "refresh");
+  logProjectWorkspace("refresh", projectRoot);
+  const tree = await readTree(projectRoot);
   return { tree, preview: previewState };
 });
 
@@ -4297,14 +4827,16 @@ async function runValidationBuild(projectPath: string) {
 
 ipcMain.handle("project:validateBuild", async () => {
   licenseManager.assertAccess("validação de build");
-  if (!currentProject) throw new Error("Nenhum projeto aberto.");
-  return runValidationBuild(currentProject);
+  const projectRoot = assertProjectRootSafe(currentProject, "validateBuild");
+  logProjectWorkspace("validateBuild", projectRoot);
+  return runValidationBuild(projectRoot);
 });
 
 ipcMain.handle("preview:start", async () => {
   licenseManager.assertAccess("servidor de preview");
-  if (!currentProject) throw new Error("Nenhum projeto aberto.");
-  return startPreview(currentProject);
+  const projectRoot = assertProjectRootSafe(currentProject, "preview");
+  logProjectWorkspace("preview", projectRoot);
+  return startPreview(projectRoot);
 });
 
 ipcMain.handle("preview:stop", async () => {
@@ -4313,6 +4845,7 @@ ipcMain.handle("preview:stop", async () => {
 });
 
 ipcMain.handle("opencode:status", async () => {
+  const projectRoot = getActiveProjectRoot();
   try {
     const response = await fetch(`${opencodeUrl}/global/health`);
     if (!response.ok) throw new Error("offline");
@@ -4320,10 +4853,10 @@ ipcMain.handle("opencode:status", async () => {
     return {
       online: true,
       ...(await response.json()),
-      project: currentProject
+      project: projectRoot
     };
   } catch {
-    return { online: false, project: currentProject };
+    return { online: false, project: projectRoot };
   }
 });
 
@@ -4367,7 +4900,8 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   perf?: { t0?: number; prepMs?: number };
 }) => {
   licenseManager.assertAccess("assistente de IA");
-  if (!currentProject) throw new Error("Nenhum projeto aberto.");
+  const projectRoot = assertProjectRootSafe(currentProject, "analyze");
+  logProjectWorkspace("analyze", projectRoot);
   if (!payload.sessionId) throw new Error("Sessão do Neko não encontrada.");
 
   const uploadCount = (payload.attachments?.length ?? 0) + (payload.contextPaths?.length ?? 0);
@@ -4381,12 +4915,32 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   forwardedSessionStatus.delete(payload.sessionId);
   clearStatusCacheForSession(payload.sessionId);
   const taskCorrelationId = newTaskCorrelationId(payload.sessionId);
+  // A new prompt is a new task: fresh state record for the session so old
+  // permissions/questions never leak into this execution.
+  const previousRecord = taskRecords.get(payload.sessionId);
+  if (previousRecord?.state === "waiting_for_user") {
+    logTask("user-response", previousRecord.taskId, payload.sessionId);
+  }
+  taskRecords.set(payload.sessionId, {
+    taskId: taskCorrelationId,
+    sessionId: payload.sessionId,
+    state: "idle",
+    planMode: Boolean(payload.planMode),
+    createdAt: Date.now(),
+    stateAt: 0,
+    sawBusy: false,
+    lastActivityAt: 0,
+    lastAssistantMessageId: "",
+    askedQuestionIds: []
+  });
+  logTask("created", taskCorrelationId, payload.sessionId, `model=${modelLabel}${payload.planMode ? " mode=plan" : ""}`);
 
   if (uploadCount > 0) perfMark("uploadStart", payload.sessionId);
   const contextParts: any[] = [];
+  const imageAttachments: Array<{ url: string; filename: string; mime: string }> = [];
   for (const rel of (payload.contextPaths ?? [])) {
     try {
-      const absolute = safePathWithinProject(currentProject, rel);
+      const absolute = safePathWithinProject(projectRoot, rel);
       const item = await validateAttachment(absolute);
       perfUploadBytes(item.size);
       contextParts.push({ type: "file", url: item.url, filename: item.name, mime: item.mime });
@@ -4395,9 +4949,64 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   for (const attachment of (payload.attachments ?? [])) {
     const item = await validateAttachment(attachment.path);
     perfUploadBytes(item.size);
-    contextParts.push({ type: "file", url: item.url, filename: item.name, mime: item.mime });
+    const filePart = { type: "file", url: item.url, filename: item.name, mime: item.mime };
+    if (isVisionImage(item.name, item.mime)) {
+      imageAttachments.push(filePart);
+    } else {
+      contextParts.push(filePart);
+    }
   }
   perfMark("uploadReady", payload.sessionId);
+
+  // ============================================================
+  // VISION CAPABILITY / FALLBACK (MiMo V2.5 Free)
+  // ------------------------------------------------------------
+  // Decided once per prompt, from the cached provider catalog. Never
+  // triggers a new providers:list request and never changes the user's
+  // selected model. When the main model accepts images, images flow to it
+  // directly. Otherwise MiMo V2.5 Free (free tier, auxiliary session)
+  // interprets the images and the resulting text context is injected into
+  // the main prompt with zero instruction authority.
+  // ============================================================
+  let userRequestText = payload.text;
+  if (imageAttachments.length > 0) {
+    const providerId = payload.model?.providerID ?? "";
+    const modelId = payload.model?.modelID ?? "";
+    const catalogMeta = payload.model ? providerCatalogCache.get(`${providerId}:${modelId}`) : undefined;
+    const capabilities = getModelCapabilities(providerId, modelId, catalogMeta);
+    console.log(`[Vision] capability-check provider=${providerId || "default"} model=${modelId || "default"} imageInput=${capabilities.imageInput} images=${imageAttachments.length}`);
+    if (capabilities.imageInput) {
+      contextParts.push(...imageAttachments);
+      console.log(`[Vision] direct-send provider=${providerId || "default"} model=${modelId || "default"} images=${imageAttachments.length}`);
+    } else {
+      const fallbackProviderID = resolveVisionFallbackProvider();
+      console.log(`[Vision] fallback-required provider=${providerId || "default"} model=${modelId || "default"} reason=image-input-unsupported images=${imageAttachments.length}`);
+      console.log(`[Vision] fallback-start model=${fallbackProviderID}/${VISION_FALLBACK_MODEL.modelID} images=${imageAttachments.length}`);
+      const fallback = await analyzeImagesWithMiMo({
+        mainSessionId: payload.sessionId,
+        opencodeUrl,
+        headers: opencodeDirectoryHeaders(),
+        images: imageAttachments,
+        userPrompt: payload.text || "Analise a imagem anexada.",
+        model: { providerID: fallbackProviderID, modelID: VISION_FALLBACK_MODEL.modelID }
+      });
+      // STOP during the fallback: never send the main prompt, never throw a
+      // technical error — the renderer keeps the cancelled state untouched.
+      if (fallback.ok === false && fallback.cancelled) {
+        return { cancelled: true };
+      }
+      const currentRecord = taskRecords.get(payload.sessionId);
+      if (currentRecord?.state === "cancelled") {
+        return { cancelled: true };
+      }
+      if (!fallback.ok) {
+        console.log(`[Vision] fallback-error reason=${fallback.reason}`);
+        throw new Error(fallback.userMessage);
+      }
+      console.log(`[Vision] fallback-success images=${imageAttachments.length} chars=${fallback.analysis.length}`);
+      userRequestText = buildVisionContext(fallback.analysis, imageAttachments.length, payload.text);
+    }
+  }
 
   const languageInstruction = `IDIOMA OBRIGATÓRIO DA INTERFACE: Português do Brasil (pt-BR).
 Todas as respostas destinadas ao usuário devem ser escritas em português do Brasil, incluindo resumo, conclusão, explicações, nomes de etapas e qualquer texto final. Não responda em inglês, espanhol ou outro idioma. Preserve nomes técnicos inevitáveis (por exemplo, nomes de arquivos, APIs, bibliotecas, comandos, variáveis e URLs) somente quando forem necessários, mas explique o restante em português. Nunca copie ou reproduza logs, mensagens ou respostas internas de ferramentas como se fossem uma resposta ao usuário. Gere uma única resposta final, exclusivamente em português do Brasil. Não inclua uma versão em inglês antes ou depois da resposta em português.`;
@@ -4407,7 +5016,7 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
 ${languageInstruction}
 
 USER REQUEST:
-${payload.text}`;
+${userRequestText}`;
 
   const requestBody = {
     agent: payload.planMode ? "plan" : "build",
@@ -4417,7 +5026,7 @@ ${payload.text}`;
 ${languageInstruction}`
     }),
     ...(payload.model ? { model: payload.model } : {}),
-    parts: [{ type: "text", text: payload.planMode ? planInstruction : payload.text }, ...contextParts]
+    parts: [{ type: "text", text: payload.planMode ? planInstruction : userRequestText }, ...contextParts]
   };
 
   // Plan is asynchronous in OpenCode. We start the prompt and then watch the
@@ -4456,6 +5065,8 @@ ${languageInstruction}`
       throw new Error(`Falha ao iniciar o modo Plan (HTTP ${response.status}).${body ? ` ${body.slice(0, 240)}` : ""}`);
     }
     perfMark("t2", payload.sessionId);
+    setTaskState(payload.sessionId, "running", "prompt-accepted");
+    logTask("started", taskCorrelationId, payload.sessionId);
 
     // Maximum safety guard only. Normal completion is driven by the session's
     // fresh assistant message, not by this timer.
@@ -4539,12 +5150,18 @@ ${languageInstruction}`
     const body = await response.text().catch(() => "");
     const failed = { error: { data: { statusCode: response.status, message: body.slice(0, 500), isRetryable: response.status >= 500 || response.status === 429 } } };
     if (isRecoverableAgentError(failed) && scheduleAgentRetry(payload.sessionId, failed)) {
+      setTaskState(payload.sessionId, "running", "prompt-retrying");
+      logTask("started", taskCorrelationId, payload.sessionId, "retrying=true");
       return { accepted: true, retrying: true, acceptedInMs: Date.now() - promptStartedAt, taskId: taskCorrelationId };
     }
     clearActiveAgentRequest(payload.sessionId);
+    setTaskState(payload.sessionId, "failed", "prompt-rejected");
+    logTask("failed", taskCorrelationId, payload.sessionId, `status=${response.status}`);
     throw new Error(`Falha ao enviar tarefa ao agente (HTTP ${response.status}).${body ? ` ${body.slice(0, 240)}` : ""}`);
   }
   perfMark("t2", payload.sessionId);
+  setTaskState(payload.sessionId, "running", "prompt-accepted");
+  logTask("started", taskCorrelationId, payload.sessionId);
 
   console.log(`[Neko/Agent] tarefa aceita em ${Date.now() - promptStartedAt}ms; execução agora é assíncrona no OpenCode`);
   return { accepted: true, acceptedInMs: Date.now() - promptStartedAt, taskId: taskCorrelationId };
@@ -4597,6 +5214,11 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
   if (!sessionId) throw new Error("Sessão do Neko não encontrada.");
   clearActiveAgentRequest(sessionId);
   engineRetryStates.delete(sessionId);
+  const recheckTimer = idleRecheckTimers.get(sessionId);
+  if (recheckTimer) {
+    clearTimeout(recheckTimer);
+    idleRecheckTimers.delete(sessionId);
+  }
   if (!opencodeUrl) throw new Error("OpenCode não está conectado.");
 
   const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
@@ -4609,6 +5231,16 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
     throw new Error(`Falha ao interromper a sessão (HTTP ${response.status}).${body ? ` ${body.slice(0, 240)}` : ""}`);
   }
 
+  // STOP cancels the execution, never the already-written files. The agent
+  // is asked to stop, the task transitions to cancelled and the Preview and
+  // workspace stay exactly as they are. A running Vision Fallback for this
+  // session is cancelled together with the task: a late visual analysis can
+  // never resurrect a cancelled task.
+  if (taskRecords.has(sessionId)) {
+    setTaskState(sessionId, "cancelled", "user-stop");
+    logTask("cancelled", resolveTaskIdForSession(sessionId), sessionId);
+  }
+  cancelVisionFallbackFor(sessionId);
   perfFlushTask(sessionId, "aborted");
   try {
     return Boolean(await response.json());
@@ -4648,7 +5280,10 @@ ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
   if (!Number.isInteger(session) || session !== activePreviewSessionId || !isAllowedInternalPreviewUrl(url)) {
     throw new Error("Preview interno recusou uma sessão ou URL inválida.");
   }
-  if (!previewState.url || !previewUrlsMatch(url, previewState.url)) {
+  // The URL must point to the ACTIVE Preview server. Only the origin matters:
+  // the route (pathname/search/hash) is the current page and never a server
+  // change, so legitimate route/query URLs must be accepted.
+  if (!previewState.url || !previewServerOriginMatches(url, previewState.url)) {
     throw new Error("A URL do Preview interno não corresponde ao servidor ativo.");
   }
   const x = Math.max(0, Math.round(Number(rawBounds?.x)) || 0);
@@ -4666,6 +5301,132 @@ ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
     await view.webContents.loadURL(url);
   }
   return { enabled: true, state: internalPreviewState };
+});
+
+// "Atualizar Preview": reloads the current page NATIVELY, without changing
+// the URL. The internal WebContents keeps its current route (pathname,
+// search and hash are all preserved by a reload). This never adds artificial
+// query parameters such as "?t=timestamp".
+ipcMain.handle("preview:refresh", async () => {
+  const view = internalPreviewView;
+  if (!view || view.webContents.isDestroyed()) {
+    return { ok: false, reason: "no-internal-view" };
+  }
+  try {
+    const current = view.webContents.getURL();
+    console.log(`[Preview] refresh origin=${(() => { try { return new URL(current).origin; } catch { return ""; } })()} url=${sanitizeExternalPreviewUrl(current)}`);
+    view.webContents.reload();
+    return { ok: true, method: "reload" };
+  } catch (error) {
+    console.warn(`[Preview] refresh failed: ${String((error as any)?.message ?? error)}`);
+    return { ok: false, reason: String((error as any)?.message ?? error) };
+  }
+});
+
+// Page Selector overlay support. The internal Preview is a native
+// WebContentsView, which Electron always paints ABOVE the renderer DOM — no
+// CSS z-index can raise a DOM dropdown over it. While a DOM overlay (the page
+// selector dropdown) is open we hide the native view so the dropdown paints
+// fully on top; it is restored as soon as the overlay closes.
+ipcMain.handle("preview:internalOverlay", async (_event, overlay: boolean) => {
+  const view = internalPreviewView;
+  if (!view || view.webContents.isDestroyed()) {
+    return { ok: false, visible: !overlay };
+  }
+  try {
+    view.setVisible(!overlay);
+  } catch {}
+  return { ok: true, visible: !overlay };
+});
+
+// Page Selector: returns the discovered routes of the active project.
+ipcMain.handle("preview:routes", async (_event, payload?: { force?: boolean }) => {
+  const projectRoot = assertProjectRootSafe(currentProject, "preview-routes");
+  const routes = await getPreviewRoutes(Boolean(payload?.force));
+  return { routes, projectPath: projectRoot };
+});
+
+// Page Selector: navigate the internal preview to a discovered route,
+// preserving the origin and never adding artificial query parameters.
+ipcMain.handle("preview:navigate", async (_event, routePath: string) => {
+  const normalized = normalizeRoutePath(routePath);
+  if (normalized === "/" || !normalized) throw new Error("Rota de Preview inválida.");
+  // Dynamic detail routes (/equipamentos/:id) cannot be opened without real
+  // parameters. Never invent them: open the static prefix instead (safe).
+  let openable = normalized;
+  if (openable !== "/") {
+    const parts = openable.split("/");
+    while (parts.length > 1 && isDynamicSegment(parts[parts.length - 1])) parts.pop();
+    openable = parts.join("/") || "/";
+    openable = normalizeRoutePath(openable);
+  }
+  const originSource = internalPreviewUrl || previewState.url || "";
+  let origin = "";
+  try { origin = new URL(originSource).origin; } catch {}
+  if (!origin) throw new Error("Nenhum servidor de Preview ativo no momento.");
+  const target = new URL(openable, origin).toString();
+  console.log(`[Preview Routes] navigate origin=${origin} route=${normalized} openable=${openable}`);
+  const view = internalPreviewView;
+  if (!view || view.webContents.isDestroyed()) {
+    // No internal surface yet: just reflect intent on the state URL.
+    if (!previewUrlsMatch(internalPreviewUrl, target)) {
+      internalPreviewUrl = target;
+      emitInternalPreviewRoute(target);
+    }
+    return { ok: true, target, method: "state" };
+  }
+  // Only a real navigation if the route actually changed; otherwise reload is
+  // handled by "Atualizar Preview" (native reload, route preserved).
+  if (!previewUrlsMatch(internalPreviewUrl, target)) {
+    internalPreviewUrl = target;
+    logInternalPreview("loading", "navigation=route");
+    await view.webContents.loadURL(target);
+    emitInternalPreviewRoute(view.webContents.getURL());
+  }
+  return { ok: true, target, method: "load" };
+});
+
+// Site Clone — analysis IPC. Deterministic static crawl of a public URL.
+// Progress is streamed to the renderer through "siteclone:event".
+ipcMain.handle("siteClone:analyze", async (_event, payload: { url: string; limits?: SiteCloneLimits }) => {
+  const send = (type: string, properties: Record<string, any>) => {
+    try {
+      mainWindow?.webContents.send("siteclone:event", { type, properties });
+    } catch {}
+  };
+  send("start", { url: String(payload?.url ?? "") });
+  const analysis: SiteCloneAnalysis = await analyzeSite(String(payload?.url ?? ""), payload?.limits, info => {
+    send("progress", { scanned: info.scanned, currentUrl: info.currentUrl });
+  });
+  send(analysis.ok ? "done" : "error", { ok: analysis.ok, pages: analysis.pages?.length ?? 0, error: analysis.error ?? null });
+  return analysis;
+});
+
+ipcMain.handle("siteClone:cancel", async () => {
+  cancelAllSiteClones();
+  return { ok: true };
+});
+
+// Clonar Site V2 — captura com Chromium real (DOM executado + estilos). Cria
+// uma janela oculta com partition isolada, navega só a origem fornecida e
+// devolve um snapshot estruturado. Nunca substitui o Preview normal.
+ipcMain.handle("siteClone:capture", async (_event, payload: { url?: string }) => {
+  const rawUrl = String(payload?.url ?? "").trim();
+  console.log(`[SiteClone] capture-request url=${rawUrl}`);
+  const snapshot = await captureSiteChromium(rawUrl, { BrowserWindow });
+  console.log(`[SiteClone] capture-result ok=${snapshot.ok} pages=${snapshot.pages?.length ?? 0} assets=${snapshot.assets?.length ?? 0} error=${snapshot.error ?? ""}`);
+  return snapshot;
+});
+
+// Download public image/font assets into the ACTIVE project (public/clone-assets)
+// so the reconstruction uses real local files instead of placeholders/hotlinks.
+ipcMain.handle("siteClone:importAssets", async (_event, payload: { assets?: { url: string; kind: string }[] }) => {
+  const projectRoot = assertProjectRootSafe(currentProject, "site-clone-assets");
+  const assets = Array.isArray(payload?.assets) ? payload.assets : [];
+  console.log(`[SiteClone] import-assets project=${projectRoot} count=${assets.length}`);
+  const result = await importSiteAssets(projectRoot, assets);
+  console.log(`[SiteClone] import-assets ok=${result.ok} imported=${result.imported.length} failed=${result.failed.length}`);
+  return result;
 });
 
 // The external Preview window is created once and reused while open. The
@@ -4709,6 +5470,17 @@ function previewUrlsMatch(a: string, b: string): boolean {
     return urlA.origin === urlB.origin && urlA.pathname === urlB.pathname && urlA.search === urlB.search;
   } catch {
     return a === b;
+  }
+}
+
+// The active Preview server is identified by its ORIGIN only. A current route
+// (pathname/search/hash) never means "a different server", so route changes
+// and legitimate query parameters must not be treated as a server mismatch.
+function previewServerOriginMatches(url: string, serverUrl: string): boolean {
+  try {
+    return new URL(url).origin === new URL(serverUrl).origin;
+  } catch {
+    return url === serverUrl;
   }
 }
 
@@ -4828,23 +5600,37 @@ function isLocalhostPreviewUrl(raw: string): boolean {
 
 ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
   console.log(`[Preview] external open requested rawUrl=${sanitizeExternalPreviewUrl(rawUrl)} previewState.url=${sanitizeExternalPreviewUrl(previewState.url || "")} previewState.status=${previewState.status}`);
-  let value = String(rawUrl || "").trim();
   const currentPreviewUrl = typeof previewState.url === "string" ? previewState.url : "";
+  let value = "";
 
-  // Always prefer the Main Process authoritative URL
-  if (currentPreviewUrl && previewState.status === "ready") {
-    if (value && !previewUrlsMatch(value, currentPreviewUrl)) {
-      console.log(`[Preview] external url-corrected from=${sanitizeExternalPreviewUrl(value)} to=${sanitizeExternalPreviewUrl(currentPreviewUrl)}`);
+  // Prefer the CURRENT route of the internal preview WebContents: if the user
+  // navigated internally to /dashboard, "Abrir em nova janela" must open
+  // /dashboard — not the server root. Otherwise fall back to the renderer
+  // provided URL and then to the server base.
+  try {
+    const internal = internalPreviewView;
+    if (internal && !internal.webContents.isDestroyed()) {
+      const internalCurrent = internal.webContents.getURL();
+      if (internalCurrent && isLocalhostPreviewUrl(internalCurrent) && currentPreviewUrl && previewServerOriginMatches(internalCurrent, currentPreviewUrl)) {
+        value = internalCurrent;
+      }
     }
-    value = currentPreviewUrl;
-  } else if (!value) {
-    if (currentPreviewUrl) {
+  } catch {}
+
+  if (!value) {
+    const requested = String(rawUrl || "").trim();
+    if (requested && currentPreviewUrl && previewServerOriginMatches(requested, currentPreviewUrl)) {
+      value = requested;
+    } else if (currentPreviewUrl && previewState.status === "ready") {
       value = currentPreviewUrl;
-      console.log(`[Preview] external url-fallback to=${sanitizeExternalPreviewUrl(value)}`);
-    } else {
-      console.log("[Preview] external open failed: no preview URL available");
-      throw new Error("Nenhum servidor de Preview ativo no momento.");
+    } else if (requested) {
+      value = requested;
     }
+  }
+
+  if (!value) {
+    console.log("[Preview] external open failed: no preview URL available");
+    throw new Error("Nenhum servidor de Preview ativo no momento.");
   }
 
   let url: URL;
@@ -4936,7 +5722,8 @@ ipcMain.handle("supabase:create-project", async (_event, payload: SupabaseCreate
 });
 
 ipcMain.handle("supabase:select-project", async (_event, ref: string) => {
-  if (!currentProject) {
+  const projectRoot = getActiveProjectRoot();
+  if (!projectRoot) {
     const parsed = parseSupabaseError("Nenhum projeto ativo.");
     return {
       ...supabaseManager.getState(),
@@ -4945,8 +5732,8 @@ ipcMain.handle("supabase:select-project", async (_event, ref: string) => {
     };
   }
   try {
-    const info = await detectProject(currentProject).catch(() => null);
-    return await supabaseManager.selectProject(currentProject, ref, {
+    const info = await detectProject(projectRoot).catch(() => null);
+    return await supabaseManager.selectProject(projectRoot, ref, {
       framework: info?.framework || "Node",
       packageManager: info?.packageManager || "npm",
     });
@@ -4961,8 +5748,8 @@ ipcMain.handle("supabase:select-project", async (_event, ref: string) => {
 });
 
 ipcMain.handle("supabase:disconnect", async () => {
-  if (!currentProject) throw new Error("Nenhum projeto ativo.");
-  return await supabaseManager.disconnect(currentProject);
+  const projectRoot = assertProjectRootSafe(currentProject, "supabase-disconnect");
+  return await supabaseManager.disconnect(projectRoot);
 });
 
 ipcMain.handle("supabase:open-token-page", async () => {
@@ -4994,11 +5781,10 @@ ipcMain.handle("vercel:publish", async (_event, customProjectName?: string) => {
   if (vercelPublishInProgress) {
     throw new Error("Já existe uma publicação na Vercel em andamento.");
   }
-  if (!currentProject) {
-    throw new Error("Selecione um projeto antes de publicar na Vercel.");
-  }
+  const projectRoot = assertProjectRootSafe(currentProject, "vercel-publish");
+  logProjectWorkspace("vercel-publish", projectRoot);
 
-  const isLinked = fs.existsSync(path.join(currentProject, ".vercel", "project.json"));
+  const isLinked = fs.existsSync(path.join(projectRoot, ".vercel", "project.json"));
   let validatedProjectName: string | undefined;
 
   if (!isLinked) {
@@ -5017,14 +5803,14 @@ ipcMain.handle("vercel:publish", async (_event, customProjectName?: string) => {
   vercelPublishInProgress = true;
   try {
     const environment: Record<string, string> = {};
-    const info = await detectProject(currentProject).catch(() => null);
-    const supabaseIntegration = await supabaseManager.getIntegration(currentProject);
+    const info = await detectProject(projectRoot).catch(() => null);
+    const supabaseIntegration = await supabaseManager.getIntegration(projectRoot);
     if (supabaseIntegration) {
       const names = getSupabaseEnvironmentNames(info?.framework || "Vite");
       environment[names.url] = supabaseIntegration.projectUrl;
       environment[names.publishableKey] = supabaseIntegration.publishableKey;
     }
-    return await vercelManager.deploy(currentProject, environment, validatedProjectName);
+    return await vercelManager.deploy(projectRoot, environment, validatedProjectName);
   } finally {
     vercelPublishInProgress = false;
   }
@@ -5315,15 +6101,23 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
         // Log de diagnóstico
         console.log(`[Neko/PreviewDiag] error-detected signature=${diagnosticInfo.signature} attempt=${attemptCount + 1}/3`);
         
-        // Envia diagnóstico estruturado para o renderer
-        mainWindow?.webContents.send("preview:event", { 
-          type: "preview.error-detected", 
-          properties: { 
-            ...diagnosticInfo,
-            attempt: attemptCount + 1,
-            maxAttempts: 3
-          } 
-        });
+        // Envia diagnóstico estruturado para o renderer. A emissão é limitada:
+        // no máximo 3 tentativas por assinatura e um intervalo mínimo entre
+        // emissões idênticas, para que um erro repetitivo do Preview nunca
+        // dispare várias execuções do agente.
+        const nowEmission = Date.now();
+        const lastEmission = previewErrorEmissionAt.get(diagnosticInfo.signature) ?? 0;
+        if (attemptCount < 3 && nowEmission - lastEmission >= 3000) {
+          previewErrorEmissionAt.set(diagnosticInfo.signature, nowEmission);
+          mainWindow?.webContents.send("preview:event", { 
+            type: "preview.error-detected", 
+            properties: { 
+              ...diagnosticInfo,
+              attempt: attemptCount + 1,
+              maxAttempts: 3
+            } 
+          });
+        }
       }
       
       if (message.includes("[vite]")) perfMark("t6");
