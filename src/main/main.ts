@@ -216,6 +216,27 @@ function logSafeText(value: unknown, limit = 160): string {
     .trim();
 }
 
+function sanitizeErrorMessage(msg: string): string {
+  return String(msg ?? "")
+    .replace(/(bearer\s+)[a-zA-Z0-9_\-\.]+/gi, "$1[REDACTED]")
+    .replace(/(password["':\s=]+)[^\s"&,]+/gi, "$1[REDACTED]")
+    .replace(/(token["':\s=]+)[^\s"&,]+/gi, "$1[REDACTED]")
+    .replace(/(key["':\s=]+)[a-zA-Z0-9_\-]{8,}/gi, "$1[REDACTED]");
+}
+
+// Handlers globais de erro para prevenir crashes silenciosos no processo principal
+process.on("uncaughtException", (error: Error) => {
+  const safeMsg = sanitizeErrorMessage(error?.message ?? String(error));
+  const safeStack = sanitizeErrorMessage(error?.stack ?? "");
+  console.error(`[FATAL/UncaughtException] ${safeMsg}\n${safeStack}`);
+});
+
+process.on("unhandledRejection", (reason: unknown) => {
+  const raw = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+  const safeReason = sanitizeErrorMessage(raw);
+  console.error(`[FATAL/UnhandledRejection] ${safeReason}`);
+});
+
 // Task correlation. Every prompt receives an internal id that is attached to
 // the session.idle events of that task, so the renderer can distinguish the
 // idle of task A from the idle of task B and never conclude the wrong task.
@@ -332,6 +353,14 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
   }
   const previous = record.state;
   if (previous === state) return false;
+
+  // Guarda de estado terminal: eventos atrasados não podem ressuscitar uma tarefa finalizada
+  const isTerminal = previous === "completed" || previous === "cancelled" || previous === "failed";
+  if (isTerminal && reason !== "task-start" && state !== "completed" && state !== "cancelled" && state !== "failed") {
+    console.log(`[TaskState] Ignorando transição tardia de estado terminal (${previous} -> ${state}) sessionId=${sessionId.slice(0, 8)} taskId=${record.taskId || "none"} reason=${logSafeText(reason)}`);
+    return false;
+  }
+
   record.state = state;
   record.stateAt = Date.now();
   logTask("state-change", record.taskId, sessionId, `state=${state} previous=${previous} reason=${logSafeText(reason)}`);
@@ -3029,14 +3058,15 @@ async function removeNodeModules(projectPath: string): Promise<void> {
       const trashDir = path.join(projectPath, `.trash_nm_${Date.now()}_${attempt}`);
       try {
         await fs.promises.rename(nodeModulesPath, trashDir);
-        // Spawn cmd rmdir in background to clean up trash directory asynchronously
-        spawn("cmd.exe", ["/c", `rmdir /s /q "${trashDir}"`], { windowsHide: true, stdio: "ignore", detached: true }).unref();
+        // Exclusão assíncrona da pasta renomeada via Node.js nativo (evita cmd.exe com interpolação)
+        void fs.promises.rm(trashDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }).catch(() => {});
         console.log(`[Preview/Cleanup] completed (renamed to ${trashDir})`);
         return;
       } catch (renameErr: any) {
         console.warn(`[Preview/Cleanup] tentativa ${attempt} de rename fallback falhou:`, renameErr?.message);
         await new Promise<void>(resolve => {
-          const killer = spawn("cmd.exe", ["/c", `rmdir /s /q "${nodeModulesPath}"`], { windowsHide: true, stdio: "ignore" });
+          const safeTarget = path.normalize(nodeModulesPath);
+          const killer = spawn("cmd.exe", ["/s", "/c", "rmdir", "/s", "/q", safeTarget], { windowsHide: true, stdio: "ignore" });
           killer.once("error", () => resolve());
           killer.once("exit", () => resolve());
         });
@@ -5550,7 +5580,29 @@ ${languageInstruction}`
     let stableSince = 0;
 
     while (Date.now() < safetyDeadline) {
+      const currentRecord = taskRecords.get(payload.sessionId);
+      if (
+        !currentRecord ||
+        currentRecord.state === "cancelled" ||
+        currentRecord.state === "failed" ||
+        isStoppingOpencodeIntentionally
+      ) {
+        console.log(`[Neko/Plan] polling interrompido por cancelamento ou parada session=${payload.sessionId}`);
+        return { accepted: false, cancelled: true, plan: "", taskId: taskCorrelationId };
+      }
+
       await new Promise(resolve => setTimeout(resolve, 700));
+
+      const afterSleepRecord = taskRecords.get(payload.sessionId);
+      if (
+        !afterSleepRecord ||
+        afterSleepRecord.state === "cancelled" ||
+        afterSleepRecord.state === "failed" ||
+        isStoppingOpencodeIntentionally
+      ) {
+        console.log(`[Neko/Plan] polling interrompido por cancelamento ou parada session=${payload.sessionId}`);
+        return { accepted: false, cancelled: true, plan: "", taskId: taskCorrelationId };
+      }
 
       let statusType = "";
       try {
