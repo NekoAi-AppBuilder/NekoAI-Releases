@@ -502,12 +502,12 @@ async function fetchSessionEngineStatus(sessionId: string, timeoutMs = 4000): Pr
   }
 }
 
-// Arms or re-arms the single inactivity watchdog for a task. Plan mode keeps
-// its own 10-minute deadline, so Plan tasks are never handled here. A short
-// unknown-recheck cycle (unknownRecheck=true) is just a one-time ~30s probe.
+// Arms or re-arms the single inactivity watchdog for a task. While waiting for
+// user input/approval, the watchdog is cancelled. A short unknown-recheck cycle
+// (unknownRecheck=true) is just a one-time ~30s probe.
 function scheduleAgentInactivityWatchdog(sessionId: string, taskId: string, unknownRecheck = false) {
   const record = taskRecords.get(sessionId);
-  if (!record || record.planMode) return;
+  if (!record) return;
   const existing = agentInactiveTimers.get(sessionId);
   if (existing) clearTimeout(existing.timer);
   const delay = unknownRecheck ? AGENT_INACTIVE_UNKNOWN_RECHECK_MS : AGENT_INACTIVE_LIMIT_MS;
@@ -617,7 +617,7 @@ function logSampledMessageEvent(eventType: string, props: any, sessionId: string
 // synthesizes a question and never emits waiting_for_user.
 async function checkAgentInactivity(sessionId: string, isUnknownRecheck = false) {
   const record = taskRecords.get(sessionId);
-  if (!record || record.planMode || record.state !== "running") return;
+  if (!record || record.state !== "running") return;
   const active = activeAgentRequests.get(sessionId);
   if (active?.isRetrying || active?.retryTimer) {
     scheduleAgentInactivityWatchdog(sessionId, record.taskId);
@@ -705,23 +705,26 @@ function scheduleQuestionCommitRecheck(sessionId: string, taskId: string) {
 // Shared question detection: a fresh (>= task start) assistant message that
 // clearly ends with "?" transitions the task to waiting_for_user. Returns
 // true when it did. Duplicates are tracked by lastAssistantMessageId so the
-// same message never re-asks the user. planMode keeps interactive questions
-// disabled.
+// same message never re-asks the user. When in planMode, text questions serve
+// as a graceful fallback when the model did not invoke the native plan_exit tool.
 function tryDetectQuestion(record: TaskRecord, latest: { id: string; text: string; created: number } | null): boolean {
   if (!latest?.text) return false;
   if (!(normalizeTimestamp(latest.created) >= normalizeTimestamp(record.createdAt))) return false; // message from an older task
   if (record.lastAssistantMessageId === latest.id && record.askedQuestionIds.length > 0) return false; // duplicate
-  if (!record.planMode && detectQuestion(latest.text)) {
+  if (detectQuestion(latest.text)) {
+    const isPlanApproval = Boolean(record.planMode);
     record.lastAssistantMessageId = latest.id;
     const questionId = `q${(++taskQuestionCounter).toString(36)}`;
     record.askedQuestionIds.push(questionId);
-    setTaskState(record.sessionId, "waiting_for_user", "question-asked", {
+    setTaskState(record.sessionId, "waiting_for_user", isPlanApproval ? "plan-approval-asked" : "question-asked", {
       questionId,
       question: latest.text,
       options: extractQuestionOptions(latest.text),
-      allowFreeText: true
+      allowFreeText: true,
+      isPlanApproval,
+      isTextualFallback: isPlanApproval
     });
-    logTask("question", record.taskId, record.sessionId, `questionId=${questionId}`);
+    logTask("question", record.taskId, record.sessionId, `questionId=${questionId} planFallback=${isPlanApproval}`);
     return true;
   }
   return false;
@@ -2614,19 +2617,27 @@ async function subscribeEvents(gen?: number) {
             const questionId = requestId || `q${(++taskQuestionCounter).toString(36)}`;
 
             const record = taskRecords.get(questionSessionId);
+            const header = String(firstQ?.header ?? props?.header ?? "").trim();
+            const isPlanApproval =
+              header.toLowerCase() === "build agent" ||
+              /plan\s+at\s+.*is\s+complete/i.test(questionText) ||
+              props?.tool === "plan_exit" ||
+              Boolean(record?.planMode && options.some(o => /switch to build agent|start implementing|stay with plan/i.test(o)));
+
             if (record) {
               record.askedQuestionIds.push(questionId);
             }
-            console.log(`[TaskLifecycle] native question.asked session=${questionSessionId} requestId=${requestId} text=${questionText.slice(0, 60)}`);
-            setTaskState(questionSessionId, "waiting_for_user", "question-asked", {
+            console.log(`[TaskLifecycle] native question.asked session=${questionSessionId} requestId=${requestId} isPlan=${isPlanApproval} text=${questionText.slice(0, 60)}`);
+            setTaskState(questionSessionId, "waiting_for_user", isPlanApproval ? "plan-approval-asked" : "question-asked", {
               questionId,
               requestId,
               isNativeTool: true,
+              isPlanApproval,
               question: questionText,
               options,
               allowFreeText
             });
-            logTask("question", record?.taskId ?? "", questionSessionId, `requestId=${requestId} native=true`);
+            logTask("question", record?.taskId ?? "", questionSessionId, `requestId=${requestId} native=true planApproval=${isPlanApproval}`);
           }
           if (eventType === "question.replied" || eventType === "question.rejected") {
             const questionSessionId = String(props?.sessionID ?? props?.sessionId ?? perfSessionId ?? "");
@@ -5527,7 +5538,7 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   const languageInstruction = `IDIOMA OBRIGATÓRIO DA INTERFACE: Português do Brasil (pt-BR).
 Todas as respostas destinadas ao usuário devem ser escritas em português do Brasil, incluindo resumo, conclusão, explicações, nomes de etapas e qualquer texto final. Não responda em inglês, espanhol ou outro idioma. Preserve nomes técnicos inevitáveis (por exemplo, nomes de arquivos, APIs, bibliotecas, comandos, variáveis e URLs) somente quando forem necessários, mas explique o restante em português. Nunca copie ou reproduza logs, mensagens ou respostas internas de ferramentas como se fossem uma resposta ao usuário. Gere uma única resposta final, exclusivamente em português do Brasil. Não inclua uma versão em inglês antes ou depois da resposta em português.`;
 
-  const planInstruction = `You are NekoAI's planning agent. Analyze the user's request and the current project, then return a concrete, implementation-ready plan for another agent to execute. Do not modify files. Do not ask the user whether you may proceed; the NekoAI UI handles approval separately. Your response must clearly state WHAT will be changed, WHERE it will be changed (files/components when you can determine them), and HOW it will be implemented. Include relevant validation steps.
+  const planInstruction = `You are NekoAI's planning agent. Analyze the user's request and the current project, then create a comprehensive, implementation-ready plan. Do not edit project files directly. Formulate the plan clearly, detailing what will be changed, where it will be changed, and how it will be validated. When your plan is ready, you must call the native plan_exit tool to request user approval before any implementation begins. If you need any clarification or architectural choices from the user during planning, use the native question tool.
 
 ${languageInstruction}
 
@@ -5544,134 +5555,6 @@ ${languageInstruction}`
     ...(payload.model ? { model: payload.model } : {}),
     parts: [{ type: "text", text: payload.planMode ? planInstruction : userRequestText }, ...contextParts]
   };
-
-  // Plan is asynchronous in OpenCode. We start the prompt and then watch the
-  // same session for a NEW assistant message. This is more reliable than relying
-  // on a fixed timeout or on session.status alone (which can be delayed/missing).
-  if (payload.planMode) {
-    const startedAt = Date.now();
-
-    // Snapshot assistant message IDs before sending the plan so we never mistake
-    // an older assistant response for the current plan.
-    let baselineAssistantIds = new Set<string>();
-    try {
-      const client: any = await getOpencodeClient();
-      const historyResult = await client.session.messages({ path: { id: payload.sessionId } });
-      const historyData: any = historyResult?.data ?? historyResult ?? [];
-      const entries: any[] = Array.isArray(historyData) ? historyData : [];
-      baselineAssistantIds = new Set(entries
-        .filter((entry: any) => (entry?.info?.role ?? entry?.role) === "assistant")
-        .map((entry: any) => String(entry?.info?.id ?? entry?.id ?? ""))
-        .filter(Boolean));
-    } catch {}
-
-    perfMark("taskSend", payload.sessionId);
-    const response = await fetchWithTimeout(
-      `${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/prompt_async`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
-        body: JSON.stringify(requestBody)
-      },
-      15000
-    );
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      throw new Error(`Falha ao iniciar o modo Plan (HTTP ${response.status}).${body ? ` ${body.slice(0, 240)}` : ""}`);
-    }
-    perfMark("t2", payload.sessionId);
-    setTaskState(payload.sessionId, "running", "prompt-accepted");
-    logTask("started", taskCorrelationId, payload.sessionId);
-
-    // Maximum safety guard only. Normal completion is driven by the session's
-    // fresh assistant message, not by this timer.
-    const safetyDeadline = Date.now() + 10 * 60 * 1000;
-    let lastText = "";
-    let stableSince = 0;
-
-    while (Date.now() < safetyDeadline) {
-      const currentRecord = taskRecords.get(payload.sessionId);
-      if (
-        !currentRecord ||
-        currentRecord.state === "cancelled" ||
-        currentRecord.state === "failed" ||
-        isStoppingOpencodeIntentionally
-      ) {
-        console.log(`[Neko/Plan] polling interrompido por cancelamento ou parada session=${payload.sessionId}`);
-        return { accepted: false, cancelled: true, plan: "", taskId: taskCorrelationId };
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 700));
-
-      const afterSleepRecord = taskRecords.get(payload.sessionId);
-      if (
-        !afterSleepRecord ||
-        afterSleepRecord.state === "cancelled" ||
-        afterSleepRecord.state === "failed" ||
-        isStoppingOpencodeIntentionally
-      ) {
-        console.log(`[Neko/Plan] polling interrompido por cancelamento ou parada session=${payload.sessionId}`);
-        return { accepted: false, cancelled: true, plan: "", taskId: taskCorrelationId };
-      }
-
-      let statusType = "";
-      try {
-        const statusResponse = await fetchWithTimeout(`${opencodeUrl}/session/status`, { headers: opencodeRequestHeaders() }, 5000);
-        if (statusResponse.ok) {
-          const statusPayload: any = await statusResponse.json();
-          const statuses = statusPayload?.data ?? statusPayload ?? {};
-          const sessionStatus = statuses?.[payload.sessionId];
-          statusType = String(sessionStatus?.type ?? sessionStatus ?? "").toLowerCase();
-        }
-      } catch {}
-
-      try {
-        const messagesResponse = await fetchWithTimeout(
-          `${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/message`,
-          { headers: opencodeRequestHeaders() },
-          8000
-        );
-        if (!messagesResponse.ok) continue;
-        const messagesPayload: any = await messagesResponse.json();
-        const entries: any[] = Array.isArray(messagesPayload) ? messagesPayload : (messagesPayload?.data ?? []);
-        const assistants = entries.filter((entry: any) => (entry?.info?.role ?? entry?.role) === "assistant");
-
-        // Prefer the most recent assistant message that was not present before
-        // this Plan request. Do not use timestamps because OpenCode versions may
-        // expose message times in different shapes/units.
-        const fresh = assistants.filter((entry: any) => {
-          const id = String(entry?.info?.id ?? entry?.id ?? "");
-          return id && !baselineAssistantIds.has(id);
-        });
-        const latest = (fresh.length ? fresh : (assistants.length ? [assistants[assistants.length - 1]] : []))[fresh.length ? fresh.length - 1 : 0];
-        const parts = Array.isArray(latest?.parts) ? latest.parts : [];
-        const text = parts
-          .filter((part: any) => part?.type === "text" && typeof part?.text === "string")
-          .map((part: any) => part.text.trim())
-          .filter(Boolean)
-          .join("\n\n")
-          .trim();
-
-        if (text) {
-          if (text !== lastText) {
-            lastText = text;
-            stableSince = Date.now();
-          }
-
-          const idle = ["idle", "completed", "done", ""].includes(statusType);
-          const stable = stableSince > 0 && Date.now() - stableSince >= 1200;
-          if (fresh.length && (idle || stable)) {
-            perfMark("t8", payload.sessionId);
-            perfFlushTask(payload.sessionId, "plan");
-            return { accepted: true, plan: text, taskId: taskCorrelationId };
-          }
-        }
-      } catch {}
-    }
-
-    throw new Error("O modo Plan não retornou um plano dentro de 10 minutos. O OpenCode pode estar aguardando uma ação ou permissão.");
-  }
 
   const promptStartedAt = Date.now();
   console.log(`[Neko/Agent] enviando tarefa session=${payload.sessionId} model=${payload.model?.providerID ?? "default"}/${payload.model?.modelID ?? "default"} effort=${payload.effort ?? "default"}`);

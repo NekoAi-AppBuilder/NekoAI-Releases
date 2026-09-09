@@ -342,7 +342,7 @@ function formatTimeAgo(timestamp: number): string {
 
 type Node = { name: string; path: string; type: "file" | "directory"; children?: Node[] };
 type Message = { role: "user" | "assistant" | "system" | "error"; text: string; attachments?: Attachment[]; taskId?: string; durationMs?: number; createdAt?: number };
-type PendingPlan = { request: string; attachments: Attachment[]; contextPaths: string[]; planText: string; messageCreatedAt: number };
+type PendingPlan = { request: string; attachments: Attachment[]; contextPaths: string[]; planText: string; messageCreatedAt: number; requestId?: string; taskId?: string; sessionID?: string };
 type ApprovedPlan = { planText: string; approvedAt: number; messageCreatedAt: number };
 type Activity = { id: string; icon: "brain" | "tool" | "file" | "command" | "status" | "check" | "error" | "wait"; title: string; detail?: string; state: "running" | "done" | "error"; ts: number };
 type PermissionRequest = { id: string; sessionID: string; permission: string; patterns: string[]; always?: string[]; metadata?: Record<string, unknown>; tool?: { messageID?: string; callID?: string } };
@@ -2361,8 +2361,37 @@ function App() {
       if (isTaskTerminal()) return;
       taskPhaseRef.current = "waiting_for_user";
       setBusy(false);
-      setWorkingStatus("Neko precisa de uma resposta");
+      const isPlan = Boolean(props?.isPlanApproval);
+      setWorkingStatus(isPlan ? "Neko elaborou um plano e aguarda sua aprovação" : "Neko precisa de uma resposta");
       const questionId = String(props?.questionId ?? "");
+      const requestId = props?.requestId ? String(props.requestId) : undefined;
+
+      if (isPlan) {
+        if (questionId && !handledQuestionIdsRef.current.has(questionId)) {
+          handledQuestionIdsRef.current.add(questionId);
+          planAwaitingRef.current = true;
+          // Capture the last assistant message or props.question for the plan summary
+          const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
+          const planText = String(lastAssistant?.text || props?.question || "Plano de implementação concluído e pronto para revisão.").trim();
+          const pendingPlanObj: PendingPlan = {
+            request: String(props?.request || lastAssistant?.text || "Plano de implementação"),
+            attachments: [],
+            contextPaths: [],
+            planText,
+            messageCreatedAt: Date.now(),
+            requestId,
+            taskId: String(props?.taskId ?? currentTaskIdRef.current ?? ""),
+            sessionID
+          };
+          pendingPlanTaskRef.current = String(props?.taskId ?? currentTaskIdRef.current ?? "");
+          setPendingPlan(pendingPlanObj);
+          upsertActivity({ id: `plan:${questionId}`, icon: "wait", title: "Plano pronto para revisão", detail: "Revise o plano antes de permitir as alterações no projeto.", state: "running" });
+          notifyOnce("plan", `plan:${questionId}`);
+          console.log(`[TaskLifecycle] state=waiting_for_user (plan) taskId=${props?.taskId ?? "-"} requestId=${requestId || "-"}`);
+        }
+        return;
+      }
+
       if (questionId && !handledQuestionIdsRef.current.has(questionId)) {
         handledQuestionIdsRef.current.add(questionId);
         const question: AgentQuestion = {
@@ -2372,7 +2401,7 @@ function App() {
           question: String(props?.question ?? "").trim(),
           options: Array.isArray(props?.options) ? props.options.map((o: any) => String(o)) : [],
           allowFreeText: props?.allowFreeText !== false,
-          requestId: props?.requestId ? String(props.requestId) : undefined,
+          requestId,
           isNativeTool: Boolean(props?.isNativeTool)
         };
         pendingQuestionRef.current = question;
@@ -3359,6 +3388,9 @@ function App() {
     if (!sessionId) return;
     setPendingQuestion(null);
     pendingQuestionRef.current = null;
+    setPendingPlan(null);
+    planAwaitingRef.current = false;
+    pendingPlanTaskRef.current = null;
     try {
       await window.neko.abort(sessionId);
     } catch (error) {
@@ -3367,9 +3399,11 @@ function App() {
   }, [sessionId]);
 
   const rejectPlan = React.useCallback(() => {
+    const plan = pendingPlan;
     setPendingPlan(null);
     setPlanExpanded(false);
     setPlanApprovalBusy(false);
+    planAwaitingRef.current = false;
     pendingPlanTaskRef.current = null;
     taskPhaseRef.current = "cancelled";
     requestInFlightRef.current = false;
@@ -3377,7 +3411,14 @@ function App() {
     setBusy(false);
     setWorkingStatus("");
     upsertActivity({ id: "plan-rejected", icon: "error", title: "Plano cancelado", detail: "O plano não foi aprovado.", state: "error" });
-  }, [upsertActivity]);
+
+    if (plan?.requestId && sessionId) {
+      void window.neko.questionReply(sessionId, plan.requestId, [["No"]]).catch(err => {
+        console.warn("[Plan] reject reply error:", err);
+      });
+      console.log(`[Plan] native rejection sent requestId=${plan.requestId} session=${sessionId}`);
+    }
+  }, [sessionId, pendingPlan, upsertActivity]);
 
   const approvePlan = React.useCallback(async () => {
     if (!sessionId || !pendingPlan || planApprovalBusy) return;
@@ -3385,11 +3426,42 @@ function App() {
     const plan = pendingPlan;
     setPendingPlan(null);
     setPlanExpanded(false);
+    planAwaitingRef.current = false;
 
     // Show the approved plan card
     setApprovedPlan({ planText: plan.planText, approvedAt: Date.now(), messageCreatedAt: Date.now() });
 
-    // Send the plan approval as a follow-up prompt to continue execution
+    // 1. NATIVE OPENCODE PLAN APPROVAL:
+    // If this came from a native question (plan_exit), send "Yes" to the existing session!
+    if (plan.requestId) {
+      requestStartedAtRef.current = Date.now();
+      requestInFlightRef.current = true;
+      requestObservedBusyRef.current = false;
+      taskPhaseRef.current = "running";
+      retryActiveRef.current = false;
+      pendingPlanTaskRef.current = null;
+      setBusy(true);
+      setWorkingStatus("Executando o plano aprovado...");
+
+      try {
+        await window.neko.questionReply(sessionId, plan.requestId, [["Yes"]]);
+        console.log(`[Plan] native approval sent requestId=${plan.requestId} session=${sessionId}`);
+      } catch (error) {
+        requestInFlightRef.current = false;
+        requestObservedBusyRef.current = false;
+        taskPhaseRef.current = "failed";
+        setBusy(false);
+        setWorkingStatus("");
+        setApprovedPlan(null);
+        setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
+      } finally {
+        setPlanApprovalBusy(false);
+      }
+      return;
+    }
+
+    // 2. TEXTUAL FALLBACK:
+    // If the model did not invoke plan_exit, send the follow-up prompt to continue execution.
     requestStartedAtRef.current = Date.now();
     requestInFlightRef.current = true;
     requestObservedBusyRef.current = false;
@@ -3412,7 +3484,7 @@ function App() {
       );
       if (result?.taskId) {
         currentTaskIdRef.current = String(result.taskId);
-        console.log(`[Plan] approved and dispatched taskId=${result.taskId}`);
+        console.log(`[Plan] fallback approved and dispatched taskId=${result.taskId}`);
       }
     } catch (error) {
       requestInFlightRef.current = false;
