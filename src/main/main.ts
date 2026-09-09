@@ -2700,11 +2700,22 @@ async function subscribeEvents(gen?: number) {
 }
 
 
-function safePathWithinProject(projectPath: string, relativePath: string) {
+function safePathWithinProject(projectPath: string, relativePath: string): string {
   const root = path.resolve(projectPath);
   const target = path.resolve(root, relativePath);
-  if (target !== root && !target.startsWith(root + path.sep)) {
-    throw new Error("Caminho fora do projeto.");
+
+  if (process.platform === "win32") {
+    const rootNorm = root.toLowerCase();
+    const targetNorm = target.toLowerCase();
+    const rootPrefix = rootNorm.endsWith(path.sep) ? rootNorm : rootNorm + path.sep;
+    if (targetNorm !== rootNorm && !targetNorm.startsWith(rootPrefix)) {
+      throw new Error("Caminho fora do projeto.");
+    }
+  } else {
+    const rootPrefix = root.endsWith(path.sep) ? root : root + path.sep;
+    if (target !== root && !target.startsWith(rootPrefix)) {
+      throw new Error("Caminho fora do projeto.");
+    }
   }
   return target;
 }
