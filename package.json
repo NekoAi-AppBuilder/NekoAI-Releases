@@ -1,6 +1,6 @@
 {
   "name": "nekoai",
-  "version": "0.4.80",
+  "version": "0.4.81",
   "private": true,
   "description": "NekoAI - AI software builder",
   "main": "dist/main/main.js",
@@ -35,6 +35,9 @@
   "build": {
     "appId": "com.nekoai.studio",
     "productName": "NekoAI",
+    "directories": {
+      "output": "dist-build"
+    },
     "files": [
       "dist/main/**/*",
       "dist/preload/**/*",
