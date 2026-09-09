@@ -61,6 +61,17 @@ let opencodeProcess: ChildProcess | null = null;
 let opencodeUrl = "http://127.0.0.1:4097";
 let currentProject: string | null = null;
 let eventAbort: AbortController | null = null;
+let sseReconnectTimer: NodeJS.Timeout | null = null;
+let sseReconnectAttempts = 0;
+
+function cancelSseReconnect(reason = "cancelled") {
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+    console.log(`[OpenCode/SSE] reconnect cancelled reason=${reason}`);
+  }
+  sseReconnectAttempts = 0;
+}
 let projectWatcher: fs.FSWatcher | null = null;
 let projectWatchTimer: NodeJS.Timeout | null = null;
 
@@ -798,6 +809,7 @@ async function runIdleDetermination(sessionId: string, taskId: string, isQuestio
 }
 
 function resetTaskRuntime() {
+  cancelSseReconnect("task-runtime-reset");
   for (const active of activeAgentRequests.values()) {
     if (active.retryTimer) clearTimeout(active.retryTimer);
   }
@@ -2225,6 +2237,7 @@ async function startOpenCode(projectPath: string) {
 }
 
 async function stopOpenCode() {
+  cancelSseReconnect("stop-opencode");
   isStoppingOpencodeIntentionally = true;
   clearStatusCache();
   perfFlushTask(null, "stopped");
@@ -2270,15 +2283,31 @@ async function stopOpenCode() {
 
 async function subscribeEvents(gen?: number) {
   const streamGen = typeof gen === "number" ? gen : (activeWorkspace?.generation ?? projectTransitionGeneration);
+  if (isStoppingOpencodeIntentionally || !opencodeProcess) {
+    return;
+  }
+  if (activeWorkspace && activeWorkspace.generation !== streamGen) {
+    return;
+  }
+
+  // Clear any existing reconnect timer when (re)connecting
+  if (sseReconnectTimer) {
+    clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
+
   eventAbort?.abort();
   eventAbort = new AbortController();
+  const currentSignal = eventAbort.signal;
   if (activeWorkspace && activeWorkspace.generation === streamGen) {
     activeWorkspace.eventAbort = eventAbort;
   }
 
+  const isReconnect = sseReconnectAttempts > 0;
+
   try {
     const response = await fetch(`${opencodeUrl}/event`, {
-      signal: eventAbort.signal,
+      signal: currentSignal,
       headers: { Accept: "text/event-stream", ...opencodeRequestHeaders() }
     });
 
@@ -2286,11 +2315,21 @@ async function subscribeEvents(gen?: number) {
       throw new Error(`OpenCode events retornou HTTP ${response.status}.`);
     }
 
+    if (currentSignal.aborted) return;
+    if (activeWorkspace && activeWorkspace.generation !== streamGen) return;
+
+    if (isReconnect) {
+      console.log(`[OpenCode/SSE] reconnect success gen=${streamGen}`);
+    } else {
+      console.log(`[OpenCode/SSE] connected gen=${streamGen}`);
+    }
+    sseReconnectAttempts = 0;
+
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
 
-    while (!eventAbort.signal.aborted) {
+    while (!currentSignal.aborted) {
       const { value, done } = await reader.read();
       if (done) break;
 
@@ -2598,12 +2637,34 @@ async function subscribeEvents(gen?: number) {
         }
       }
     }
+    console.log(`[OpenCode/SSE] disconnected gen=${streamGen}`);
   } catch (error: any) {
     if (error?.name !== "AbortError" && (!activeWorkspace || activeWorkspace.generation === streamGen)) {
       console.error("[Neko/OpenCode] event stream error:", error);
+    }
+  }
+
+  // Auto-reconexão progressiva caso o stream tenha caído inesperadamente
+  const shouldReconnect =
+    !currentSignal.aborted &&
+    !isStoppingOpencodeIntentionally &&
+    Boolean(opencodeProcess) &&
+    (!activeWorkspace || activeWorkspace.generation === streamGen);
+
+  if (shouldReconnect) {
+    if (sseReconnectAttempts < 10) {
+      sseReconnectAttempts++;
+      const delayMs = Math.min(10000, Math.round(500 * Math.pow(1.8, sseReconnectAttempts - 1)));
+      console.log(`[OpenCode/SSE] reconnect scheduled attempt=${sseReconnectAttempts} delayMs=${delayMs} gen=${streamGen}`);
+      sseReconnectTimer = setTimeout(() => {
+        sseReconnectTimer = null;
+        void subscribeEvents(streamGen);
+      }, delayMs);
+    } else {
+      console.warn(`[OpenCode/SSE] reconnect attempts exhausted (${sseReconnectAttempts}) gen=${streamGen}`);
       mainWindow?.webContents.send("opencode:event", {
         type: "neko.connection.error",
-        properties: { message: String(error?.message ?? error), generation: streamGen }
+        properties: { message: "Conexão com o serviço de eventos interrompida após várias tentativas.", generation: streamGen }
       });
     }
   }
