@@ -245,12 +245,40 @@ type TaskRecord = {
   lastActivityAt: number;
   lastAssistantMessageId: string;
   askedQuestionIds: string[];
+  // Newest assistant message id the event stream has referred to for this
+  // session (message.part.updated / message.updated). Used to detect the
+  // message-commit race: an idle can arrive before the message endpoint
+  // exposes the very message the engine just streamed.
+  lastStreamedAssistantMessageId: string;
 };
 const taskRecords = new Map<string, TaskRecord>();
 let taskQuestionCounter = 0;
 const idleDeterminationGate = new Map<string, { running: boolean; lastAt: number }>();
 const idleRecheckTimers = new Map<string, NodeJS.Timeout>();
+// Single short recheck for the message-commit race (see runIdleDetermination).
+// Deduplicated by task+session so only one recheck ever runs per idle cycle.
+const questionRecheckTimers = new Map<string, { timer: NodeJS.Timeout; taskId: string }>();
 const previewErrorEmissionAt = new Map<string, number>();
+// Safety net against tasks stuck in "running": OpenCode can accept a prompt and
+// then never emit activity, messages, tool calls or session.idle. Conclusion
+// only happens inside runIdleDetermination (triggered by session.idle), so such
+// a task would stay running forever. One bounded timer per non-plan task: 3
+// minutes by default, overridable for tests. It never invents questions, never
+// emits waiting_for_user, and defers to busy/retry/unknown instead of failing.
+const AGENT_INACTIVE_LIMIT_MS = Math.max(5_000, Number(process.env.NEKO_AGENT_STALE_LIMIT_MS) || 180_000);
+// When the first watchdog check finds the session unknown/absent, a SINGLE
+// short recheck (~30s) is armed instead of a new full cycle. If the second
+// probe is still unknown/absent the task fails: the watchdog never re-arms
+// indefinitely. If the session returns to busy/retry/idle meanwhile, the
+// normal flow takes over. No loops, no periodic polling.
+const AGENT_INACTIVE_UNKNOWN_RECHECK_MS = Math.max(5_000, Number(process.env.NEKO_AGENT_STALE_UNKNOWN_RECHECK_MS) || 30_000);
+type AgentInactiveEntry = { timer: NodeJS.Timeout; taskId: string; unknownRecheck: boolean };
+const agentInactiveTimers = new Map<string, AgentInactiveEntry>();
+// Diagnostic-only trackers (never decide state): unknown-status transitions,
+// sampled SSE message logging and one-shot post-ACK probes.
+const unknownStatusTrack = new Map<string, { enteredAt: number; persistedLogged: boolean }>();
+const diagMessageLogCounts = new Map<string, number>();
+const postAckDiagScheduled = new Set<string>();
 
 // In-memory capability cache for the provider catalog, refreshed whenever
 // the renderer loads providers. Vision capability decisions never trigger
@@ -286,7 +314,8 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
       sawBusy: false,
       lastActivityAt: 0,
       lastAssistantMessageId: "",
-      askedQuestionIds: []
+      askedQuestionIds: [],
+      lastStreamedAssistantMessageId: ""
     };
     taskRecords.set(sessionId, record);
   }
@@ -307,6 +336,14 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
       ...extra
     }
   });
+  // Inactivity watchdog: arm a single bounded timer whenever a (non-plan) task
+  // enters running and disarm it as soon as it leaves running (user STOP,
+  // question, approval or completion). Plan mode keeps its own deadline.
+  if (state === "running") {
+    scheduleAgentInactivityWatchdog(sessionId, record.taskId);
+  } else {
+    cancelAgentInactivityWatchdog(sessionId);
+  }
   return true;
 }
 
@@ -320,22 +357,28 @@ function resolveTaskIdForSession(sessionId: string): string {
   return taskId;
 }
 
+function normalizeTimestamp(value: unknown): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  return num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+}
+
 // Pending permissions are the engine's approval requests. Only permissions
 // created after the current task started count: an old permission must never
 // block or influence a new task.
 async function fetchPendingPermissions(sessionId: string, timeoutMs = 4000): Promise<any[]> {
   try {
-    const response = await fetchWithTimeout(`${opencodeUrl}/permission`, { headers: opencodeDirectoryHeaders() }, timeoutMs);
+    const response = await fetchWithTimeout(`${opencodeUrl}/permission`, { headers: opencodeRequestHeaders() }, timeoutMs);
     if (!response.ok) return [];
     const payload = await response.json();
     const list = Array.isArray(payload) ? payload : (payload?.data ?? payload?.permissions ?? []);
     if (!Array.isArray(list)) return [];
     const record = taskRecords.get(sessionId);
-    const since = record?.createdAt ?? 0;
+    const since = normalizeTimestamp(record?.createdAt ?? 0);
     return list
       .filter((item: any) => item?.sessionID === sessionId)
-      .filter((item: any) => Number(item?.time?.created ?? 0) >= since)
-      .sort((a: any, b: any) => Number(a?.time?.created ?? 0) - Number(b?.time?.created ?? 0));
+      .filter((item: any) => normalizeTimestamp(item?.time?.created ?? 0) >= since)
+      .sort((a: any, b: any) => normalizeTimestamp(a?.time?.created ?? 0) - normalizeTimestamp(b?.time?.created ?? 0));
   } catch {
     return [];
   }
@@ -345,7 +388,7 @@ async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000):
   try {
     const response = await fetchWithTimeout(
       `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
-      { headers: opencodeDirectoryHeaders() },
+      { headers: opencodeRequestHeaders() },
       timeoutMs
     );
     if (!response.ok) return null;
@@ -363,7 +406,7 @@ async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000):
         .join("\n\n")
         .trim();
       if (!text) continue;
-      const created = Number(entry?.info?.time?.created ?? entry?.time?.created ?? entry?.createdAt ?? 0);
+      const created = normalizeTimestamp(entry?.info?.time?.created ?? entry?.time?.created ?? entry?.createdAt ?? 0);
       return { id: String(entry?.info?.id ?? entry?.id ?? ""), text, created };
     }
     return null;
@@ -372,14 +415,18 @@ async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000):
   }
 }
 
-// The engine has no dedicated "question" event in this protocol version: an
-// interactive question is an assistant message that ends asking the user.
-// Only that exact shape (trailing question mark) turns an idle session into
-// waiting_for_user; everything else is a real completion.
+// The engine can ask questions via native tool or trailing text question.
+// A question ends asking the user or offers choice options.
 function detectQuestion(text: string): boolean {
   const normalized = String(text ?? "").trim();
   if (!normalized) return false;
-  return /[?？]\s*$/.test(normalized);
+  // Tolerate small trailing formatting differences (a stray period, closing
+  // quote/bracket, line break or whitespace) without turning arbitrary text
+  // into a question. The message still has to actually end with a "?".
+  const cleaned = normalized.replace(/[)}\]"'`»“”]+$/, "");
+  if (/[?？]\s*$/.test(cleaned)) return true;
+  if (/[?？]/.test(normalized) && extractQuestionOptions(normalized).length >= 2) return true;
+  return false;
 }
 
 function extractQuestionOptions(text: string): string[] {
@@ -397,17 +444,183 @@ function extractQuestionOptions(text: string): string[] {
 // task that is still being processed.
 async function fetchSessionEngineStatus(sessionId: string, timeoutMs = 4000): Promise<"busy" | "retry" | "idle" | "unknown"> {
   try {
-    const response = await fetchWithTimeout(`${opencodeUrl}/session/status`, { headers: opencodeDirectoryHeaders() }, timeoutMs);
-    if (!response.ok) return "unknown";
+    const response = await fetchWithTimeout(`${opencodeUrl}/session/status`, { headers: opencodeRequestHeaders() }, timeoutMs);
+    if (!response.ok) {
+      trackUnknownStatus(sessionId, "unknown");
+      return "unknown";
+    }
     const payload: any = await response.json();
     const statuses = payload?.data ?? payload ?? {};
     const status = statuses?.[sessionId];
     const engineStatus = String(status?.type ?? status ?? "").toLowerCase();
+    trackUnknownStatus(sessionId, engineStatus === "" ? "unknown" : engineStatus);
     if (engineStatus === "busy" || engineStatus === "retry" || engineStatus === "idle") return engineStatus;
     return "unknown";
   } catch {
+    trackUnknownStatus(sessionId, "unknown");
     return "unknown";
   }
+}
+
+// Arms or re-arms the single inactivity watchdog for a task. Plan mode keeps
+// its own 10-minute deadline, so Plan tasks are never handled here. A short
+// unknown-recheck cycle (unknownRecheck=true) is just a one-time ~30s probe.
+function scheduleAgentInactivityWatchdog(sessionId: string, taskId: string, unknownRecheck = false) {
+  const record = taskRecords.get(sessionId);
+  if (!record || record.planMode) return;
+  const existing = agentInactiveTimers.get(sessionId);
+  if (existing) clearTimeout(existing.timer);
+  const delay = unknownRecheck ? AGENT_INACTIVE_UNKNOWN_RECHECK_MS : AGENT_INACTIVE_LIMIT_MS;
+  const timer = setTimeout(() => {
+    agentInactiveTimers.delete(sessionId);
+    void checkAgentInactivity(sessionId, unknownRecheck);
+  }, delay);
+  agentInactiveTimers.set(sessionId, { timer, taskId, unknownRecheck });
+}
+
+function cancelAgentInactivityWatchdog(sessionId: string) {
+  const existing = agentInactiveTimers.get(sessionId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    agentInactiveTimers.delete(sessionId);
+  }
+}
+
+// Diagnostic only: logs unknown-status transitions for a task session —
+// entering unknown, persisting >=5s (once), and leaving unknown. Never logs
+// every call, never decides state.
+function trackUnknownStatus(sessionId: string, status: string) {
+  if (!sessionId) return;
+  const taskLabel = resolveTaskIdForSession(sessionId) || "-";
+  if (status !== "unknown") {
+    const entry = unknownStatusTrack.get(sessionId);
+    if (entry) {
+      console.log(`[TASK][diag] task=${taskLabel} session=${sessionId} status=${status} previouslyUnknownMs=${Date.now() - entry.enteredAt}`);
+      unknownStatusTrack.delete(sessionId);
+    }
+    return;
+  }
+  const now = Date.now();
+  const entry = unknownStatusTrack.get(sessionId);
+  if (!entry) {
+    unknownStatusTrack.set(sessionId, { enteredAt: now, persistedLogged: false });
+    console.log(`[TASK][diag] task=${taskLabel} session=${sessionId} status=unknown durationMs=0`);
+    return;
+  }
+  const durationMs = now - entry.enteredAt;
+  if (durationMs >= 5000 && !entry.persistedLogged) {
+    entry.persistedLogged = true;
+    console.log(`[TASK][diag] task=${taskLabel} session=${sessionId} status=unknown durationMs=${durationMs}`);
+  }
+}
+
+// One-time post-ACK probe (BUILD only): ~5s after prompt_async accepts, read
+// /session/status and /session/{id}/message once and log structural facts.
+// Deduplicated by taskId:sessionId, never repeated, skipped on terminal states.
+async function runPostAckDiag(sessionId: string, taskId: string) {
+  const record = taskRecords.get(sessionId);
+  if (!record) return;
+  if (["completed", "failed", "cancelled", "waiting_for_user", "waiting_for_approval"].includes(record.state)) return;
+  const engineStatus = await fetchSessionEngineStatus(sessionId);
+  let messageCount = 0;
+  let lastRole = "";
+  let lastMessageId = "";
+  let lastMessageAgeMs = -1;
+  try {
+    const response = await fetchWithTimeout(
+      `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
+      { headers: opencodeRequestHeaders() },
+      5000
+    );
+    if (response.ok) {
+      const payload: any = await response.json();
+      const entries: any[] = Array.isArray(payload) ? payload : (payload?.data ?? []);
+      messageCount = entries.length;
+      const last = entries[entries.length - 1];
+      if (last) {
+        lastRole = String(last?.info?.role ?? last?.role ?? "");
+        lastMessageId = String(last?.info?.id ?? last?.id ?? "");
+        const created = Number(last?.info?.time?.created ?? last?.time?.created ?? last?.createdAt ?? 0);
+        lastMessageAgeMs = created > 0 ? Math.max(0, Date.now() - created * 1000) : -1;
+      }
+    }
+  } catch {}
+  console.log(`[TASK][diag] post-ack session=${sessionId} task=${taskId || "-"} engineStatus=${engineStatus} sessionPresent=${engineStatus === "unknown" ? "false" : "true"} messages=${messageCount} lastRole=${lastRole || "-"} lastMessageId=${lastMessageId || "-"} lastMessageAgeMs=${lastMessageAgeMs}`);
+}
+
+// Sampled, structural-only logging for SSE message events. For streaming parts
+// it logs the first 3 of a message, then every 25th (bounded even for very
+// long streams). Text content is never logged, only the length.
+function logSampledMessageEvent(eventType: string, props: any, sessionId: string) {
+  const messageId = String(props?.part?.messageID ?? props?.messageID ?? props?.info?.id ?? "");
+  const role = String(props?.info?.role ?? props?.part?.role ?? props?.part?.state?.role ?? "");
+  const partType = String(props?.part?.type ?? (eventType === "message.updated" ? "message" : ""));
+  const infoParts = Array.isArray(props?.info?.parts) ? props.info.parts : [];
+  const textLength = eventType === "message.updated"
+    ? infoParts
+        .filter((p: any) => p?.type === "text" && typeof p?.text === "string")
+        .reduce((sum: number, p: any) => sum + p.text.length, 0)
+    : typeof props?.part?.text === "string" ? props.part.text.length : 0;
+  const key = `${eventType}:${sessionId}:${messageId || "-"}`;
+  const count = (diagMessageLogCounts.get(key) ?? 0) + 1;
+  diagMessageLogCounts.set(key, count);
+  if (eventType === "message.part.updated" && count > 3 && count % 25 !== 0) return;
+  console.log(`[Neko/OpenCode][diag] event=${eventType} session=${sessionId} message=${messageId || "-"} role=${role || "-"} part=${partType || "-"} textLength=${textLength} seq=${count}`);
+}
+
+// Deadline reached for a "running" task with no real agent activity. Fails only
+// when the engine itself confirms the session stopped making progress: busy and
+// retry re-arm the normal full cycle (a slow-but-alive agent is never killed).
+// Unknown/absent is re-checked exactly once after ~30s; still unknown then
+// means the task is really orphaned and becomes failed. Question/approval
+// outcomes are still decided by the existing determination; the watchdog never
+// synthesizes a question and never emits waiting_for_user.
+async function checkAgentInactivity(sessionId: string, isUnknownRecheck = false) {
+  const record = taskRecords.get(sessionId);
+  if (!record || record.planMode || record.state !== "running") return;
+  const active = activeAgentRequests.get(sessionId);
+  if (active?.isRetrying || active?.retryTimer) {
+    scheduleAgentInactivityWatchdog(sessionId, record.taskId);
+    return;
+  }
+  const sinceLastRealActivity = Date.now() - (record.lastActivityAt || record.createdAt);
+  if (sinceLastRealActivity < AGENT_INACTIVE_LIMIT_MS) {
+    // Activity happened after the watchdog was armed: re-arm from now.
+    scheduleAgentInactivityWatchdog(sessionId, record.taskId);
+    return;
+  }
+  const engineStatus = await fetchSessionEngineStatus(sessionId);
+  const current = taskRecords.get(sessionId);
+  if (current !== record || record.state !== "running") return; // replaced/concluded meanwhile
+  if (engineStatus === "busy" || engineStatus === "retry") {
+    scheduleAgentInactivityWatchdog(sessionId, record.taskId); // still processing
+    return;
+  }
+  if (engineStatus === "unknown") {
+    if (!isUnknownRecheck) {
+      // First unknown probe: give the session one short recheck, never loop.
+      scheduleAgentInactivityWatchdog(sessionId, record.taskId, true);
+    } else {
+      // Second probe still unknown/absent: the session is orphaned.
+      setTaskState(sessionId, "failed", "agent-inactive");
+      logTask("failed", resolveTaskIdForSession(sessionId), sessionId, "reason=agent-inactive unknown-persistent");
+      clearActiveAgentRequest(sessionId);
+      cancelAgentInactivityWatchdog(sessionId);
+    }
+    return;
+  }
+  // engineStatus === "idle": the session stopped but nothing concluded on its
+  // own. Let the authoritative determination decide once (question, approval or
+  // completion all flow through it). If it still cannot conclude, the task is
+  // really stuck beyond the deadline.
+  await runIdleDetermination(sessionId, record.taskId, true);
+  const after = taskRecords.get(sessionId);
+  if (after && after.state === "running") {
+    setTaskState(sessionId, "failed", "agent-inactive");
+    logTask("failed", resolveTaskIdForSession(sessionId), sessionId, "reason=agent-inactive");
+    clearActiveAgentRequest(sessionId);
+  }
+  cancelAgentInactivityWatchdog(sessionId);
 }
 
 // Authoritative completion/queue determination, executed every time the
@@ -417,6 +630,12 @@ async function fetchSessionEngineStatus(sessionId: string, timeoutMs = 4000): Pr
 // 3) otherwise           -> completed            (real completion)
 // The determination runs BEFORE the idle event is forwarded, so the renderer
 // can never conclude a task that actually needs user input.
+//
+// A question does NOT depend on sawBusy: a turn that ends in a text question
+// (no tool/file/permission afterwards) may never produce a busy status. The
+// fresh assistant message alone is enough evidence the engine worked on THIS
+// task, so the sawBusy guard only protects the "completed" decision, never
+// the question detection.
 function scheduleIdleRecheck(sessionId: string, taskId: string) {
   if (idleRecheckTimers.has(sessionId)) return;
   const timer = setTimeout(() => {
@@ -426,14 +645,78 @@ function scheduleIdleRecheck(sessionId: string, taskId: string) {
   idleRecheckTimers.set(sessionId, timer);
 }
 
-async function runIdleDetermination(sessionId: string, taskId: string) {
+// Single short recheck for the message-commit race: session.idle can arrive
+// before the final assistant text is visible in the message endpoint. Instead
+// of concluding "completed" (and missing a real question), we wait one short
+// bounded cycle and re-run the determination. Deduplicated by task+session:
+// at most one pending recheck at a time, and it never loops.
+function scheduleQuestionCommitRecheck(sessionId: string, taskId: string) {
+  const key = taskId ? `${taskId}:${sessionId}` : `:${sessionId}`;
+  if (questionRecheckTimers.has(key)) return;
+  const timer = setTimeout(() => {
+    questionRecheckTimers.delete(key);
+    // isQuestionRecheck=true: if the recheck still finds no new question it
+    // must follow the normal completion flow instead of re-scheduling again.
+    void runIdleDetermination(sessionId, taskId, true);
+  }, 900);
+  questionRecheckTimers.set(key, { timer, taskId });
+}
+
+// Shared question detection: a fresh (>= task start) assistant message that
+// clearly ends with "?" transitions the task to waiting_for_user. Returns
+// true when it did. Duplicates are tracked by lastAssistantMessageId so the
+// same message never re-asks the user. planMode keeps interactive questions
+// disabled.
+function tryDetectQuestion(record: TaskRecord, latest: { id: string; text: string; created: number } | null): boolean {
+  if (!latest?.text) return false;
+  if (!(normalizeTimestamp(latest.created) >= normalizeTimestamp(record.createdAt))) return false; // message from an older task
+  if (record.lastAssistantMessageId === latest.id && record.askedQuestionIds.length > 0) return false; // duplicate
+  if (!record.planMode && detectQuestion(latest.text)) {
+    record.lastAssistantMessageId = latest.id;
+    const questionId = `q${(++taskQuestionCounter).toString(36)}`;
+    record.askedQuestionIds.push(questionId);
+    setTaskState(record.sessionId, "waiting_for_user", "question-asked", {
+      questionId,
+      question: latest.text,
+      options: extractQuestionOptions(latest.text),
+      allowFreeText: true
+    });
+    logTask("question", record.taskId, record.sessionId, `questionId=${questionId}`);
+    return true;
+  }
+  return false;
+}
+
+async function runIdleDetermination(sessionId: string, taskId: string, isQuestionRecheck = false) {
   if (!sessionId) return;
   const record = taskRecords.get(sessionId);
   if (!record) return; // idle without an in-flight task is not a task event
   if (record.state === "completed" || record.state === "cancelled" || record.state === "failed") return;
+
   // An idle before the engine ever started processing this task is chatter
-  // (for example the idle state left by the previous task). Never conclude.
-  if (!record.sawBusy) return;
+  // (for example the idle state left by the previous task). It must never
+  // conclude the task. BUT a turn that ends in a plain-text question may
+  // never have produced a busy status; the fresh assistant message is enough
+  // evidence it worked on THIS task. sawBusy must not block that question.
+  if (!record.sawBusy) {
+    // The engine must be genuinely idle: session.idle can race a busy engine
+    // and a partial streamed text ending in "?" is not a real question.
+    const engineStatus = await fetchSessionEngineStatus(sessionId);
+    const currentAfterStatus = taskRecords.get(sessionId);
+    if (currentAfterStatus !== record) return; // a new task replaced this one mid-check
+    if (engineStatus === "busy" || engineStatus === "retry") {
+      scheduleIdleRecheck(sessionId, taskId);
+      return;
+    }
+    if (engineStatus === "unknown") return;
+    const latest = await fetchLatestAssistantMessage(sessionId);
+    const currentAfterMessages = taskRecords.get(sessionId);
+    if (currentAfterMessages !== record) return; // a new task replaced this one mid-check
+    if (tryDetectQuestion(record, latest)) return;
+    // Pure chatter (no busy, no question): never conclude.
+    return;
+  }
+
   // Debounce: OpenCode can emit transient idle between queued actions. Only
   // finalize after the engine stayed quiet for ~1s; a recheck is scheduled
   // in case no further idle event arrives.
@@ -451,9 +734,9 @@ async function runIdleDetermination(sessionId: string, taskId: string) {
       const current = taskRecords.get(sessionId);
       if (current !== record) return; // a new task replaced this one
       if (pending.length) {
-        const latest = pending[pending.length - 1];
-        setTaskState(sessionId, "waiting_for_approval", "permission-pending", { permission: latest });
-        logTask("approval-required", taskId, sessionId, `permission=${String(latest?.id ?? "").slice(0, 12)}`);
+        const latestPermission = pending[pending.length - 1];
+        setTaskState(sessionId, "waiting_for_approval", "permission-pending", { permission: latestPermission });
+        logTask("approval-required", taskId, sessionId, `permission=${String(latestPermission?.id ?? "").slice(0, 12)}`);
       }
     }
     return;
@@ -479,32 +762,27 @@ async function runIdleDetermination(sessionId: string, taskId: string) {
     const current = taskRecords.get(sessionId);
     if (current !== record) return; // a new task replaced this one mid-check
     if (pending.length) {
-      const latest = pending[pending.length - 1];
-      setTaskState(sessionId, "waiting_for_approval", "permission-pending", { permission: latest });
-      logTask("approval-required", taskId, sessionId, `permission=${String(latest?.id ?? "").slice(0, 12)}`);
+      const latestPermission = pending[pending.length - 1];
+      setTaskState(sessionId, "waiting_for_approval", "permission-pending", { permission: latestPermission });
+      logTask("approval-required", taskId, sessionId, `permission=${String(latestPermission?.id ?? "").slice(0, 12)}`);
       return;
     }
     const latest = await fetchLatestAssistantMessage(sessionId);
     const currentAfterMessages = taskRecords.get(sessionId);
     if (currentAfterMessages !== record) return; // a new task replaced this one mid-check
-    // Messages created before this task started belong to older tasks and
-    // can never trigger a question for this one.
+    if (tryDetectQuestion(record, latest)) return;
+    // Message-commit race: the engine reached idle but the message endpoint
+    // is not exposing the newest streamed assistant message yet (an older,
+    // non-question assistant message can be returned instead). Concluding
+    // "completed" on that older message would miss a question that is only
+    // seconds away. One short deduplicated recheck gives the commit a chance;
+    // after that recheck (isQuestionRecheck=true) the normal flow below runs.
     const messageIsFresh = Boolean(latest?.id) && latest != null && latest.created >= record.createdAt;
-    if (latest?.text && messageIsFresh && !record.planMode) {
-      const alreadyAsked = record.lastAssistantMessageId === latest.id && record.askedQuestionIds.length > 0;
-      if (detectQuestion(latest.text) && !alreadyAsked) {
-        record.lastAssistantMessageId = latest.id;
-        const questionId = `q${(++taskQuestionCounter).toString(36)}`;
-        record.askedQuestionIds.push(questionId);
-        setTaskState(sessionId, "waiting_for_user", "question-asked", {
-          questionId,
-          question: latest.text,
-          options: extractQuestionOptions(latest.text),
-          allowFreeText: true
-        });
-        logTask("question", taskId, sessionId, `questionId=${questionId}`);
-        return;
-      }
+    const streamedAnchor = record.lastStreamedAssistantMessageId;
+    const commitRacing = Boolean(streamedAnchor) && latest != null && latest.id !== streamedAnchor;
+    if (!isQuestionRecheck && (!messageIsFresh || commitRacing)) {
+      scheduleQuestionCommitRecheck(sessionId, taskId);
+      return;
     }
     clearActiveAgentRequest(sessionId);
     setTaskState(sessionId, "completed", "session-idle");
@@ -533,6 +811,13 @@ function resetTaskRuntime() {
   idleDeterminationGate.clear();
   for (const timer of idleRecheckTimers.values()) clearTimeout(timer);
   idleRecheckTimers.clear();
+  for (const entry of questionRecheckTimers.values()) clearTimeout(entry.timer);
+  questionRecheckTimers.clear();
+  for (const entry of agentInactiveTimers.values()) clearTimeout(entry.timer);
+  agentInactiveTimers.clear();
+  unknownStatusTrack.clear();
+  diagMessageLogCounts.clear();
+  postAckDiagScheduled.clear();
   previewErrorEmissionAt.clear();
   clearVisionFallbackSessions();
   cancelAllSiteClones();
@@ -546,8 +831,20 @@ function resetTaskRuntime() {
 // never count as agent progress.
 function isRealAgentActivity(eventType: string, props: any): boolean {
   if (eventType.startsWith("tool.")) return true;
-  if (eventType === "command.executed" || eventType === "permission.asked") return true;
+  if (eventType === "command.executed" || eventType === "permission.asked" || eventType === "question.asked") return true;
   if (eventType === "message.part.updated" && String(props?.part?.type ?? "") === "tool") return true;
+  // message.part.updated always belongs to the assistant message being
+  // streamed (user messages arrive as message.updated with their own role),
+  // exactly like the tool-part case above. A real text part of that message
+  // is agent activity: it proves the engine is producing content for THIS
+  // task. Synthetic/ignored parts (system chatter, token bookkeeping) are NOT
+  // activity and never count.
+  if (eventType === "message.part.updated" && String(props?.part?.type ?? "") === "text") {
+    const text = props?.part?.text;
+    if (typeof text !== "string" || !text.trim()) return false;
+    if (props?.part?.synthetic === true || props?.part?.ignored === true) return false;
+    return true;
+  }
   if (eventType === "file.edited") {
     const filePath = String(props?.file?.path ?? props?.filePath ?? props?.path ?? (typeof props?.file === "string" ? props.file : "") ?? "");
     return Boolean(filePath) && !shouldIgnoreEventPath(filePath);
@@ -603,7 +900,7 @@ function scheduleAgentRetry(sessionId: string, rawError: any) {
     if (!current) return;
     current.retryTimer = undefined;
     try {
-      const response = await fetchWithTimeout(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/prompt_async`, { method: "POST", headers: { "Content-Type": "application/json", ...opencodeDirectoryHeaders() }, body: JSON.stringify(current.requestBody) }, 30000);
+      const response = await fetchWithTimeout(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/prompt_async`, { method: "POST", headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() }, body: JSON.stringify(current.requestBody) }, 30000);
       if (!response.ok) {
         const body = await response.text().catch(() => "");
         const synthetic = { error: { data: { statusCode: response.status, message: body.slice(0, 500), isRetryable: response.status >= 500 || response.status === 429 } } };
@@ -1526,6 +1823,29 @@ async function pollGithubDevice(deviceCode: string, intervalSeconds: number, att
   }
 }
 
+// Basic Auth headers for a locally-authenticated OpenCode server. When the
+// OPENCODE_SERVER_USERNAME/PASSWORD env vars are present, OpenCode enables
+// HTTP Basic Auth on every endpoint; without the header every request (health,
+// session, message, permission, event...) returns 401. These credentials are
+// consumed ONLY by this helper and are NEVER logged. With no env vars set the
+// helper returns an empty object so the pre-existing unauthenticated flow is
+// unchanged. Applies solely to the local OpenCode server, never to external
+// hosts (GitHub/Supabase/Vercel/Resend) — the token is only layered into the
+// OpenCode-destined headers below.
+function opencodeAuthHeaders(): Record<string, string> {
+  const username = process.env.OPENCODE_SERVER_USERNAME;
+  const password = process.env.OPENCODE_SERVER_PASSWORD;
+  if (!username && !password) return {};
+  const token = Buffer.from(`${username ?? ""}:${password ?? ""}`).toString("base64");
+  return { Authorization: `Basic ${token}` };
+}
+
+// Combined headers for any HTTP request aimed at the local OpenCode server:
+// Basic Auth (when configured) plus the existing x-opencode-directory header.
+function opencodeRequestHeaders(): Record<string, string> {
+  return { ...opencodeAuthHeaders(), ...opencodeDirectoryHeaders() };
+}
+
 function opencodeDirectoryHeaders(): Record<string, string> {
   const root = getActiveProjectRoot();
   return root ? { "x-opencode-directory": encodeURIComponent(root) } : {};
@@ -1537,6 +1857,9 @@ async function getOpencodeClient() {
   return sdk.createOpencodeClient({
     baseUrl: opencodeUrl,
     throwOnError: true,
+    // Keep the original x-opencode-directory behavior; layer the Basic Auth
+    // header when the local server requires it.
+    headers: opencodeAuthHeaders(),
     ...(directory ? { directory } : {})
   });
 }
@@ -1667,7 +1990,7 @@ async function waitForServer(url: string, timeout = 20000) {
 
   while (Date.now() - start < timeout) {
     try {
-      const response = await fetch(`${url}/global/health`);
+      const response = await fetch(`${url}/global/health`, { headers: opencodeRequestHeaders() });
       if (response.ok) return await response.json();
     } catch {}
 
@@ -1849,7 +2172,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
       }
 
       try {
-        const response = await fetchWithTimeout(`${opencodeUrl}/global/health`, {}, 2500);
+        const response = await fetchWithTimeout(`${opencodeUrl}/global/health`, { headers: opencodeRequestHeaders() }, 2500);
         if (response.ok) {
           const health = await response.json();
           if (generation !== serviceGeneration || (typeof transitionGen === "number" && transitionGen !== projectTransitionGeneration)) {
@@ -1956,7 +2279,7 @@ async function subscribeEvents(gen?: number) {
   try {
     const response = await fetch(`${opencodeUrl}/event`, {
       signal: eventAbort.signal,
-      headers: { Accept: "text/event-stream", ...opencodeDirectoryHeaders() }
+      headers: { Accept: "text/event-stream", ...opencodeRequestHeaders() }
     });
 
     if (!response.ok || !response.body) {
@@ -1991,6 +2314,11 @@ async function subscribeEvents(gen?: number) {
           const fallbackIdCandidates = [perfSessionId, String(props?.info?.id ?? ""), String(event?.sessionID ?? "")];
           if (fallbackIdCandidates.some(id => id && isVisionFallbackSession(id))) {
             continue;
+          }
+          // Observed-only diagnostics for message events (never changes logic,
+          // never logs text content — only structural facts, sampled).
+          if (eventType === "message.updated" || eventType === "message.part.updated") {
+            logSampledMessageEvent(eventType, props, perfSessionId);
           }
           if (eventType.startsWith("tool.execute") || eventType.startsWith("file.") || eventType.startsWith("permission.") || eventType.startsWith("session.") || eventType === "command.executed") {
             const toolName = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
@@ -2032,6 +2360,23 @@ async function subscribeEvents(gen?: number) {
             if (taskRecord) {
               taskRecord.sawBusy = true;
               taskRecord.lastActivityAt = Date.now();
+            }
+          }
+          // Track the newest assistant message the stream exposed. This is the
+          // commit-race anchor: if session.idle arrives but the message API
+          // does not yet return THIS message, the final text is still being
+          // committed and the task must not conclude as completed (it could be
+          // a question that is seconds away).
+          if (perfSessionId) {
+            const streamedMessageId =
+              eventType === "message.updated" && String(props?.info?.role ?? "") === "assistant"
+                ? String(props?.info?.id ?? "")
+                : eventType === "message.part.updated"
+                  ? String(props?.part?.messageID ?? props?.info?.id ?? "")
+                  : "";
+            if (streamedMessageId) {
+              const taskRecord = taskRecords.get(perfSessionId);
+              if (taskRecord) taskRecord.lastStreamedAssistantMessageId = streamedMessageId;
             }
           }
           // session.idle is the engine's completion confirmation for the task.
@@ -2113,7 +2458,7 @@ async function subscribeEvents(gen?: number) {
                 // Ask the engine to stop its internal retry loop.
                 void fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
                   method: "POST",
-                  headers: opencodeDirectoryHeaders()
+                  headers: opencodeRequestHeaders()
                 }).catch(() => {});
                 mainWindow?.webContents.send("opencode:event", {
                   type: "session.error",
@@ -2136,12 +2481,14 @@ async function subscribeEvents(gen?: number) {
               const retryState = engineRetryStates.get(sessionId);
               if (retryState) retryState.phase = "busy";
               // The engine resumed by itself (for example an auto-approved
-              // permission): any waiting state goes back to running.
+              // permission): approval state goes back to running.
+              // NOTE: waiting_for_user is NOT cleared here because the engine stays
+              // busy while awaiting the user's answer to the native question tool.
               const record = taskRecords.get(sessionId);
               if (record) {
                 record.sawBusy = true;
                 record.lastActivityAt = Date.now();
-                if (record.state === "waiting_for_user" || record.state === "waiting_for_approval") {
+                if (record.state === "waiting_for_approval") {
                   setTaskState(sessionId, "running", "engine-resumed");
                 }
               }
@@ -2176,6 +2523,50 @@ async function subscribeEvents(gen?: number) {
           // session.updated/diff are internal synchronization chatter. Nothing in
           // the Neko renderer consumes them, so keep them inside the main process.
           if (eventType === "session.updated" || eventType === "session.diff") continue;
+          // Native question protocol: OpenCode emits question.asked when the
+          // agent uses the question tool. The task machine immediately moves to
+          // waiting_for_user with the question details and requestId.
+          if (eventType === "question.asked") {
+            const questionSessionId = String(props?.sessionID ?? props?.sessionId ?? perfSessionId ?? "");
+            const requestId = String(props?.id ?? "");
+            const firstQ = Array.isArray(props?.questions) ? props.questions[0] : props?.questions;
+            const questionText = String(firstQ?.question ?? props?.question ?? "").trim();
+            const rawOptions = Array.isArray(firstQ?.options) ? firstQ.options : (Array.isArray(props?.options) ? props.options : []);
+            const options: string[] = rawOptions.map((opt: any) => {
+              if (typeof opt === "string") return opt;
+              if (opt && typeof opt === "object") {
+                const title = String(opt.title ?? opt.label ?? "").trim();
+                const desc = String(opt.description ?? "").trim();
+                if (title && desc) return `${title} — ${desc}`;
+                return title || desc || JSON.stringify(opt);
+              }
+              return String(opt ?? "");
+            }).filter(Boolean);
+            const allowFreeText = firstQ?.custom !== false && props?.custom !== false;
+            const questionId = requestId || `q${(++taskQuestionCounter).toString(36)}`;
+
+            const record = taskRecords.get(questionSessionId);
+            if (record) {
+              record.askedQuestionIds.push(questionId);
+            }
+            console.log(`[TaskLifecycle] native question.asked session=${questionSessionId} requestId=${requestId} text=${questionText.slice(0, 60)}`);
+            setTaskState(questionSessionId, "waiting_for_user", "question-asked", {
+              questionId,
+              requestId,
+              isNativeTool: true,
+              question: questionText,
+              options,
+              allowFreeText
+            });
+            logTask("question", record?.taskId ?? "", questionSessionId, `requestId=${requestId} native=true`);
+          }
+          if (eventType === "question.replied" || eventType === "question.rejected") {
+            const questionSessionId = String(props?.sessionID ?? props?.sessionId ?? perfSessionId ?? "");
+            if (questionSessionId && taskRecords.has(questionSessionId)) {
+              setTaskState(questionSessionId, "running", eventType);
+              logTask("user-response", resolveTaskIdForSession(questionSessionId), questionSessionId, `event=${eventType}`);
+            }
+          }
           // Approval protocol: permission.updated is the engine asking for an
           // approval. It is normalized to permission.asked for the renderer and
           // the task machine moves to waiting_for_approval. permission.replied
@@ -3492,7 +3883,7 @@ ipcMain.handle("project:search", async (_event, query: string) => {
 
 ipcMain.handle("commands:list", async () => {
   try {
-    const response = await fetch(`${opencodeUrl}/command`);
+    const response = await fetch(`${opencodeUrl}/command`, { headers: opencodeRequestHeaders() });
     if (!response.ok) return [];
     const data = await response.json();
     return Array.isArray(data) ? data : (data?.commands ?? data?.data ?? []);
@@ -3506,7 +3897,7 @@ ipcMain.handle("opencode:command", async (_event, payload: { sessionId: string; 
   if (!payload.sessionId) throw new Error("Sessão do Neko não encontrada.");
   const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/command`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...opencodeDirectoryHeaders() },
+    headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
     body: JSON.stringify({
       command: payload.command.replace(/^\//, ""),
       arguments: payload.arguments ?? "",
@@ -4376,6 +4767,16 @@ ipcMain.handle("project:exists", async (_event, projectPath: string) => {
   }
 });
 
+ipcMain.handle("project:isInsideApplicationRoot", (_event, projectPath: string) => {
+  const value = String(projectPath || "").trim();
+  if (!value) return true;
+  try {
+    return isInsideNekoApplication(path.resolve(value));
+  } catch {
+    return true;
+  }
+});
+
 ipcMain.handle("project:thumbnail", async (_event, projectPath: string) => {
   const root = String(projectPath || "").trim();
   if (!root) return null;
@@ -4443,6 +4844,7 @@ ipcMain.handle("project:choose", async () => {
 });
 
 async function switchWorkspaceInternal(targetInput: string | { projectPath: string; source?: string }, defaultSource = "unknown") {
+  console.log("[BLACKSCREEN] switchWorkspace:start", { targetInput: typeof targetInput === "string" ? targetInput : targetInput?.projectPath, source: defaultSource, currentProject, hasActiveWorkspace: !!activeWorkspace, activeWorkspaceStatus: activeWorkspace?.status });
   licenseManager.assertAccess("o workspace do NekoAI");
   const projectPath = typeof targetInput === "string" ? targetInput : targetInput?.projectPath;
   const source = (typeof targetInput === "object" && targetInput?.source) ? targetInput.source : defaultSource;
@@ -4453,6 +4855,7 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
   const transitionGen = ++projectTransitionGeneration;
   logProjectWorkspace("switch", targetPath);
   console.log(`[ProjectSwitch] REQUEST source=${source} target=${targetPath} generation=${transitionGen}`);
+  console.log("[BLACKSCREEN] switchWorkspace:before-work", { targetPath, transitionGen, licenseState: licenseManager.getState().state });
   logService("transition-start", `target=${targetPath} gen=${transitionGen}`);
 
   // A new workspace gets a completely fresh task runtime: no old task,
@@ -4532,8 +4935,9 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
 
     newWorkspace.status = "ready";
     logService("transition-ready", `target=${targetPath} gen=${transitionGen}`);
+    console.log("[BLACKSCREEN] switchWorkspace:transition-ready", { targetPath, sessionData: !!(session as any).data, treeNodes: tree.length, supabaseStatus: supabaseState?.status, vercelStatus: vercelState?.connection });
 
-    return {
+    const result = {
       path: targetPath,
       opencodeUrl,
       health,
@@ -4544,11 +4948,16 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
       supabaseState,
       vercelState
     };
+    console.log("[BLACKSCREEN] switchWorkspace:returning-result", { path: result.path, hasSession: !!result.session, hasTree: !!result.tree, hasSupabase: !!result.supabaseState, hasVercel: !!result.vercelState, supabaseKeys: result.supabaseState ? Object.keys(result.supabaseState) : null });
+    return result;
   })();
 
   activeWorkspaceTransitionPromise = transitionPromise;
   try {
-    return await transitionPromise;
+    console.log("[BLACKSCREEN] switchWorkspace:before-await");
+    const result = await transitionPromise;
+    console.log("[BLACKSCREEN] switchWorkspace:after-await", { path: result?.path });
+    return result;
   } finally {
     if (activeWorkspaceTransitionPromise === transitionPromise) {
       activeWorkspaceTransitionPromise = null;
@@ -4557,7 +4966,10 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
 }
 
 ipcMain.handle("project:create", async (_event, payload: string | { projectPath: string; source?: string }) => {
-  return switchWorkspaceInternal(payload, "ipc");
+  console.log("[BLACKSCREEN] IPC:project:create", { payload: typeof payload === "string" ? payload : payload?.projectPath });
+  const result = await switchWorkspaceInternal(payload, "ipc");
+  console.log("[BLACKSCREEN] IPC:project:create:complete", { path: result?.path });
+  return result;
 });
 
 
@@ -4729,7 +5141,7 @@ async function readConnectedProviderIDs(): Promise<Set<string>> {
 async function disposeOpenCodeInstance() {
   // Provider state is cached by OpenCode. Disposing the instance forces the
   // next /provider request to rebuild its state from auth.json.
-  await fetchWithTimeout(`${opencodeUrl}/instance/dispose`, { method: "POST" }, 10000).catch(() => {});
+  await fetchWithTimeout(`${opencodeUrl}/instance/dispose`, { method: "POST", headers: opencodeRequestHeaders() }, 10000).catch(() => {});
 }
 
 ipcMain.handle("provider:connect", async (_event, payload: { providerID: string; key: string }) => {
@@ -4751,7 +5163,7 @@ ipcMain.handle("provider:connect", async (_event, payload: { providerID: string;
   // DELETE /mcp/{name}/auth and return "MCP server not found".
   const response = await fetchWithTimeout(`${opencodeUrl}/auth/${encodeURIComponent(id)}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
     body: JSON.stringify({ type: "api", key })
   }, 10000);
 
@@ -4779,7 +5191,8 @@ ipcMain.handle("provider:disconnect", async (_event, providerID: string) => {
   // MCP OAuth removal (/mcp/{name}/auth), producing the exact 404 seen in the
   // NekoAI terminal. OpenCode's provider credentials use DELETE /auth/:id.
   const response = await fetchWithTimeout(`${opencodeUrl}/auth/${encodeURIComponent(id)}`, {
-    method: "DELETE"
+    method: "DELETE",
+    headers: opencodeRequestHeaders()
   }, 10000);
 
   if (!response.ok && response.status !== 404) {
@@ -4847,7 +5260,7 @@ ipcMain.handle("preview:stop", async () => {
 ipcMain.handle("opencode:status", async () => {
   const projectRoot = getActiveProjectRoot();
   try {
-    const response = await fetch(`${opencodeUrl}/global/health`);
+    const response = await fetch(`${opencodeUrl}/global/health`, { headers: opencodeRequestHeaders() });
     if (!response.ok) throw new Error("offline");
 
     return {
@@ -4867,7 +5280,7 @@ ipcMain.handle("opencode:sessionStatus", async (_event, sessionId: string) => {
     return "retry";
   }
   try {
-    const response = await fetch(`${opencodeUrl}/session/status`, { headers: opencodeDirectoryHeaders() });
+    const response = await fetch(`${opencodeUrl}/session/status`, { headers: opencodeRequestHeaders() });
     if (!response.ok) return (active?.retryTimer || active?.isRetrying) ? "retry" : "unknown";
     const payload: any = await response.json();
     const statuses = payload?.data ?? payload ?? {};
@@ -4931,7 +5344,8 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
     sawBusy: false,
     lastActivityAt: 0,
     lastAssistantMessageId: "",
-    askedQuestionIds: []
+    askedQuestionIds: [],
+    lastStreamedAssistantMessageId: ""
   });
   logTask("created", taskCorrelationId, payload.sessionId, `model=${modelLabel}${payload.planMode ? " mode=plan" : ""}`);
 
@@ -4985,7 +5399,7 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
       const fallback = await analyzeImagesWithMiMo({
         mainSessionId: payload.sessionId,
         opencodeUrl,
-        headers: opencodeDirectoryHeaders(),
+        headers: opencodeRequestHeaders(),
         images: imageAttachments,
         userPrompt: payload.text || "Analise a imagem anexada.",
         model: { providerID: fallbackProviderID, modelID: VISION_FALLBACK_MODEL.modelID }
@@ -5021,7 +5435,7 @@ ${userRequestText}`;
   const requestBody = {
     agent: payload.planMode ? "plan" : "build",
     ...(payload.planMode ? {} : {
-      system: `You are the NekoAI software development agent. You have received an APPROVED PLAN from the user. Execute it now by modifying the project files directly in the current workspace. Do not merely describe the changes and do not ask for another approval. Do not run long-lived development servers such as npm run dev in the foreground and wait for them. The NekoAI Preview Manager handles dev servers separately. Focus on implementing the requested application, creating or editing files, installing dependencies when needed, and validating with short-lived commands. After implementation, verify that the requested changes actually exist in the files and report which files were changed.
+      system: `You are the NekoAI software development agent. You have received an APPROVED PLAN from the user. Execute it now by modifying the project files directly in the current workspace. Do not merely describe the changes and do not ask for another approval. Do not run long-lived development servers such as npm run dev in the foreground and wait for them. The NekoAI Preview Manager handles dev servers separately. Focus on implementing the requested application, creating or editing files, installing dependencies when needed, and validating with short-lived commands. After implementation, verify that the requested changes actually exist in the files and report which files were changed. If you encounter critical ambiguity between multiple valid implementations or need the user's architectural choice, use the native question tool to ask the user.
 
 ${languageInstruction}`
     }),
@@ -5054,7 +5468,7 @@ ${languageInstruction}`
       `${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/prompt_async`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...opencodeDirectoryHeaders() },
+        headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
         body: JSON.stringify(requestBody)
       },
       15000
@@ -5079,7 +5493,7 @@ ${languageInstruction}`
 
       let statusType = "";
       try {
-        const statusResponse = await fetchWithTimeout(`${opencodeUrl}/session/status`, {}, 5000);
+        const statusResponse = await fetchWithTimeout(`${opencodeUrl}/session/status`, { headers: opencodeRequestHeaders() }, 5000);
         if (statusResponse.ok) {
           const statusPayload: any = await statusResponse.json();
           const statuses = statusPayload?.data ?? statusPayload ?? {};
@@ -5091,7 +5505,7 @@ ${languageInstruction}`
       try {
         const messagesResponse = await fetchWithTimeout(
           `${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/message`,
-          { headers: opencodeDirectoryHeaders() },
+          { headers: opencodeRequestHeaders() },
           8000
         );
         if (!messagesResponse.ok) continue;
@@ -5142,17 +5556,20 @@ ${languageInstruction}`
   perfMark("taskSend", payload.sessionId);
   const response = await fetchWithTimeout(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/prompt_async`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...opencodeDirectoryHeaders() },
+    headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
     body: JSON.stringify(requestBody)
   });
+  const promptAckDurationMs = Date.now() - promptStartedAt;
+  const promptModelLabel = `${payload.model?.providerID ?? "default"}/${payload.model?.modelID ?? "default"}`;
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+    console.log(`[Neko/Agent] prompt_async response task=${taskCorrelationId} session=${payload.sessionId} model=${promptModelLabel} status=${response.status} ok=false durationMs=${promptAckDurationMs} bodyChars=${body.length}`);
     const failed = { error: { data: { statusCode: response.status, message: body.slice(0, 500), isRetryable: response.status >= 500 || response.status === 429 } } };
     if (isRecoverableAgentError(failed) && scheduleAgentRetry(payload.sessionId, failed)) {
       setTaskState(payload.sessionId, "running", "prompt-retrying");
       logTask("started", taskCorrelationId, payload.sessionId, "retrying=true");
-      return { accepted: true, retrying: true, acceptedInMs: Date.now() - promptStartedAt, taskId: taskCorrelationId };
+      return { accepted: true, retrying: true, acceptedInMs: promptAckDurationMs, taskId: taskCorrelationId };
     }
     clearActiveAgentRequest(payload.sessionId);
     setTaskState(payload.sessionId, "failed", "prompt-rejected");
@@ -5163,14 +5580,26 @@ ${languageInstruction}`
   setTaskState(payload.sessionId, "running", "prompt-accepted");
   logTask("started", taskCorrelationId, payload.sessionId);
 
-  console.log(`[Neko/Agent] tarefa aceita em ${Date.now() - promptStartedAt}ms; execução agora é assíncrona no OpenCode`);
-  return { accepted: true, acceptedInMs: Date.now() - promptStartedAt, taskId: taskCorrelationId };
+  console.log(`[Neko/Agent] prompt_async response task=${taskCorrelationId} session=${payload.sessionId} model=${promptModelLabel} status=${response.status} ok=true durationMs=${promptAckDurationMs}`);
+  console.log(`[Neko/Agent] tarefa aceita em ${promptAckDurationMs}ms; execução agora é assíncrona no OpenCode`);
+
+  // BUILD diagnostics only: one-shot post-ACK probe (~5s) to distinguish
+  // "accepted but never ran" from slow/stale SSE. Deduplicated, never repeated.
+  const postAckKey = `${taskCorrelationId}:${payload.sessionId}`;
+  if (!postAckDiagScheduled.has(postAckKey)) {
+    postAckDiagScheduled.add(postAckKey);
+    setTimeout(() => {
+      postAckDiagScheduled.delete(postAckKey);
+      void runPostAckDiag(payload.sessionId, taskCorrelationId);
+    }, 5000);
+  }
+  return { accepted: true, acceptedInMs: promptAckDurationMs, taskId: taskCorrelationId };
 });
 
 ipcMain.handle("opencode:permissions", async (_event, sessionId: string) => {
   if (!sessionId) return [];
   try {
-    const response = await fetch(`${opencodeUrl}/permission`, { headers: opencodeDirectoryHeaders() });
+    const response = await fetch(`${opencodeUrl}/permission`, { headers: opencodeRequestHeaders() });
     if (!response.ok) return [];
     const payload = await response.json();
     const list = Array.isArray(payload) ? payload : (payload?.data ?? payload?.permissions ?? []);
@@ -5189,7 +5618,7 @@ ipcMain.handle("opencode:permissionReply", async (_event, payload: {
   licenseManager.assertAccess("permissões de execução");
   if (!payload?.sessionId || !payload?.permissionId) throw new Error("Pedido de permissão inválido.");
   const bodyPayload = { response: payload.response, ...(payload.remember ? { remember: true } : {}) };
-  const headers = { "Content-Type": "application/json", ...opencodeDirectoryHeaders() };
+  const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
   let response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/permissions/${encodeURIComponent(payload.permissionId)}`, {
     method: "POST", headers, body: JSON.stringify(bodyPayload)
   });
@@ -5210,6 +5639,91 @@ ipcMain.handle("opencode:permissionReply", async (_event, payload: {
   return true;
 });
 
+ipcMain.handle("opencode:questionReply", async (_event, payload: {
+  sessionId: string;
+  requestId: string;
+  answers: string[];
+}) => {
+  licenseManager.assertAccess("respostas de interação");
+  if (!payload?.sessionId || !payload?.requestId) throw new Error("Pedido de resposta inválido.");
+  const answersFormatted = (Array.isArray(payload.answers) ? payload.answers : [String(payload.answers || "")])
+    .map(a => Array.isArray(a) ? a : [String(a)]);
+  const bodyPayload = { answers: answersFormatted };
+  const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+
+  // 1. Primary OpenCode endpoint: POST /question/{id}/reply
+  let response = await fetch(`${opencodeUrl}/question/${encodeURIComponent(payload.requestId)}/reply`, {
+    method: "POST", headers, body: JSON.stringify(bodyPayload)
+  });
+
+  // 2. Fallback route: POST /session/{sessionId}/question/{requestId}/reply
+  if (!response.ok && (response.status === 404 || response.status === 405)) {
+    response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reply`, {
+      method: "POST", headers, body: JSON.stringify(bodyPayload)
+    });
+  }
+
+  // 3. Fallback route 2: POST /api/session/{sessionId}/question/{requestId}/reply
+  if (!response.ok && (response.status === 404 || response.status === 405)) {
+    response = await fetch(`${opencodeUrl}/api/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reply`, {
+      method: "POST", headers, body: JSON.stringify(bodyPayload)
+    });
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Não foi possível enviar a resposta (HTTP ${response.status}).${body ? ` ${body.slice(0, 220)}` : ""}`);
+  }
+
+  const record = taskRecords.get(payload.sessionId);
+  if (record && record.state === "waiting_for_user") {
+    record.state = "running";
+    record.sawBusy = true;
+    record.lastActivityAt = Date.now();
+    logTask("user-response", record.taskId, payload.sessionId, `requestId=${payload.requestId}`);
+    setTaskState(payload.sessionId, "running", "user-answered", { requestId: payload.requestId });
+  }
+
+  return true;
+});
+
+ipcMain.handle("opencode:questionReject", async (_event, payload: {
+  sessionId: string;
+  requestId: string;
+}) => {
+  licenseManager.assertAccess("respostas de interação");
+  if (!payload?.sessionId || !payload?.requestId) throw new Error("Pedido de rejeição inválido.");
+  const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+
+  // 1. Primary OpenCode endpoint: POST /question/{id}/reject
+  let response = await fetch(`${opencodeUrl}/question/${encodeURIComponent(payload.requestId)}/reject`, {
+    method: "POST", headers, body: JSON.stringify({})
+  });
+
+  // 2. Fallback route: POST /session/{sessionId}/question/{requestId}/reject
+  if (!response.ok && (response.status === 404 || response.status === 405)) {
+    response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reject`, {
+      method: "POST", headers, body: JSON.stringify({})
+    });
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Não foi possível rejeitar a pergunta (HTTP ${response.status}).${body ? ` ${body.slice(0, 220)}` : ""}`);
+  }
+
+  const record = taskRecords.get(payload.sessionId);
+  if (record && record.state === "waiting_for_user") {
+    record.state = "running";
+    record.sawBusy = true;
+    record.lastActivityAt = Date.now();
+    logTask("user-rejected", record.taskId, payload.sessionId, `requestId=${payload.requestId}`);
+    setTaskState(payload.sessionId, "running", "user-rejected", { requestId: payload.requestId });
+  }
+
+  return true;
+});
+
 ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
   if (!sessionId) throw new Error("Sessão do Neko não encontrada.");
   clearActiveAgentRequest(sessionId);
@@ -5219,11 +5733,18 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
     clearTimeout(recheckTimer);
     idleRecheckTimers.delete(sessionId);
   }
+  for (const [key, item] of questionRecheckTimers.entries()) {
+    if (key.endsWith(`:${sessionId}`)) {
+      clearTimeout(item.timer);
+      questionRecheckTimers.delete(key);
+    }
+  }
+  cancelAgentInactivityWatchdog(sessionId);
   if (!opencodeUrl) throw new Error("OpenCode não está conectado.");
 
   const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
     method: "POST",
-    headers: opencodeDirectoryHeaders()
+    headers: opencodeRequestHeaders()
   });
 
   if (!response.ok) {
@@ -5958,6 +6479,7 @@ function createWindow() {
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
     console.error("[Neko/Renderer] render-process-gone", details);
+    console.error("[BLACKSCREEN-RENDERER] render-process-gone", { reason: details.reason, exitCode: details.exitCode });
   });
 
   // Detecta se uma mensagem de console representa um erro real do Preview
@@ -6084,6 +6606,12 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
     // representation. Do not require an exact port match for diagnostics.
     const isPreviewConsole = Boolean(previewPort && (source.includes("127.0.0.1") || source.includes("localhost"))) ||
       (Boolean(previewPort) && source.includes(`:${previewPort}`));
+
+    // [BLACKSCREEN-RENDERER] Capture renderer errors (not preview) from console-message
+    if (!isPreviewConsole && level >= 3 && message.trim()) {
+      console.error("[BLACKSCREEN-RENDERER] console-error", { message: message.slice(0, 500), line: lineNumber, source: source.slice(0, 200) });
+    }
+
     if (isPreviewConsole && message.trim()) {
       if (level >= 2) console.error("[Neko/Preview] console", payload);
       if (message.includes("[vite]")) perfMark("t6");
@@ -6185,6 +6713,9 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
 
 app.whenReady().then(() => {
   ipcMain.handle("app:version", () => app.getVersion());
+  ipcMain.handle("renderer:report-error", (_event, payload: { type: string; message: string; filename: string; lineno: number; colno: number; stack: string }) => {
+    console.error(`[BLACKSCREEN-RENDERER] ${payload.type}`, { message: payload.message?.slice(0, 500), filename: payload.filename?.slice(0, 200), lineno: payload.lineno, colno: payload.colno, stack: payload.stack?.slice(0, 1000) });
+  });
   ipcMain.handle("app:openExternal", async (_event, url: string) => {
     const raw = String(url || "").trim();
     if (/^https?:\/\//i.test(raw)) {
@@ -6199,12 +6730,14 @@ app.whenReady().then(() => {
 
   licenseManager.setOnStateChange(async (newState, prevState) => {
     console.log(`[Neko/License] Estado alterado de ${prevState.state} para ${newState.state}`);
+    console.log(`[BLACKSCREEN] license-state-change:main`, { from: prevState.state, to: newState.state, wasLicensed: prevState.isLicensed, nowLicensed: newState.isLicensed, currentProject });
     // Envia evento de alteração de estado para o Renderer
     mainWindow?.webContents.send("license:state-changed", newState);
 
     // Se perdeu o acesso licenciado (transferência para outro PC, revogação ou expiração), fecha o workspace imediatamente
     if (!newState.isLicensed && prevState.isLicensed) {
       console.warn("[Neko/License] Licença perdida/transferida. Encerrando workspace e servidores ativos imediatamente.");
+      console.warn("[BLACKSCREEN] license-revoked:killing-workspace", { currentProject, hasActiveWorkspace: !!activeWorkspace });
       await stopPreview();
       await stopOpenCode();
       currentProject = null;
