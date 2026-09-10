@@ -1301,12 +1301,15 @@ function App() {
     console.log("[BLACKSCREEN] openRecentProject:start", { path, source, currentProject: project, isExiting: isExitingRef.current, isSwitching: isSwitchingProjectRef.current });
     if (!path || isSwitchingProjectRef.current) { console.log("[BLACKSCREEN] openRecentProject:early-exit", { noPath: !path, alreadySwitching: isSwitchingProjectRef.current }); return; }
 
-    // Valida se a pasta ainda existe no disco antes de tentar abrir
-    const exists = await window.neko.projectExists(path);
-    if (!exists) {
-      showToast("Pasta não encontrada no disco: " + path);
-      setRecentProjects(prev => prev.map(p => p.path === path ? { ...p, missing: true } : p));
-      return false;
+    // Valida se a pasta ainda existe no disco antes de tentar abrir (somente para projetos existentes)
+    const isCreatingNew = source === "NewProject" || source === "create";
+    if (!isCreatingNew) {
+      const exists = await window.neko.projectExists(path);
+      if (!exists) {
+        showToast("Pasta não encontrada no disco: " + path);
+        setRecentProjects(prev => prev.map(p => p.path === path ? { ...p, missing: true } : p));
+        return false;
+      }
     }
 
     const insideApp = await window.neko.isInsideApplicationRoot(path).catch(() => false);
@@ -1314,7 +1317,7 @@ function App() {
       console.warn("[BLACKSCREEN] openRecentProject:blocked-inside-application-root", { path });
       showToast("Este diretório faz parte do NekoAI e não pode ser usado como projeto.");
       void removeRecentProject(path);
-      return;
+      return false;
     }
     const normalizeProjectPath = (value: string | null | undefined) =>
       String(value || "").replace(/[\\/]+$/g, "").toLowerCase();
@@ -1337,10 +1340,15 @@ function App() {
       console.log("[BLACKSCREEN] openRecentProject:before-ipc", { path });
       const res = await window.neko.openProject(path, source);
       console.log("[BLACKSCREEN] openRecentProject:ipc-result", { hasResult: !!res, hasError: !!res?.error, resultPath: res?.path, hasSession: !!res?.session, hasTree: !!res?.tree, hasSupabase: !!res?.supabaseState, hasVercel: !!res?.vercelState });
-      if (!res) { console.log("[BLACKSCREEN] openRecentProject:null-result"); return false; }
+      if (!res) {
+        console.log("[BLACKSCREEN] openRecentProject:null-result");
+        if (!projectRef.current) setStatus("offline");
+        return false;
+      }
       if (res.error) {
         console.log("[BLACKSCREEN] openRecentProject:error-result", { error: res.error });
         showToast(res.error || "Erro ao abrir projeto");
+        if (!projectRef.current) setStatus("offline");
         return false;
       }
       console.log("[BLACKSCREEN] openRecentProject:before-set-state", { targetPath: res.path || path, projectBefore: project });
@@ -1364,6 +1372,7 @@ function App() {
     } catch (err: any) {
       console.error("[BLACKSCREEN] openRecentProject:runtime-error", err);
       showToast(err?.message || "Erro ao abrir projeto");
+      if (!projectRef.current) setStatus("offline");
       return false;
     } finally {
       isSwitchingProjectRef.current = false;
