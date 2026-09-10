@@ -1,5 +1,6 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell, WebContentsView, webFrameMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell, WebContentsView, webFrameMain, type OpenDialogOptions } from "electron";
 import path from "node:path";
+import http from "node:http";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -20,6 +21,9 @@ import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSess
 import { discoverPreviewRoutes, routeFromUrl, normalizeRoutePath, isDynamicSegment, type PreviewRoute } from "./preview-routes";
 import { analyzeSite, cancelAllSiteClones, importSiteAssets, type SiteCloneAnalysis, type SiteCloneLimits } from "./site-clone";
 import { captureSiteChromium } from "./site-capture";
+import { recentProjectsManager, detectProjectTechnology, checkProjectExistsOnDisk, normalizeProjectPath } from "./recent-projects-manager";
+import { appPreferencesManager, isValidDirectory } from "./app-preferences-manager";
+import { thumbnailService } from "./thumbnail-service";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -48,6 +52,7 @@ interface WorkspaceContext {
   opencodeUrl: string;
   opencodePort: number | null;
   previewProcess: ChildProcess | null;
+  previewStaticServer: http.Server | null;
   previewPort: number | null;
   previewUrl: string | null;
   watcher: fs.FSWatcher | null;
@@ -2771,6 +2776,7 @@ type PreviewManagerState = {
   port: number | null;
   url: string | null;
   message?: string;
+  internalSession?: number;
 };
 
 let previewState: PreviewManagerState = {
@@ -2781,13 +2787,30 @@ let previewState: PreviewManagerState = {
   url: null
 };
 
+export type ProjectRuntimeType = "STATIC_HTML" | "NODE_DEV_SERVER" | "UNSUPPORTED";
+
+export interface ProjectRuntimeDescriptor {
+  type: ProjectRuntimeType;
+  framework: string;
+  projectRoot: string;
+  preferredPort: number;
+  entryHtml?: string;
+  pkg?: Record<string, any> | null;
+  devScript?: string | null;
+  packageManager?: string;
+  runtimeEntry?: string | null;
+}
+
 let previewProcess: ChildProcess | null = null;
+let previewStaticServer: http.Server | null = null;
 let previewPort: number | null = null;
 let previewProjectPath: string | null = null;
 let previewStartPromise: Promise<PreviewManagerState> | null = null;
 let previewSessionCounter = 0;
 let activePreviewSessionId = 0;
 let previewRestartDebounceTimer: NodeJS.Timeout | null = null;
+let previewStaticReloadDebounceTimer: NodeJS.Timeout | null = null;
+let previewRuntimeDescriptor: ProjectRuntimeDescriptor | null = null;
 
 // The iframe renderer remains available as a reversible fallback.  The view
 // below is the opt-in internal surface: it loads the already-running Preview
@@ -3023,6 +3046,230 @@ function packageManagerExecutable(packageManager: string) {
   if (packageManager === "yarn") return process.platform === "win32" ? "yarn.cmd" : "yarn";
   if (packageManager === "bun") return process.platform === "win32" ? "bun.exe" : "bun";
   return process.platform === "win32" ? "npm.cmd" : "npm";
+}
+
+const STATIC_MIME_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".ico": "image/x-icon",
+  ".bmp": "image/bmp",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".eot": "application/vnd.ms-fontobject",
+  ".wav": "audio/wav",
+  ".mp3": "audio/mpeg",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".txt": "text/plain; charset=utf-8",
+  ".pdf": "application/pdf",
+  ".xml": "application/xml; charset=utf-8"
+};
+
+async function startStaticHttpServer(projectRoot: string, port: number): Promise<http.Server> {
+  const safeRoot = path.resolve(projectRoot);
+
+  return new Promise<http.Server>((resolve, reject) => {
+    const server = http.createServer(async (req, res) => {
+      // 1. Only allow GET and HEAD methods
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Method Not Allowed");
+        return;
+      }
+
+      try {
+        // 2. Decode and normalize path
+        const reqUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+        let decodedPath = "";
+        try {
+          decodedPath = decodeURIComponent(reqUrl.pathname);
+        } catch {
+          decodedPath = reqUrl.pathname;
+        }
+
+        // 3. Resolve absolute path and enforce strict directory traversal protection
+        const relativePath = decodedPath.replace(/^\/+/, "");
+        let targetPath = path.resolve(safeRoot, relativePath);
+
+        const isInsideRoot = targetPath === safeRoot || targetPath.startsWith(safeRoot + path.sep);
+        if (!isInsideRoot) {
+          res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end("Forbidden: Access Denied");
+          return;
+        }
+
+        // 4. File existence & directory resolution
+        let fileStat: fs.Stats | null = null;
+        try {
+          fileStat = await fs.promises.stat(targetPath);
+        } catch {}
+
+        // If directory, try index.html inside it
+        if (fileStat && fileStat.isDirectory()) {
+          const indexCandidate = path.join(targetPath, "index.html");
+          try {
+            const indexStat = await fs.promises.stat(indexCandidate);
+            if (indexStat.isFile()) {
+              targetPath = indexCandidate;
+              fileStat = indexStat;
+            } else {
+              fileStat = null;
+            }
+          } catch {
+            fileStat = null;
+          }
+        }
+
+        // If not found and has no extension, try targetPath + ".html" (clean URLs e.g. /sobre -> /sobre.html)
+        if (!fileStat && !path.extname(targetPath)) {
+          const htmlCandidate = targetPath + ".html";
+          try {
+            const htmlStat = await fs.promises.stat(htmlCandidate);
+            if (htmlStat.isFile()) {
+              targetPath = htmlCandidate;
+              fileStat = htmlStat;
+            }
+          } catch {}
+        }
+
+        // 5. 404 Not Found
+        if (!fileStat || !fileStat.isFile()) {
+          res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>404 Not Found</title><style>body{font-family:sans-serif;padding:40px;background:#18181b;color:#f4f4f5;text-align:center;}h1{color:#ef4444;}</style></head><body><h1>404 — Página não encontrada</h1><p>O arquivo solicitado não foi encontrado no projeto.</p></body></html>`);
+          return;
+        }
+
+        // 6. Content headers
+        const ext = path.extname(targetPath).toLowerCase();
+        const contentType = STATIC_MIME_TYPES[ext] || "application/octet-stream";
+        const headers: Record<string, string | number> = {
+          "Content-Type": contentType,
+          "Content-Length": fileStat.size,
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "Access-Control-Allow-Origin": "*"
+        };
+
+        if (req.method === "HEAD") {
+          res.writeHead(200, headers);
+          res.end();
+          return;
+        }
+
+        res.writeHead(200, headers);
+        const stream = fs.createReadStream(targetPath);
+        stream.on("error", streamErr => {
+          console.warn("[Neko/StaticServer] stream error:", streamErr);
+          if (!res.headersSent) {
+            res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("Internal Server Error");
+          } else {
+            res.destroy();
+          }
+        });
+        stream.pipe(res);
+      } catch (err: any) {
+        console.warn("[Neko/StaticServer] request error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end("Internal Server Error");
+        } else {
+          res.destroy();
+        }
+      }
+    });
+
+    server.once("error", err => {
+      reject(err);
+    });
+
+    server.listen(port, "127.0.0.1", () => {
+      console.log(`[Neko/StaticServer] servidor ativo em http://127.0.0.1:${port} (root: ${safeRoot})`);
+      resolve(server);
+    });
+  });
+}
+
+async function detectProjectRuntime(workspacePath: string): Promise<ProjectRuntimeDescriptor> {
+  const root = path.resolve(workspacePath);
+
+  // 1. Prioridade 1: Projeto com package.json válido + script de desenvolvimento (NODE_DEV_SERVER)
+  const nodeProjectRoot = await resolvePreviewProjectRoot(root);
+  if (nodeProjectRoot) {
+    const nodeInfo = await detectProject(nodeProjectRoot);
+    if (nodeInfo.exists && nodeInfo.devScript) {
+      return {
+        type: "NODE_DEV_SERVER",
+        framework: nodeInfo.framework,
+        projectRoot: nodeProjectRoot,
+        preferredPort: nodeInfo.preferredPort,
+        pkg: nodeInfo.pkg,
+        devScript: nodeInfo.devScript,
+        packageManager: nodeInfo.packageManager,
+        runtimeEntry: nodeInfo.runtimeEntry
+      };
+    }
+  }
+
+  // 2. Prioridade 2: Projeto com index.html navegável (STATIC_HTML)
+  const candidateDirs = [
+    root,
+    path.join(root, "public"),
+    path.join(root, "dist"),
+    path.join(root, "src")
+  ];
+
+  for (const dir of candidateDirs) {
+    const candidateHtml = path.join(dir, "index.html");
+    try {
+      const stat = await fs.promises.stat(candidateHtml);
+      if (stat.isFile()) {
+        console.log(`[Neko/Preview] runtime STATIC_HTML detectado em ${dir}`);
+        return {
+          type: "STATIC_HTML",
+          framework: "HTML/JS Estático",
+          projectRoot: dir,
+          preferredPort: 3000,
+          entryHtml: path.relative(dir, candidateHtml) || "index.html"
+        };
+      }
+    } catch {}
+  }
+
+  // Also check if any .html file exists in the root directory
+  try {
+    const entries = await fs.promises.readdir(root, { withFileTypes: true }).catch(() => []);
+    const htmlEntry = entries.find(e => e.isFile() && e.name.toLowerCase().endsWith(".html"));
+    if (htmlEntry) {
+      console.log(`[Neko/Preview] runtime STATIC_HTML (arquivo: ${htmlEntry.name}) detectado em ${root}`);
+      return {
+        type: "STATIC_HTML",
+        framework: "HTML/JS Estático",
+        projectRoot: root,
+        preferredPort: 3000,
+        entryHtml: htmlEntry.name
+      };
+    }
+  } catch {}
+
+  // 3. Prioridade 3: Nenhum runtime reconhecido
+  return {
+    type: "UNSUPPORTED",
+    framework: "Desconhecido",
+    projectRoot: root,
+    preferredPort: 3000
+  };
 }
 
 async function hasDependencies(projectPath: string) {
@@ -3319,6 +3566,19 @@ function previewArgs(framework: string, port: number, devScript = "dev") {
 }
 
 async function stopPreviewProcessOnly(): Promise<void> {
+  if (previewStaticServer) {
+    try {
+      const server = previewStaticServer;
+      previewStaticServer = null;
+      await new Promise<void>(resolve => {
+        server.close(() => resolve());
+        setTimeout(resolve, 300);
+      });
+      console.log("[Preview] static HTTP server stopped");
+    } catch (err) {
+      console.warn("[Preview] error stopping static HTTP server:", err);
+    }
+  }
   if (previewProcess) {
     const proc = previewProcess;
     previewProcess = null;
@@ -3348,9 +3608,11 @@ async function stopPreview(): Promise<void> {
   previewProjectPath = null;
   if (activeWorkspace) {
     activeWorkspace.previewProcess = null;
+    activeWorkspace.previewStaticServer = null;
     activeWorkspace.previewPort = null;
     activeWorkspace.previewUrl = null;
   }
+  previewRuntimeDescriptor = null;
   previewState = { status: "stopped", framework: previewState.framework, packageManager: previewState.packageManager, port: null, url: null };
   emitPreview("preview.stopped");
 }
@@ -3358,10 +3620,32 @@ async function stopPreview(): Promise<void> {
 function handleProjectFileChange(projectPath: string, changedPath: string) {
   if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
   const normalized = (changedPath || "").replaceAll("\\", "/").toLowerCase();
+  if (normalized.startsWith(".neko/") || normalized.includes("/.neko/")) return;
 
   // Concurrency guard: Only ONE install/boot per projectPath and generation
   if (previewStartPromise || ["detecting", "installing", "starting", "ready"].includes(previewState.status)) {
-    // If preview is active or currently booting, only trigger restart on config file change
+    // 1. If active preview runtime is STATIC_HTML and status is ready:
+    if (previewRuntimeDescriptor?.type === "STATIC_HTML" && previewState.status === "ready") {
+      const ext = path.extname(normalized);
+      const isStaticAsset = [".html", ".htm", ".css", ".js", ".mjs", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".woff", ".woff2", ".ttf"].includes(ext);
+      if (isStaticAsset) {
+        if (previewStaticReloadDebounceTimer) clearTimeout(previewStaticReloadDebounceTimer);
+        previewStaticReloadDebounceTimer = setTimeout(() => {
+          previewStaticReloadDebounceTimer = null;
+          if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
+          console.log(`[Neko/PreviewWatcher] Arquivo estático modificado (${changedPath}). Recarregando preview...`);
+          try {
+            if (internalPreviewView && !internalPreviewView.webContents.isDestroyed()) {
+              internalPreviewView.webContents.reload();
+            }
+          } catch {}
+          mainWindow?.webContents.send("preview:event", { type: "preview.frame-loading", properties: {} });
+        }, 150);
+      }
+      return;
+    }
+
+    // 2. If active preview is NODE_DEV_SERVER: only trigger restart on config file change
     const isConfigFile = normalized.endsWith("package.json") ||
       normalized.includes("vite.config") ||
       normalized.includes("next.config") ||
@@ -3384,45 +3668,24 @@ function handleProjectFileChange(projectPath: string, changedPath: string) {
     return;
   }
 
-  // If preview is idle/stopped/error and package.json appeared, trigger auto start
-  if (!previewProcess && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error")) {
-    void resolvePreviewProjectRoot(projectPath).then(root => {
-      if (root && (!previewProcess && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error"))) {
-        console.log(`[Neko/PreviewWatcher] package.json detectado em ${root}. Iniciando preview automaticamente...`);
-        void startPreview(projectPath).catch(err => {
-          console.warn("[Neko/PreviewWatcher] Falha na auto-inicialização do preview:", err);
-        });
-      }
-    });
+  // 3. If preview is idle/stopped/error and a project structure appeared (index.html or package.json):
+  if (!previewProcess && !previewStaticServer && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error")) {
+    const isStructureTrigger = normalized.endsWith("package.json") || normalized.endsWith("index.html") || normalized.endsWith(".html");
+    if (isStructureTrigger) {
+      void detectProjectRuntime(projectPath).then(runtime => {
+        if (runtime.type !== "UNSUPPORTED" && (!previewProcess && !previewStaticServer && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error"))) {
+          console.log(`[Neko/PreviewWatcher] Estrutura de projeto (${runtime.type}) detectada em ${runtime.projectRoot}. Iniciando preview automaticamente...`);
+          void startPreview(projectPath).catch(err => {
+            console.warn("[Neko/PreviewWatcher] Falha na auto-inicialização do preview:", err);
+          });
+        }
+      });
+    }
   }
 }
 
-async function captureProjectPreviewThumbnail(projectPath: string, url: string) {
-  let offscreenWin: BrowserWindow | null = null;
-  try {
-    offscreenWin = new BrowserWindow({
-      show: false,
-      width: 1280,
-      height: 720,
-      webPreferences: {
-        offscreen: true
-      }
-    });
-    await offscreenWin.loadURL(url);
-    await new Promise(r => setTimeout(r, 1800));
-    const image = await offscreenWin.webContents.capturePage();
-    if (!image.isEmpty()) {
-      const nekoDir = path.join(projectPath, ".neko");
-      await fs.promises.mkdir(nekoDir, { recursive: true });
-      const thumbBuffer = image.resize({ width: 640 }).toPNG();
-      await fs.promises.writeFile(path.join(nekoDir, "thumbnail.png"), thumbBuffer);
-      console.log("[Neko/Preview] real thumbnail saved for project:", projectPath);
-    }
-  } catch (err) {
-    console.warn("[Neko/Preview] offscreen thumbnail capture skipped:", err);
-  } finally {
-    try { if (offscreenWin && !offscreenWin.isDestroyed()) offscreenWin.close(); } catch {}
-  }
+function captureProjectPreviewThumbnail(projectPath: string, url: string, force = false) {
+  thumbnailService.queueCapture(projectPath, url, { force });
 }
 
 async function launchPreviewProcess(projectPath: string, info: any, packageManager: string, port: number) {
@@ -3461,6 +3724,84 @@ async function launchPreviewProcess(projectPath: string, info: any, packageManag
   });
 
   return { processRef, exitPromise, getOutput: () => output };
+}
+
+async function startStaticPreviewInternal(projectRoot: string, info: ProjectRuntimeDescriptor, sessionId: number): Promise<PreviewManagerState> {
+  if (sessionId !== activePreviewSessionId) return previewState;
+
+  emitPreview("preview.detected", {
+    status: "detecting",
+    framework: "HTML / Estático",
+    packageManager: "none",
+    message: "Projeto HTML/Estático detectado."
+  });
+
+  if (sessionId !== activePreviewSessionId) return previewState;
+
+  const port = await findFreePort(3000);
+  emitPreview("preview.starting", {
+    status: "starting",
+    packageManager: "none",
+    port,
+    message: `Iniciando servidor estático na porta ${port}...`
+  });
+
+  try {
+    const server = await startStaticHttpServer(projectRoot, port);
+    if (sessionId !== activePreviewSessionId) {
+      server.close();
+      return previewState;
+    }
+
+    server.on("close", () => {
+      if (previewStaticServer === server) {
+        previewStaticServer = null;
+        previewPort = null;
+        emitPreview("preview.exit", {
+          status: "stopped",
+          port: null,
+          url: null,
+          message: "Servidor estático encerrado."
+        });
+      }
+    });
+
+    previewStaticServer = server;
+    previewPort = port;
+    const url = `http://127.0.0.1:${port}`;
+    await waitForHttp(url, 5000);
+
+    if (sessionId !== activePreviewSessionId) {
+      server.close();
+      if (previewStaticServer === server) previewStaticServer = null;
+      return previewState;
+    }
+
+    const ready: PreviewManagerState = {
+      status: "ready",
+      framework: "HTML / Estático",
+      packageManager: "none",
+      port,
+      url,
+      message: "Preview estático pronto.",
+      internalSession: sessionId
+    };
+    previewState = ready;
+    previewRuntimeDescriptor = info;
+    if (activeWorkspace) {
+      activeWorkspace.previewStaticServer = server;
+      activeWorkspace.previewPort = port;
+      activeWorkspace.previewUrl = url;
+    }
+    console.log(`[Preview] static ready session=${sessionId} url=${url}`);
+    mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
+    void captureProjectPreviewThumbnail(projectRoot, url);
+    return ready;
+  } catch (error: any) {
+    await stopPreviewProcessOnly();
+    emitPreview("preview.error", { status: "error", message: String(error?.message ?? error), port: null, url: null });
+    return previewState;
+  }
 }
 
 async function startPreviewInternal(projectRoot: string, info: any, sessionId: number): Promise<PreviewManagerState> {
@@ -3550,6 +3891,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       previewPort = port;
       const ready = { status: "ready" as const, framework: info.framework, packageManager, port, url, message: "Preview pronto.", internalSession: sessionId };
       previewState = ready;
+      previewRuntimeDescriptor = info;
       if (activeWorkspace) {
         activeWorkspace.previewProcess = processRef;
         activeWorkspace.previewPort = port;
@@ -3616,7 +3958,9 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
           previewPort = retryPort;
           const ready = { status: "ready" as const, framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Preview pronto.", internalSession: sessionId };
           previewState = ready;
+          previewRuntimeDescriptor = info;
           mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
+          captureProjectPreviewThumbnail(projectRoot, retryUrl);
           return ready;
         } catch (fallbackError: any) {
           console.error(`[Preview] terminal failure: npm recovery failed:`, fallbackError?.message || fallbackError);
@@ -3656,11 +4000,15 @@ async function startPreview(projectPath: string, _sourceGen?: number, forceResta
   const workspace = path.resolve(projectPath);
 
   // 1. Se já está rodando e saudável no mesmo projeto, NÃO matar! Reutilizar e reemitir ready!
-  if (!forceRestart && previewProjectPath === workspace && previewProcess && previewProcess.exitCode === null && previewState.status === "ready" && previewState.url) {
+  const hasActiveRunner = (previewProcess && previewProcess.exitCode === null) || Boolean(previewStaticServer);
+  if (!forceRestart && previewProjectPath === workspace && hasActiveRunner && previewState.status === "ready" && previewState.url) {
     const alive = await isHttpAlive(previewState.url);
     if (alive) {
       console.log(`[Preview] Servidor já ativo e saudável em ${previewState.url} (mantido sem interrupção).`);
       emitPreview("preview.ready", previewState);
+      if (previewState.url) {
+        captureProjectPreviewThumbnail(workspace, previewState.url);
+      }
       return previewState;
     }
   }
@@ -3677,26 +4025,22 @@ async function startPreview(projectPath: string, _sourceGen?: number, forceResta
   previewProjectPath = workspace;
   previewStartPromise = (async () => {
     emitPreview("preview.detecting", { status: "detecting", message: "Analisando estrutura do projeto..." });
-    const projectRoot = await resolvePreviewProjectRoot(workspace);
-    if (!projectRoot) {
-      if (session === activePreviewSessionId) {
-        emitPreview("preview.unsupported", { status: "idle", message: "Aguardando criação da estrutura do projeto (package.json)..." });
-      }
-      return previewState;
-    }
+    const runtime = await detectProjectRuntime(workspace);
     if (session !== activePreviewSessionId) return previewState;
 
-    const info = await detectProject(projectRoot);
-    if (!info.exists || !info.devScript) {
-      if (session === activePreviewSessionId) {
-        emitPreview("preview.unsupported", { status: "idle", message: "O projeto não possui um script dev ou start no package.json." });
-      }
+    if (runtime.type === "UNSUPPORTED") {
+      emitPreview("preview.unsupported", { status: "idle", message: "Aguardando criação da estrutura do projeto..." });
       return previewState;
     }
 
     await stopPreviewProcessOnly();
-    console.log("[Neko/Preview] project root resolved", { workspace, projectRoot, session });
-    return startPreviewInternal(projectRoot, info, session);
+    console.log("[Neko/Preview] project runtime resolved", { workspace, runtimeType: runtime.type, projectRoot: runtime.projectRoot, session });
+
+    if (runtime.type === "STATIC_HTML") {
+      return startStaticPreviewInternal(runtime.projectRoot, runtime, session);
+    }
+
+    return startPreviewInternal(runtime.projectRoot, runtime, session);
   })().finally(() => {
     previewStartPromise = null;
   });
@@ -4292,10 +4636,23 @@ ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
 });
 
 ipcMain.handle("github:chooseCloneDestination", async () => {
-  const destination = await dialog.showOpenDialog(mainWindow!, {
+  let defaultPath: string | undefined = undefined;
+  const lastDir = await appPreferencesManager.getLastProjectDirectory();
+  if (lastDir) {
+    defaultPath = lastDir;
+  }
+
+  const dialogOptions: OpenDialogOptions = {
     title: "Escolha onde salvar o projeto do GitHub",
     properties: ["openDirectory", "createDirectory"]
-  });
+  };
+  if (defaultPath) {
+    dialogOptions.defaultPath = defaultPath;
+  }
+
+  const destination = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+    : await dialog.showOpenDialog(dialogOptions);
   if (destination.canceled || !destination.filePaths[0]) return { canceled: true };
   return { canceled: false, path: destination.filePaths[0] };
 });
@@ -4870,6 +5227,42 @@ ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: str
   });
 });
 
+ipcMain.handle("projects:getRecent", async () => {
+  return await recentProjectsManager.getRecentProjectsWithStatus();
+});
+
+ipcMain.handle("projects:touchRecent", async (_event, projectPath: string) => {
+  const updated = await recentProjectsManager.touchRecentProject(projectPath);
+  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
+  return updated;
+});
+
+ipcMain.handle("projects:removeRecent", async (_event, projectPath: string) => {
+  const updated = await recentProjectsManager.removeRecentProject(projectPath);
+  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
+  return updated;
+});
+
+ipcMain.handle("projects:toggleFavorite", async (_event, projectPath: string) => {
+  const updated = await recentProjectsManager.toggleFavoriteProject(projectPath);
+  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
+  return updated;
+});
+
+ipcMain.handle("projects:saveRecent", async (_event, projects: any[]) => {
+  const updated = await recentProjectsManager.saveRecentProjects(projects);
+  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
+  return updated;
+});
+
+ipcMain.handle("projects:detectTechnology", async (_event, projectPath: string) => {
+  return await detectProjectTechnology(projectPath);
+});
+
+ipcMain.handle("preferences:getLastProjectDirectory", async () => {
+  return await appPreferencesManager.getLastProjectDirectory();
+});
+
 ipcMain.handle("project:exists", async (_event, projectPath: string) => {
   const value = String(projectPath || "").trim();
   if (!value) return false;
@@ -4917,7 +5310,18 @@ ipcMain.handle("project:saveThumbnail", async (_event, payload: { projectPath: s
     await fs.promises.mkdir(nekoDir, { recursive: true });
     const base64Data = dataUrl.replace(/^data:image\/\w+;base64,/, "");
     const buffer = Buffer.from(base64Data, "base64");
-    await fs.promises.writeFile(path.join(nekoDir, "thumbnail.png"), buffer);
+    const thumbFile = path.join(nekoDir, "thumbnail.png");
+    await fs.promises.writeFile(thumbFile, buffer);
+    void recentProjectsManager.updateProjectThumbnail(root, {
+      thumbnail: dataUrl,
+      thumbnailPath: thumbFile,
+      thumbnailUpdatedAt: Date.now()
+    }).then(async () => {
+      try {
+        const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
+        mainWindow?.webContents.send("recent-projects:updated", enriched);
+      } catch {}
+    }).catch(() => {});
     return { ok: true };
   } catch (error) {
     console.warn("[Neko/Thumbnail] failed to save thumbnail:", error);
@@ -4946,11 +5350,30 @@ ipcMain.handle("project:lastEdited", async (_event, projectPath: string) => {
   }
 });
 
-ipcMain.handle("project:choose", async () => {
-  const result = await dialog.showOpenDialog(mainWindow!, {
+ipcMain.handle("project:choose", async (_event, options?: { defaultPath?: string }) => {
+  let defaultPath: string | undefined = undefined;
+
+  if (options?.defaultPath && isValidDirectory(options.defaultPath)) {
+    defaultPath = normalizeProjectPath(options.defaultPath);
+  } else {
+    const lastDir = await appPreferencesManager.getLastProjectDirectory();
+    if (lastDir) {
+      defaultPath = lastDir;
+    }
+  }
+
+  const dialogOptions: OpenDialogOptions = {
     title: "Abrir pasta do projeto",
     properties: ["openDirectory"]
-  });
+  };
+
+  if (defaultPath) {
+    dialogOptions.defaultPath = defaultPath;
+  }
+
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, dialogOptions)
+    : await dialog.showOpenDialog(dialogOptions);
 
   if (result.canceled || !result.filePaths[0]) return null;
   return result.filePaths[0];
@@ -4965,6 +5388,15 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
   if (!projectPath) throw new Error("Pasta do projeto não informada.");
 
   const targetPath = assertProjectRootSafe(projectPath, "switch");
+
+  const isCreatingNew = source === "NewProject" || source === "create";
+  if (!isCreatingNew) {
+    const exists = await fs.promises.stat(targetPath).then(s => s.isDirectory()).catch(() => false);
+    if (!exists) {
+      throw new Error(`Pasta não encontrada no disco: ${targetPath}`);
+    }
+  }
+
   const transitionGen = ++projectTransitionGeneration;
   logProjectWorkspace("switch", targetPath);
   console.log(`[ProjectSwitch] REQUEST source=${source} target=${targetPath} generation=${transitionGen}`);
@@ -4984,6 +5416,7 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
     opencodeUrl: "http://127.0.0.1:4097",
     opencodePort: null,
     previewProcess: null,
+    previewStaticServer: null,
     previewPort: null,
     previewUrl: null,
     watcher: null,
@@ -4994,8 +5427,10 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
   currentProject = targetPath;
 
   const transitionPromise = (async () => {
-    // 1. Ensure project directory exists
-    await fs.promises.mkdir(targetPath, { recursive: true });
+    // 1. Ensure project directory exists only if explicitly creating a new project
+    if (isCreatingNew) {
+      await fs.promises.mkdir(targetPath, { recursive: true });
+    }
 
     // 2. Terminate prior services cleanly
     await stopPreview();
@@ -5049,6 +5484,21 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
     newWorkspace.status = "ready";
     logService("transition-ready", `target=${targetPath} gen=${transitionGen}`);
     console.log("[BLACKSCREEN] switchWorkspace:transition-ready", { targetPath, sessionData: !!(session as any).data, treeNodes: tree.length, supabaseStatus: supabaseState?.status, vercelStatus: vercelState?.connection });
+
+    // Registra projeto recente universalmente na conclusão do workspace
+    void recentProjectsManager.touchRecentProject(targetPath).then(async () => {
+      try {
+        const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
+        mainWindow?.webContents.send("recent-projects:updated", enriched);
+      } catch {}
+    }).catch(err => {
+      console.warn("[Neko/RecentProjects] Erro ao registrar projeto recente:", err);
+    });
+
+    // Salva a pasta pai como última pasta utilizada (lastProjectDirectory)
+    void appPreferencesManager.saveLastProjectDirectoryFromProjectPath(targetPath).catch(err => {
+      console.warn("[Neko/Preferences] Erro ao salvar última pasta do projeto:", err);
+    });
 
     const result = {
       path: targetPath,
@@ -5844,6 +6294,12 @@ ipcMain.handle("preview:refresh", async () => {
     const current = view.webContents.getURL();
     console.log(`[Preview] refresh origin=${(() => { try { return new URL(current).origin; } catch { return ""; } })()} url=${sanitizeExternalPreviewUrl(current)}`);
     view.webContents.reload();
+    const activeRoot = getActiveProjectRoot();
+    if (activeRoot && current) {
+      setTimeout(() => {
+        captureProjectPreviewThumbnail(activeRoot, current, true);
+      }, 1500);
+    }
     return { ok: true, method: "reload" };
   } catch (error) {
     console.warn(`[Preview] refresh failed: ${String((error as any)?.message ?? error)}`);
@@ -6452,6 +6908,10 @@ function createWindow() {
     mainWindow?.maximize();
     mainWindow?.show();
   });
+
+  thumbnailService.setMainWindowGetter(() => mainWindow);
+  thumbnailService.setInternalPreviewViewGetter(() => internalPreviewView);
+  thumbnailService.setIsInsideAppRootChecker((p: string) => isInsideNekoApplication(p));
 
   supabaseManager.on("state-changed", (state) => {
     if (mainWindow && !mainWindow.isDestroyed()) {

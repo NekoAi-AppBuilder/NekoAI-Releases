@@ -1,103 +1,17 @@
 {
   "name": "nekoai",
-  "version": "0.4.81",
+  "version": "0.4.82",
   "private": true,
   "description": "NekoAI - AI software builder",
   "main": "dist/main/main.js",
-  "scripts": {
-    "dev": "concurrently -k \"vite --host 127.0.0.1 --port 5173\" \"tsc -p tsconfig.main.json --watch\" \"wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
-    "build": "npm run sync:provider-icons && npm run sync:icons && vite build && tsc -p tsconfig.main.json",
-    "start": "electron .",
-    "sync:provider-icons": "node scripts/sync-provider-icons.mjs",
-    "sync:icons": "powershell -ExecutionPolicy Bypass -Command \"New-Item -ItemType Directory -Force -Path 'dist/assets' | Out-Null; Copy-Item 'build/icon.*' 'dist/assets/' -Force\""
-  },
   "dependencies": {
     "@opencode-ai/sdk": "1.18.18",
     "@opencode-ai/ui": "1.18.18",
+    "@shikijs/engine-javascript": "4.2.0",
     "electron-updater": "^6.8.9",
     "lucide-react": "latest",
     "react": "latest",
-    "react-dom": "latest"
-  },
-  "devDependencies": {
-    "@types/electron": "latest",
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "@vitejs/plugin-react": "latest",
-    "concurrently": "latest",
-    "cross-env": "latest",
-    "electron": "latest",
-    "typescript": "latest",
-    "vite": "latest",
-    "wait-on": "latest"
-  },
-  "build": {
-    "appId": "com.nekoai.studio",
-    "productName": "NekoAI",
-    "directories": {
-      "output": "dist-build"
-    },
-    "files": [
-      "dist/main/**/*",
-      "dist/preload/**/*",
-      "dist/renderer/**/*",
-      "dist/assets/**/*",
-      "dist/shared/**/*",
-      "node_modules/@opencode-ai/sdk/**/*",
-      "node_modules/cross-spawn/**/*",
-      "node_modules/which/**/*",
-      "node_modules/isexe/**/*",
-      "node_modules/path-key/**/*",
-      "node_modules/shebang-command/**/*",
-      "node_modules/shebang-regex/**/*",
-      "node_modules/electron-updater/**/*",
-      "node_modules/builder-util-runtime/**/*",
-      "node_modules/js-yaml/**/*",
-      "node_modules/lazy-val/**/*",
-      "node_modules/semver/**/*",
-      "node_modules/tiny-typed-emitter/**/*",
-      "node_modules/lodash.isequal/**/*",
-      "node_modules/lodash.escaperegexp/**/*",
-      "node_modules/fs-extra/**/*",
-      "node_modules/graceful-fs/**/*",
-      "node_modules/jsonfile/**/*",
-      "node_modules/universalify/**/*",
-      "node_modules/argparse/**/*",
-      "node_modules/sax/**/*",
-      "node_modules/debug/**/*",
-      "node_modules/ms/**/*",
-      "package.json"
-    ],
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "NekoAi-AppBuilder",
-        "repo": "NekoAI-Releases",
-        "releaseType": "release"
-      }
-    ],
-    "extraResources": [
-      {
-        "from": "tools/opencode.exe",
-        "to": "tools/opencode.exe"
-      }
-    ],
-    "win": {
-      "target": [
-        "nsis"
-      ],
-      "artifactName": "NekoAI-Setup-${version}.${ext}"
-    },
-    "nsis": {
-      "oneClick": true,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": false,
-      "deleteAppDataOnUninstall": false,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true,
-      "shortcutName": "NekoAI",
-      "artifactName": "NekoAI-Setup-${version}.${ext}"
-    }
+    "react-dom": "latest",
+    "shiki": "4.2.0"
   }
 }

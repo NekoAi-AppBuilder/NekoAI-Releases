@@ -15,6 +15,23 @@ import { nextChatMode, chatModeLabel, CHAT_MODES, type ChatMode } from "../share
 import { getNekoTutorials, type NekoTutorial } from "./tutorials";
 import { notifyOnce, playNotify, soundEnabled, setSoundEnabled, unlockAudio } from "./sounds";
 import { buildAgentCaptureContext, htmlToText } from "../main/site-capture";
+import { CodeWorkspace } from "./components/code";
+import {
+  AutocompleteMenu,
+  detectAutocompleteTrigger,
+  applyAutocompleteSelection,
+  filterCommands,
+  filterContexts,
+  resolveChatMessage,
+  extractProjectItems,
+  filterProjectItems,
+  type AutocompleteMode,
+  type TriggerMatch,
+  type ChatCommand,
+  type ChatContext,
+  type ProjectItem,
+  type ResolverContextState
+} from "./autocomplete";
 
 // Catálogo oficial do OpenCode. A lista é mantida pelo pacote @opencode-ai/ui.
 // Quando o ID do provider não possui um ícone oficial, a Neko usa o Sparkles
@@ -315,9 +332,9 @@ function SupabaseIcon({ size = 16 }: { size?: number }) {
 }
 
 
-// Formatação dinâmica de tempo em português para lastEdited
-function formatTimeAgo(timestamp: number): string {
-  if (!timestamp || isNaN(timestamp)) return "Editado recentemente";
+// Formatação dinâmica de tempo em português para lastOpenedAt / lastEdited
+function formatTimeAgo(timestamp: number, prefix: "Editado" | "Aberto" = "Editado"): string {
+  if (!timestamp || isNaN(timestamp)) return `${prefix} recentemente`;
   const now = Date.now();
   const diffMs = Math.max(0, now - timestamp);
   const diffSec = Math.floor(diffMs / 1000);
@@ -327,17 +344,25 @@ function formatTimeAgo(timestamp: number): string {
   const diffMonths = Math.floor(diffDays / 30);
   const diffYears = Math.floor(diffDays / 365);
 
-  if (diffSec < 60) return "Editado agora";
-  if (diffMin === 1) return "Editado há 1 minuto";
-  if (diffMin < 60) return `Editado há ${diffMin} minutos`;
-  if (diffHours === 1) return "Editado há 1 hora";
-  if (diffHours < 24) return `Editado há ${diffHours} horas`;
-  if (diffDays === 1) return "Editado há 1 dia";
-  if (diffDays < 30) return `Editado há ${diffDays} dias`;
-  if (diffMonths === 1) return "Editado há 1 mês";
-  if (diffMonths < 12) return `Editado há ${diffMonths} meses`;
-  if (diffYears === 1) return "Editado há 1 ano";
-  return `Editado há ${diffYears} anos`;
+  if (diffSec < 60) return `${prefix} agora`;
+  if (diffMin === 1) return `${prefix} há 1 minuto`;
+  if (diffMin < 60) return `${prefix} há ${diffMin} minutos`;
+  if (diffHours === 1) return `${prefix} há 1 hora`;
+  if (diffHours < 24) return `${prefix} há ${diffHours} horas`;
+  if (diffDays === 1) return `${prefix} há 1 dia`;
+  if (diffDays < 30) return `${prefix} há ${diffDays} dias`;
+  if (diffMonths === 1) return `${prefix} há 1 mês`;
+  if (diffMonths < 12) return `${prefix} há ${diffMonths} meses`;
+  if (diffYears === 1) return `${prefix} há 1 ano`;
+  return `${prefix} há ${diffYears} anos`;
+}
+
+function formatProjectActivity(item: RecentProject): string {
+  if (item.lastEdited && item.lastOpenedAt && item.lastEdited > item.lastOpenedAt) {
+    return formatTimeAgo(item.lastEdited, "Editado");
+  }
+  const openedTs = item.lastOpenedAt || item.lastOpened || item.lastEdited || Date.now();
+  return formatTimeAgo(openedTs, "Aberto");
 }
 
 type Node = { name: string; path: string; type: "file" | "directory"; children?: Node[] };
@@ -368,11 +393,27 @@ type GithubDevice = { userCode: string; verificationUri: string; expiresIn: numb
 type RecentProject = {
   name: string;
   path: string;
-  lastOpened: number;
-  lastEdited: number;
+  lastOpenedAt?: number;
+  lastOpened?: number;
+  lastEdited?: number;
   favorite?: boolean;
   thumbnail?: string | null;
+  thumbnailPath?: string | null;
+  thumbnailUpdatedAt?: number;
+  previewUrl?: string | null;
+  technology?: string;
+  missing?: boolean;
 };
+
+function getProjectParentDirectory(projectPath: string): string {
+  if (!projectPath) return "";
+  const norm = projectPath.replace(/[/\\]+$/, "");
+  const lastSlash = Math.max(norm.lastIndexOf("\\"), norm.lastIndexOf("/"));
+  if (lastSlash > 0) {
+    return norm.slice(0, lastSlash);
+  }
+  return norm;
+}
 
 type GitChangedFile = {
   path: string;
@@ -522,36 +563,6 @@ function AgentDecisionCard({ question, onAnswer, onDismiss }: {
 
 
 
-function filterTree(nodes: Node[], query: string): Node[] {
-  const q = query.trim().toLowerCase();
-  if (!q) return nodes;
-
-  const walk = (items: Node[]): Node[] => items.flatMap(node => {
-    const selfMatch = node.name.toLowerCase().includes(q) || node.path.toLowerCase().includes(q);
-    if (node.type !== "directory") return selfMatch ? [node] : [];
-
-    const children = walk(node.children || []);
-    if (selfMatch || children.length) {
-      return [{ ...node, children: children.length ? children : (node.children || []) }];
-    }
-    return [];
-  });
-
-  return walk(nodes);
-}
-
-function TreeNode({ node, onFile }: { node: Node; onFile: (n: Node) => void }) {
-  const [open, setOpen] = React.useState(true);
-  return <div className="tree-node">
-    <button className="tree-row" onClick={() => node.type === "directory" ? setOpen(v => !v) : onFile(node)}>
-      <span className="tree-caret">{node.type === "directory" ? (open ? <ChevronDown size={14}/> : <ChevronRight size={14}/>) : null}</span>
-      <span className="tree-icon">{node.type === "directory" ? (open ? <FolderOpen size={15}/> : <Folder size={15}/>) : <FileCode2 size={15}/>}</span>
-      <span className="tree-name">{node.name}</span>
-    </button>
-    {node.type === "directory" && open && node.children?.map(child => <div className="tree-children" key={child.path}><TreeNode node={child} onFile={onFile} /></div>)}
-  </div>;
-}
-
 function App() {
   // [BLACKSCREEN] DIAGNOSTIC: global error handlers
   React.useEffect(() => {
@@ -597,6 +608,7 @@ function App() {
   const [recentProjects, setRecentProjects] = React.useState<RecentProject[]>([]);
   const [recentProjectsMenuOpen, setRecentProjectsMenuOpen] = React.useState(false);
   const [homeTab, setHomeTab] = React.useState<"all" | "favorites">("all");
+  const [brokenThumbs, setBrokenThumbs] = React.useState<Set<string>>(() => new Set());
   const [sessionId, setSessionId] = React.useState<string | null>(null);
 
   const [projectDisplayName, setProjectDisplayName] = React.useState("Projeto");
@@ -1100,6 +1112,7 @@ function App() {
   const [device, setDevice] = React.useState<"desktop" | "tablet" | "mobile">("desktop");
   const [workspaceTab, setWorkspaceTab] = React.useState<"preview" | "code">("preview");
   const [activeFile, setActiveFile] = React.useState<{ path: string; content: string } | null>(null);
+  const [codeChangedFile, setCodeChangedFile] = React.useState<string | null>(null);
   const [codeSearch, setCodeSearch] = React.useState("");
   const openFile = React.useCallback((node: Node) => {
     if (node.type !== "directory") {
@@ -1234,61 +1247,68 @@ function App() {
 
   const loadRecentProjects = React.useCallback(async () => {
     try {
-      const raw = localStorage.getItem("neko:recentProjects");
-      const arr = raw ? JSON.parse(raw) as Array<{ name: string; path: string; lastOpenedAt?: number }> : [];
-      if (!Array.isArray(arr)) { setRecentProjects([]); return; }
-      const filtered: typeof arr = [];
-      for (const item of arr) {
-        if (!item?.path) continue;
-        const insideApp = await window.neko.isInsideApplicationRoot(item.path).catch(() => false);
-        if (!insideApp) filtered.push(item);
+      const list = await window.neko.getRecentProjects();
+      if (Array.isArray(list) && list.length > 0) {
+        setRecentProjects(list);
+        return;
       }
-      setRecentProjects(filtered);
-    } catch { setRecentProjects([]); }
+      // Migração de registros prévios do localStorage caso o armazenamento central esteja vazio
+      const legacyRaw = localStorage.getItem("nekoai.recentProjects") || localStorage.getItem("neko:recentProjects");
+      if (legacyRaw) {
+        try {
+          const parsed = JSON.parse(legacyRaw);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const migrated = await window.neko.saveRecentProjects(parsed);
+            if (Array.isArray(migrated) && migrated.length > 0) {
+              setRecentProjects(migrated);
+              return;
+            }
+          }
+        } catch {}
+      }
+      setRecentProjects(list || []);
+    } catch {
+      setRecentProjects([]);
+    }
   }, []);
 
-  const touchRecentProject = React.useCallback((path: string, save = true) => {
+  const touchRecentProject = React.useCallback(async (path: string) => {
     if (!path) return;
-    const ts = Date.now();
-    setRecentProjects(prev => {
-      const exists = prev.find(p => p.path === path);
-      let next: Array<{ name: string; path: string; lastOpenedAt?: number }>;
-      if (exists) {
-        next = prev.map(p => p.path === path ? { ...p, lastOpenedAt: ts } : p);
-      } else {
-        const name = path.split(/[/\\]/).pop() ?? path;
-        next = [{ name, path, lastOpenedAt: ts }, ...prev];
-      }
-      if (save) {
-        try { localStorage.setItem("neko:recentProjects", JSON.stringify(next.slice(0, 30))); } catch {}
-      }
-      return next.slice(0, 30);
-    });
+    try {
+      const updated = await window.neko.touchRecentProject(path);
+      if (Array.isArray(updated)) setRecentProjects(updated);
+    } catch {}
   }, []);
 
   const removeRecentProject = React.useCallback(async (path: string) => {
     if (!path) return;
-    setRecentProjects(prev => {
-      const next = prev.filter(p => p.path !== path);
-      try { localStorage.setItem("neko:recentProjects", JSON.stringify(next)); } catch {}
-      return next;
-    });
+    try {
+      const updated = await window.neko.removeRecentProject(path);
+      if (Array.isArray(updated)) setRecentProjects(updated);
+    } catch {}
   }, []);
 
-  const toggleFavoriteProject = React.useCallback((targetPath: string, e?: React.MouseEvent) => {
+  const toggleFavoriteProject = React.useCallback(async (targetPath: string, e?: React.MouseEvent) => {
     if (e) { e.stopPropagation(); e.preventDefault(); }
     if (!targetPath) return;
-    setRecentProjects(prev => {
-      const next = prev.map(p => p.path === targetPath ? { ...p, favorite: !p.favorite } : p);
-      try { localStorage.setItem("nekoai.recentProjects", JSON.stringify(next)); } catch {}
-      try { localStorage.setItem("neko:recentProjects", JSON.stringify(next)); } catch {}
-      return next;
-    });
+    try {
+      const updated = await window.neko.toggleFavoriteProject(targetPath);
+      if (Array.isArray(updated)) setRecentProjects(updated);
+    } catch {}
   }, []);
 
   const openRecentProject = React.useCallback(async (path: string, source = "Home") => {
     console.log("[BLACKSCREEN] openRecentProject:start", { path, source, currentProject: project, isExiting: isExitingRef.current, isSwitching: isSwitchingProjectRef.current });
     if (!path || isSwitchingProjectRef.current) { console.log("[BLACKSCREEN] openRecentProject:early-exit", { noPath: !path, alreadySwitching: isSwitchingProjectRef.current }); return; }
+
+    // Valida se a pasta ainda existe no disco antes de tentar abrir
+    const exists = await window.neko.projectExists(path);
+    if (!exists) {
+      showToast("Pasta não encontrada no disco: " + path);
+      setRecentProjects(prev => prev.map(p => p.path === path ? { ...p, missing: true } : p));
+      return false;
+    }
+
     const insideApp = await window.neko.isInsideApplicationRoot(path).catch(() => false);
     if (insideApp) {
       console.warn("[BLACKSCREEN] openRecentProject:blocked-inside-application-root", { path });
@@ -1303,7 +1323,10 @@ function App() {
     const normalizedTarget = normalizeProjectPath(path);
     if (activeProject && normalizedActive === normalizedTarget) {
       console.log("[BLACKSCREEN] openRecentProject:same-project-reuse", { path, activeProject });
-      return;
+      setModal(null);
+      setProjectMenuOpen(false);
+      setRecentProjectsMenuOpen(false);
+      return true;
     }
     projectLoadKindRef.current = activeProject ? "switch" : "load";
     isSwitchingProjectRef.current = true;
@@ -1314,11 +1337,11 @@ function App() {
       console.log("[BLACKSCREEN] openRecentProject:before-ipc", { path });
       const res = await window.neko.openProject(path, source);
       console.log("[BLACKSCREEN] openRecentProject:ipc-result", { hasResult: !!res, hasError: !!res?.error, resultPath: res?.path, hasSession: !!res?.session, hasTree: !!res?.tree, hasSupabase: !!res?.supabaseState, hasVercel: !!res?.vercelState });
-      if (!res) { console.log("[BLACKSCREEN] openRecentProject:null-result"); return; }
+      if (!res) { console.log("[BLACKSCREEN] openRecentProject:null-result"); return false; }
       if (res.error) {
         console.log("[BLACKSCREEN] openRecentProject:error-result", { error: res.error });
         showToast(res.error || "Erro ao abrir projeto");
-        return;
+        return false;
       }
       console.log("[BLACKSCREEN] openRecentProject:before-set-state", { targetPath: res.path || path, projectBefore: project });
       setProject(res.path || path);
@@ -1326,23 +1349,29 @@ function App() {
       setMessages([]);
       setSessionId(res.session?.id || "");
       setTree(res.tree || []);
+      setActiveFile(null);
+      setCodeChangedFile(null);
       setGithubLinkStatus({ loading: false, linkedRepo: res.gitStatus?.linkedRepo || null, branch: res.gitStatus?.branch || null });
       setSupabaseState(res.supabaseState || null);
       setVercelState(res.vercelState || null);
       setConsoleEntries([]);
       setTerminalLines([]);
       console.log("[BLACKSCREEN] openRecentProject:after-set-state", { newPath: res.path || path });
-      touchRecentProject(res.path || path, true);
-    } catch (err) {
+      setModal(null);
+      setProjectMenuOpen(false);
+      setRecentProjectsMenuOpen(false);
+      return true;
+    } catch (err: any) {
       console.error("[BLACKSCREEN] openRecentProject:runtime-error", err);
-      showToast("Erro ao abrir projeto");
+      showToast(err?.message || "Erro ao abrir projeto");
+      return false;
     } finally {
       isSwitchingProjectRef.current = false;
       isExitingRef.current = false;
       setIsExiting(false);
       console.log("[BLACKSCREEN] openRecentProject:finally");
     }
-  }, [showToast, touchRecentProject, removeRecentProject]);
+  }, [showToast, removeRecentProject]);
 
   const exitProject = React.useCallback(async (source?: string) => {
     console.log("[BLACKSCREEN] exitProject:start", { source, project: projectRef.current, isExiting: isExitingRef.current });
@@ -1356,6 +1385,8 @@ function App() {
     setMessages([]);
     setSessionId("");
     setTree([]);
+    setActiveFile(null);
+    setCodeChangedFile(null);
     setConsoleEntries([]);
     setTerminalLines([]);
     setIsExiting(false);
@@ -1377,20 +1408,22 @@ function App() {
 
   const chooseNewProjectParent = React.useCallback(async () => {
     try {
-      const chosen = await window.neko.chooseProject();
+      const chosen = await window.neko.chooseProject({ defaultPath: newProjectParent || undefined });
       if (chosen) setNewProjectParent(chosen);
     } catch {}
-  }, []);
+  }, [newProjectParent]);
 
   const confirmCreateProject = React.useCallback(async () => {
     if (!newProjectParent.trim() || !newProjectName.trim()) return;
     try {
       const sep = newProjectParent.includes("\\") ? "\\" : "/";
       const fullPath = `${newProjectParent}${sep}${newProjectName.trim()}`;
-      await window.neko.createProject(fullPath);
-      void openRecentProject(fullPath, "NewProject");
-      setNewProjectName("");
-      setNewProjectParent("");
+      const success = await openRecentProject(fullPath, "NewProject");
+      if (success) {
+        setModal(null);
+        setNewProjectName("");
+        setNewProjectParent("");
+      }
     } catch (err) {
       console.error("[App] confirmCreateProject error:", err);
       showToast("Erro ao criar projeto");
@@ -1401,6 +1434,101 @@ function App() {
     setProjectMenuOpen(v => !v);
     setRecentProjectsMenuOpen(false);
   }, []);
+
+  const renderProjectCard = React.useCallback((item: RecentProject, source = "Home") => {
+    const parentDir = getProjectParentDirectory(item.path);
+    const hasValidThumb = Boolean(item.thumbnail) && !brokenThumbs.has(item.path);
+    return (
+      <div
+        key={item.path}
+        className={`home-project-card ${item.missing ? "missing-project" : ""}`}
+        onClick={() => {
+          if (item.missing) {
+            showToast("Esta pasta não existe mais no computador.");
+            return;
+          }
+          void openRecentProject(item.path, source);
+        }}
+        role="button"
+        tabIndex={0}
+        onKeyDown={e => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            if (item.missing) {
+              showToast("Esta pasta não existe mais no computador.");
+              return;
+            }
+            void openRecentProject(item.path, source);
+          }
+        }}
+      >
+        <div className="home-project-preview-box">
+          {hasValidThumb ? (
+            <img
+              className="home-project-real-thumb"
+              src={item.thumbnail!}
+              alt={`Preview de ${item.name}`}
+              onError={() => setBrokenThumbs(prev => new Set(prev).add(item.path))}
+            />
+          ) : (
+            <div className="home-project-fallback-thumb">
+              <div className="fallback-glow" />
+              <div className="fallback-content">
+                <div className="fallback-icon-wrap">
+                  <Code2 size={24} />
+                </div>
+                <span className="fallback-title">{item.name}</span>
+                <span className={`fallback-badge ${item.missing ? "missing-badge" : ""}`}>
+                  {item.missing ? "Pasta não encontrada" : (item.technology || "Projeto")}
+                </span>
+              </div>
+            </div>
+          )}
+          <button
+            className={`home-project-fav-btn ${item.favorite ? "favorited" : ""}`}
+            onClick={e => toggleFavoriteProject(item.path, e)}
+            title={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
+            aria-label={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
+          >
+            <Star size={14} fill={item.favorite ? "#a855f7" : "none"} />
+          </button>
+        </div>
+        <div className="home-project-footer">
+          <div className="home-project-info">
+            <span className="home-project-name" title={item.name}>{item.name}</span>
+            {parentDir ? <span className="home-project-parent" title={item.path}>{parentDir}</span> : null}
+            <small className="home-project-time">{formatProjectActivity(item)}</small>
+          </div>
+          {item.missing ? (
+            <button
+              className="home-project-remove-btn"
+              onClick={e => {
+                e.stopPropagation();
+                void removeRecentProject(item.path);
+              }}
+              title="Remover do histórico"
+              aria-label={`Remover projeto ${item.name} do histórico`}
+            >
+              <Trash2 size={13} />
+              <span>Remover</span>
+            </button>
+          ) : (
+            <button
+              className="home-project-open-btn"
+              onClick={e => {
+                e.stopPropagation();
+                void openRecentProject(item.path, source);
+              }}
+              aria-label={`Abrir projeto ${item.name}`}
+            >
+              <FolderOpen size={14} />
+              <span>Abrir Projeto</span>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }, [openRecentProject, removeRecentProject, showToast, toggleFavoriteProject, brokenThumbs]);
 
   const appendTerminalLine = React.useCallback((kind: "log" | "console" | "error", text: unknown, source = "Neko") => {
     const raw = String(text ?? "").trim();
@@ -1699,6 +1827,88 @@ function App() {
   const [homeView, setHomeView] = React.useState<"home" | "allProjects">("home");
   const [projectSearchQuery, setProjectSearchQuery] = React.useState("");
 
+  // Sistema de Autocomplete inteligente (/ comandos e @ contextos)
+  const [autocompleteTrigger, setAutocompleteTrigger] = React.useState<TriggerMatch | null>(null);
+  const [autocompleteMode, setAutocompleteMode] = React.useState<AutocompleteMode | null>(null);
+  const [autocompleteQuery, setAutocompleteQuery] = React.useState<string>("");
+  const [autocompleteSelectedIndex, setAutocompleteSelectedIndex] = React.useState<number>(0);
+
+  const projectItems = React.useMemo(() => extractProjectItems(tree), [tree]);
+
+  const autocompleteItems = React.useMemo(() => {
+    if (!autocompleteMode) return [];
+    if (autocompleteMode === "commands") {
+      return filterCommands(autocompleteQuery);
+    }
+    if (autocompleteMode === "contexts") {
+      return filterContexts(autocompleteQuery);
+    }
+    if (autocompleteMode === "files") {
+      return filterProjectItems(projectItems.files, autocompleteQuery);
+    }
+    if (autocompleteMode === "folders") {
+      return filterProjectItems(projectItems.folders, autocompleteQuery);
+    }
+    return [];
+  }, [autocompleteMode, autocompleteQuery, projectItems]);
+
+  const handleAutocompleteSelect = React.useCallback((item: ChatCommand | ChatContext | ProjectItem) => {
+    if (!composerRef.current) return;
+    const textarea = composerRef.current;
+    const currentText = textarea.value;
+    const cursor = textarea.selectionStart ?? currentText.length;
+
+    // Se selecionou @file ou @folder, transiciona o menu para arquivos ou pastas do projeto
+    if ("isPicker" in item && item.isPicker) {
+      if (item.pickerType === "file") {
+        setAutocompleteMode("files");
+        setAutocompleteQuery("");
+        setAutocompleteSelectedIndex(0);
+        textarea.focus();
+        return;
+      }
+      if (item.pickerType === "folder") {
+        setAutocompleteMode("folders");
+        setAutocompleteQuery("");
+        setAutocompleteSelectedIndex(0);
+        textarea.focus();
+        return;
+      }
+    }
+
+    const trigger = autocompleteTrigger || detectAutocompleteTrigger(currentText, cursor);
+    if (!trigger) {
+      setAutocompleteMode(null);
+      setAutocompleteTrigger(null);
+      return;
+    }
+
+    let insertionText = "";
+    if ("command" in item) {
+      insertionText = item.command;
+    } else if ("context" in item) {
+      insertionText = item.context;
+    } else if ("path" in item) {
+      insertionText = `@${item.path}`;
+    }
+
+    if (!insertionText) return;
+
+    const { newText, newCursor } = applyAutocompleteSelection(currentText, trigger, insertionText);
+    setInput(newText);
+    setAutocompleteMode(null);
+    setAutocompleteTrigger(null);
+    setAutocompleteQuery("");
+    setAutocompleteSelectedIndex(0);
+
+    requestAnimationFrame(() => {
+      if (composerRef.current) {
+        composerRef.current.focus();
+        composerRef.current.setSelectionRange(newCursor, newCursor);
+      }
+    });
+  }, [autocompleteTrigger]);
+
   const filteredSlashCommands = React.useMemo(() => {
     const q = input.startsWith("/") ? input.slice(1).toLowerCase() : "";
     return q ? slashCommands.filter(c => (c.name || "").toLowerCase().includes(q)) : slashCommands;
@@ -1707,55 +1917,14 @@ function App() {
   const filteredContextResults = contextResults;
 
   React.useEffect(() => {
-    let alive = true;
-    const loadRecentProjects = async () => {
-      try {
-        const raw = localStorage.getItem("nekoai.recentProjects");
-        const parsed = raw ? JSON.parse(raw) : [];
-        if (!Array.isArray(parsed)) return;
-        const candidates = parsed
-          .filter((item: any) => item && typeof item.path === "string" && typeof item.name === "string")
-          .slice(0, 50);
-
-        const checks = await Promise.all(candidates.map(async item => {
-          const insideApp = await window.neko.isInsideApplicationRoot(item.path).catch(() => false);
-          if (insideApp) return { item, exists: false };
-          const exists = await window.neko.projectExists(item.path);
-          let thumbnail: string | null = null;
-          let lastEdited = Number(item.lastEdited || item.lastOpened || Date.now());
-          if (exists) {
-            try {
-              thumbnail = await window.neko.getThumbnail(item.path);
-              if (!item.lastEdited) {
-                lastEdited = await window.neko.getLastEdited(item.path);
-              }
-            } catch {}
-          }
-          return {
-            item: {
-              ...item,
-              lastEdited,
-              lastOpened: Number(item.lastOpened || lastEdited),
-              favorite: Boolean(item.favorite),
-              thumbnail
-            },
-            exists
-          };
-        }));
-        const valid = checks
-          .filter(entry => entry.exists)
-          .map(entry => entry.item)
-          .sort((a, b) => b.lastEdited - a.lastEdited)
-          .slice(0, 50);
-
-        if (!alive) return;
-        setRecentProjects(valid);
-        try { localStorage.setItem("nekoai.recentProjects", JSON.stringify(valid)); } catch {}
-      } catch {}
-    };
     void loadRecentProjects();
-    return () => { alive = false; };
-  }, []);
+    const unsub = window.neko.onRecentProjectsUpdated?.((updated: RecentProject[]) => {
+      if (Array.isArray(updated)) {
+        setRecentProjects(updated);
+      }
+    });
+    return () => { unsub?.(); };
+  }, [loadRecentProjects]);
 
   React.useEffect(() => {
     if (!project) return;
@@ -2609,6 +2778,7 @@ function App() {
           if (isTaskRunning()) setWorkingStatus(`Criando/editando ${displayPath(filePath)}...`);
           upsertActivity({ id: `file:${displayPath(filePath)}`, icon: "file", title: "Arquivo atualizado", detail: displayPath(filePath), state: "done" });
           window.neko.tree().then(setTree).catch(() => {});
+          setCodeChangedFile(displayPath(filePath));
           if (activeFile?.path === displayPath(filePath)) {
             window.neko.readFile(activeFile.path).then(setActiveFile).catch(() => {});
           }
@@ -2764,6 +2934,7 @@ function App() {
         if (isTaskRunning()) setWorkingStatus(`Criando/editando ${displayPath(file)}...`);
         upsertActivity({ id: `file:${displayPath(file)}`, icon: "file", title: "Arquivo atualizado", detail: displayPath(file), state: "done" });
         window.neko.tree().then(setTree).catch(() => {});
+        setCodeChangedFile(displayPath(file));
         if (activeFile?.path === displayPath(file)) {
           window.neko.readFile(activeFile.path).then(setActiveFile).catch(() => {});
         }
@@ -3281,13 +3452,30 @@ function App() {
 
     handledQuestionIdsRef.current.clear();
 
-    // Slash commands
-    if (text.startsWith("/")) {
+    // Context resolution via central resolver:
+    const resolverState: ResolverContextState = {
+      projectRoot: project,
+      projectName: project ? project.split(/[/\\]/).pop() : undefined,
+      previewUrl,
+      previewStatus,
+      previewFramework,
+      previewMessage,
+      tree,
+      gitStatus: githubLinkStatus,
+      terminalLines,
+      consoleEntries
+    };
+    const resolved = resolveChatMessage(text, resolverState);
+
+    // Se for comando puro do OpenCode que não pertence aos 6 comandos nativos da Neko nem contém contextos semânticos
+    if (text.startsWith("/") && !resolved.command && !resolved.semanticContexts.length && !resolved.filePaths.length) {
       const parts = text.split(/\s+/);
       const cmd = parts[0].slice(1);
       const args = parts.slice(1).join(" ");
       setInput("");
       setShowSlashMenu(false);
+      setAutocompleteMode(null);
+      setAutocompleteTrigger(null);
       requestInFlightRef.current = true;
       requestObservedBusyRef.current = false;
       currentTaskIdRef.current = null;
@@ -3319,28 +3507,25 @@ function App() {
       name: a.name
     }));
 
-    // Collect @-context file paths from the message text
-    const contextPaths: string[] = [];
-    const contextRegex = /@([^\s@]+)/g;
-    let contextMatch;
-    while ((contextMatch = contextRegex.exec(text)) !== null) {
-      contextPaths.push(contextMatch[1]);
-    }
+    // Arquivos físicos referenciados com @ (ex: @src/App.tsx)
+    const contextPaths: string[] = [...resolved.filePaths];
 
     // Reset editing state
     setEditingMessageIndex(null);
 
-    // Add user message
-    const userMessage: Message = { role: "user", text, attachments: attachments.length > 0 ? [...attachments] : undefined, createdAt: Date.now() };
+    // Adiciona mensagem do usuário no histórico mantendo o texto original limpo
+    const userMessage: Message = { role: "user", text: resolved.userDisplayText, attachments: attachments.length > 0 ? [...attachments] : undefined, createdAt: Date.now() };
     setMessages(prev => [...prev, userMessage]);
     const userIndex = messages.length;
 
-    // Clear input
+    // Clear input e menus
     setInput("");
     setAttachments([]);
     setUploadErrors([]);
     setShowSlashMenu(false);
     setShowContextMenu(false);
+    setAutocompleteMode(null);
+    setAutocompleteTrigger(null);
 
     // Set up task lifecycle
     requestStartedAtRef.current = Date.now();
@@ -3361,7 +3546,7 @@ function App() {
     try {
       const result = await window.neko.prompt(
         sessionId,
-        text,
+        resolved.agentPromptText,
         getEffectiveModel(selectedModel),
         promptAttachments.length > 0 ? promptAttachments : undefined,
         contextPaths.length > 0 ? contextPaths : undefined,
@@ -3382,7 +3567,7 @@ function App() {
       setWorkingStatus("");
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
     }
-  }, [sessionId, input, attachments, selectedModel, planMode, effort, messages.length, getEffectiveModel, sanitizeUserFacingText, upsertActivity]);
+  }, [sessionId, input, attachments, selectedModel, planMode, effort, messages.length, getEffectiveModel, sanitizeUserFacingText, upsertActivity, project, previewUrl, previewStatus, previewFramework, previewMessage, tree, githubLinkStatus, terminalLines, consoleEntries]);
 
   const stopDevelopment = React.useCallback(async () => {
     if (!sessionId) return;
@@ -4197,7 +4382,7 @@ function App() {
                       key={item.path}
                       className="recent-project-item"
                       disabled={isSwitchingProject}
-                      onClick={() => void openRecentProject(item.path, "RecentProjects")}
+                      onClick={() => { setProjectMenuOpen(false); setRecentProjectsMenuOpen(false); void openRecentProject(item.path, "RecentProjects"); }}
                     >
                       <Folder size={14}/>
                       <span><b>{item.name}</b><small>{item.path}</small></span>
@@ -4223,7 +4408,7 @@ function App() {
                     key={item.path}
                     className="recent-project-item"
                     disabled={isSwitchingProject}
-                    onClick={() => void openRecentProject(item.path, "RecentProjects")}
+                    onClick={() => { setProjectMenuOpen(false); setRecentProjectsMenuOpen(false); void openRecentProject(item.path, "RecentProjects"); }}
                   >
                     <Folder size={14}/>
                     <span><b>{item.name}</b><small>{item.path}</small></span>
@@ -4442,13 +4627,119 @@ function App() {
 
           <div className="composer-wrap">
               <div className="composer">
-                <textarea ref={composerRef} value={input} onChange={async e => { const value=e.target.value; setInput(value); setShowSlashMenu(value.startsWith("/") && !value.includes(" ")); const match=value.match(/(?:^|\s)@([^\s]*)$/); setShowContextMenu(Boolean(match)); if(match) setContextResults(await window.neko.searchProject(match[1] || "")); }} onPaste={handlePaste} onDragOver={e => { e.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={async e => { e.preventDefault(); setDragOver(false); const paths=Array.from(e.dataTransfer.files).map((f:any)=>f.path).filter(Boolean); if(paths.length){ try { addAttachmentResult(await window.neko.attachmentsFromPaths(paths)); } catch(error){ setUploadErrors(prev=>[...prev,{id:`drop:${Date.now()}`,name:"Arquivo",message:String(error),extension:"FILE"}].slice(-6)); } } }} onKeyDown={e => {
-                  if (e.key === "Escape") { setShowSlashMenu(false); setShowContextMenu(false); setChatModeMenuOpen(false); }
-                  if (e.key === "Tab" && !e.shiftKey) { e.preventDefault(); toggleChatModeViaTab(); return; }
-                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
-                }} placeholder={sessionId ? "Pergunte qualquer coisa, / para comandos, @ para contexto..." : "Crie um projeto para começar..."} disabled={!sessionId || busy} className={dragOver ? "drag-over" : ""}/>
-                {showSlashMenu && filteredSlashCommands.length > 0 && <div className="composer-menu">{filteredSlashCommands.map(cmd => <button key={String(cmd.name)} onMouseDown={e=>e.preventDefault()} onClick={() => { setInput(`/${cmd.name} `); setShowSlashMenu(false); composerRef.current?.focus(); }}><span className="command-icon"><SquareTerminal size={14}/></span><span><b>/{cmd.name}</b><small>{cmd.description || "Comando do Neko"}</small></span></button>)}</div>}
-                {showContextMenu && filteredContextResults.length > 0 && <div className="composer-menu context-menu">{filteredContextResults.map(p => <button key={p} onMouseDown={e=>e.preventDefault()} onClick={() => { setInput(prev => prev.replace(/@[^\s]*$/, `@${p} `)); setShowContextMenu(false); composerRef.current?.focus(); }}><span className="command-icon"><AtSign size={14}/></span><span><b>{p}</b><small>Adicionar arquivo ao contexto</small></span></button>)}</div>}
+                <textarea
+                  ref={composerRef}
+                  value={input}
+                  onChange={e => {
+                    const value = e.target.value;
+                    const cursor = e.target.selectionStart ?? value.length;
+                    setInput(value);
+
+                    const trigger = detectAutocompleteTrigger(value, cursor);
+                    if (trigger) {
+                      setAutocompleteTrigger(trigger);
+                      if (autocompleteMode === "files" && trigger.mode === "contexts") {
+                        setAutocompleteQuery(trigger.query);
+                        setAutocompleteSelectedIndex(0);
+                      } else if (autocompleteMode === "folders" && trigger.mode === "contexts") {
+                        setAutocompleteQuery(trigger.query);
+                        setAutocompleteSelectedIndex(0);
+                      } else {
+                        setAutocompleteMode(trigger.mode);
+                        setAutocompleteQuery(trigger.query);
+                        setAutocompleteSelectedIndex(0);
+                      }
+                    } else {
+                      setAutocompleteTrigger(null);
+                      setAutocompleteMode(null);
+                      setAutocompleteQuery("");
+                      setAutocompleteSelectedIndex(0);
+                    }
+                  }}
+                  onPaste={handlePaste}
+                  onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={async e => {
+                    e.preventDefault();
+                    setDragOver(false);
+                    const paths = Array.from(e.dataTransfer.files).map((f: any) => f.path).filter(Boolean);
+                    if (paths.length) {
+                      try {
+                        addAttachmentResult(await window.neko.attachmentsFromPaths(paths));
+                      } catch (error) {
+                        setUploadErrors(prev => [...prev, { id: `drop:${Date.now()}`, name: "Arquivo", message: String(error), extension: "FILE" }].slice(-6));
+                      }
+                    }
+                  }}
+                  onKeyDown={e => {
+                    if (autocompleteMode && autocompleteItems.length > 0) {
+                      if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        setAutocompleteSelectedIndex(prev => (prev + 1) % autocompleteItems.length);
+                        return;
+                      }
+                      if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        setAutocompleteSelectedIndex(prev => (prev - 1 + autocompleteItems.length) % autocompleteItems.length);
+                        return;
+                      }
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        const selected = autocompleteItems[autocompleteSelectedIndex] || autocompleteItems[0];
+                        if (selected) {
+                          handleAutocompleteSelect(selected);
+                        }
+                        return;
+                      }
+                      if (e.key === "Escape") {
+                        e.preventDefault();
+                        if (autocompleteMode === "files" || autocompleteMode === "folders") {
+                          setAutocompleteMode("contexts");
+                          setAutocompleteQuery("");
+                          setAutocompleteSelectedIndex(0);
+                        } else {
+                          setAutocompleteMode(null);
+                          setAutocompleteTrigger(null);
+                        }
+                        return;
+                      }
+                    }
+
+                    if (e.key === "Escape") {
+                      setAutocompleteMode(null);
+                      setAutocompleteTrigger(null);
+                      setShowSlashMenu(false);
+                      setShowContextMenu(false);
+                      setChatModeMenuOpen(false);
+                    }
+                    if (e.key === "Tab" && !e.shiftKey) {
+                      e.preventDefault();
+                      toggleChatModeViaTab();
+                      return;
+                    }
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void send();
+                    }
+                  }}
+                  placeholder={sessionId ? "Pergunte qualquer coisa, / para comandos, @ para contexto..." : "Crie um projeto para começar..."}
+                  disabled={!sessionId || busy}
+                  className={dragOver ? "drag-over" : ""}
+                />
+                {autocompleteMode && autocompleteItems.length > 0 && (
+                  <AutocompleteMenu
+                    mode={autocompleteMode}
+                    items={autocompleteItems}
+                    selectedIndex={autocompleteSelectedIndex}
+                    onSelect={handleAutocompleteSelect}
+                    onHoverIndex={setAutocompleteSelectedIndex}
+                    onBack={(autocompleteMode === "files" || autocompleteMode === "folders") ? () => {
+                      setAutocompleteMode("contexts");
+                      setAutocompleteQuery("");
+                      setAutocompleteSelectedIndex(0);
+                    } : undefined}
+                  />
+                )}
                 {(attachments.length>0||uploadErrors.length>0)&&<div className="attachment-strip">{attachments.map((a,i)=>(a.kind==="image"&&a.previewUrl?
                   <div className="attachment-preview-card image-thumb" key={`${a.path}:${i}`}>
                     <button type="button" className="image-thumb-btn" onClick={()=>setLightboxImage({url:a.previewUrl!,name:a.name})} title={`Visualizar ${a.name}`} aria-label={`Visualizar ${a.name}`}><img src={a.previewUrl} alt={a.name}/></button>
@@ -4508,7 +4799,7 @@ function App() {
 
           <section className="workspace">
             <div className="workspace-toolbar"><div className="workspace-toolbar-left"><div className="workspace-tabs"><button className="collapse-chat-btn" onClick={()=>setChatCollapsed(v=>!v)} aria-label={chatCollapsed?"Abrir chat":"Fechar chat"}>{chatCollapsed?<PanelLeftOpen size={15}/>:<PanelLeftClose size={15}/>}</button><button className={workspaceTab === "preview" ? "active" : ""} onClick={() => setWorkspaceTab("preview")}><Eye size={15}/> Preview</button><button className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}><Code2 size={15}/> Código</button>{previewFramework ? <span className="workspace-framework">{previewFramework}</span> : null}</div></div><div className="workspace-toolbar-center">{renderPreviewRouteSelector()}</div><div className="workspace-tools">{workspaceTab === "preview" && <><button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")}><Monitor size={14}/></button><button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")}><Tablet size={14}/></button><button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")}><Smartphone size={14}/></button></>}<button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={15}/></button><button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; console.log("[Neko/PreviewExternal] click", `url=${String(previewUrl)}`); void window.neko.openPreviewExternal(previewUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={15}/></button></div></div>
-            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewUrl}</span></div>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : <iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview (fallback)" className={previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"} src={previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview de fallback", "Preview"); setPreviewFrameReady(true); }}/>}</div> : <div className="preview-empty"><div className="preview-icon"><Globe2 size={26}/></div><strong>{previewStatus === "error" ? "Não foi possível iniciar o preview" : previewStatus === "starting" ? "Iniciando servidor..." : previewStatus === "installing" ? "Instalando dependências..." : "Seu app aparecerá aqui"}</strong><span>{previewMessage || "Crie ou abra um projeto com um script dev para iniciar o preview."}</span>{previewStatus === "error" && <button className="preview-retry" onClick={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })}><RefreshCw size={15}/> Tentar novamente</button>}</div>}</div> : <div className="code-workspace"><aside className="code-tree"><div className="code-title"><FileCode2 size={15}/> ARQUIVOS</div><div className="code-search"><Search size={14}/><input value={codeSearch} onChange={e => setCodeSearch(e.target.value)} placeholder="Buscar arquivos" spellCheck={false} autoComplete="off" autoCorrect="off" autoCapitalize="off"/></div>{filterTree(tree, codeSearch).map(n => <TreeNode key={n.path} node={n} onFile={openFile}/>)}{codeSearch.trim() && filterTree(tree, codeSearch).length === 0 && <div className="code-search-empty">Nenhum arquivo encontrado.</div>}</aside><div className="editor">{activeFile ? <><div className="editor-head"><span>{activeFile.path}</span></div><pre><code>{activeFile.content}</code></pre></> : <div className="editor-empty">Selecione um arquivo para visualizar o código.</div>}</div></div>}</div>
+            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewUrl}</span></div>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : <iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview (fallback)" className={previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"} src={previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview de fallback", "Preview"); setPreviewFrameReady(true); }}/>}</div> : <div className="preview-empty"><div className="preview-icon"><Globe2 size={26}/></div><strong>{previewStatus === "error" ? "Não foi possível iniciar o preview" : previewStatus === "starting" ? "Iniciando servidor..." : previewStatus === "installing" ? "Instalando dependências..." : "Seu app aparecerá aqui"}</strong><span>{previewMessage || "Crie ou abra um projeto com um script dev para iniciar o preview."}</span>{previewStatus === "error" && <button className="preview-retry" onClick={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })}><RefreshCw size={15}/> Tentar novamente</button>}</div>}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
             <div className={`terminal-panel ${terminalOpen ? "open" : "closed"}`}>
               <div className="terminal-head"><div className="terminal-tabs"><button className={terminalTab === "logs" ? "active" : ""} onClick={() => { setTerminalTab("logs"); setTerminalOpen(true); }}>Logs</button><button className={terminalTab === "console" ? "active" : ""} onClick={() => { setTerminalTab("console"); setTerminalOpen(true); }}>Console</button><button className={terminalTab === "errors" ? "active" : ""} onClick={() => { setTerminalTab("errors"); setTerminalOpen(true); }}>Erros</button></div><button className="terminal-collapse" onClick={() => setTerminalOpen(v => !v)}>{terminalOpen ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}</button></div>
               {terminalOpen && (terminalTab === "console" ? (
@@ -4549,135 +4840,171 @@ function App() {
           {console.log("[BLACKSCREEN] home-render", { project, status, isLicensed: licenseState.isLicensed })}
           <main className="home-screen">
           <div className="home-content-container">
-            <div className="home-hero">
-              <div className="home-brand-logo-wrap">
-                <img className="home-brand-logo" src={nekoLogo} alt="NekoAI Logo" />
-              </div>
-              <h1 className="home-hero-title">O que iremos construir juntos?</h1>
-              <p className="home-hero-subtitle">
-                Comece um projeto ou abra um existente, nós cuidamos de tudo,<br />
-                as tecnologias, dependências e servidor
-              </p>
-              <div className="home-hero-actions">
-                <button className="home-btn home-btn-primary" onClick={() => void createProject()}>
-                  <FolderPlus size={17} />
-                  <span>Criar novo projeto</span>
-                </button>
-                <button className="home-btn home-btn-secondary" onClick={() => void openOtherProject()}>
-                  <Folder size={17} />
-                  <span>Abrir projeto existente</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="home-divider-wrap">
-              <div className="home-tabs-nav">
-                <div className="home-tabs-left">
-                  <button
-                    className={`home-tab-btn ${homeTab === "all" ? "active" : ""}`}
-                    onClick={() => setHomeTab("all")}
-                  >
-                    Meus projetos
+            {homeView === "allProjects" ? (
+              <div className="projects-page">
+                <div className="breadcrumb-bar">
+                  <button className="breadcrumb-home-btn" onClick={() => setHomeView("home")}>
+                    <HomeIcon size={14} />
+                    <span>Home</span>
                   </button>
-                  <button
-                    className={`home-tab-btn ${homeTab === "favorites" ? "active" : ""}`}
-                    onClick={() => setHomeTab("favorites")}
-                  >
-                    Favoritos
-                  </button>
+                  <span className="breadcrumb-sep">&gt;</span>
+                  <span className="breadcrumb-active">Meus Projetos</span>
                 </div>
-                <button className="home-view-all-link" onClick={() => { setHomeView("allProjects"); setProjectSearchQuery(""); }}>
-                  <span>Ver todos</span>
-                  <ArrowRight size={14} />
-                </button>
-              </div>
-            </div>
 
-            <div className="home-projects-area">
-              {(() => {
-                const candidates = homeTab === "favorites"
-                  ? recentProjects.filter(p => p.favorite)
-                  : recentProjects;
-                // Strict limit: maximum 8 projects on Home sorted by lastEdited DESC
-                const displayProjects = candidates.slice(0, 8);
+                <div className="projects-search-wrap">
+                  <Search size={16} className="projects-search-icon" />
+                  <input
+                    type="text"
+                    className="projects-search-input"
+                    placeholder="Pesquise por seus projetos..."
+                    value={projectSearchQuery}
+                    onChange={e => setProjectSearchQuery(e.target.value)}
+                  />
+                  {projectSearchQuery && (
+                    <button
+                      className="projects-search-clear"
+                      onClick={() => setProjectSearchQuery("")}
+                      title="Limpar busca"
+                    >
+                      <X size={12} />
+                    </button>
+                  )}
+                </div>
 
-                if (displayProjects.length === 0) {
-                  return (
-                    <div className="home-empty-projects">
-                      <Sparkles size={28} className="home-empty-icon" />
-                      <h3>{homeTab === "favorites" ? "Nenhum projeto favoritado" : "Nenhum projeto recente"}</h3>
-                      <p>
-                        {homeTab === "favorites"
-                          ? "Clique na estrela de qualquer projeto para adicioná-lo aos favoritos."
-                          : "Crie um novo projeto ou abra uma pasta existente para começar."}
-                      </p>
-                    </div>
-                  );
-                }
-
-                return (
-                  <div className="home-projects-grid">
-                    {displayProjects.map(item => (
-                      <div
-                        key={item.path}
-                        className="home-project-card"
-                        onClick={() => void openRecentProject(item.path, "Home")}
-                        role="button"
-                        tabIndex={0}
-                        onKeyDown={e => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            void openRecentProject(item.path, "Home");
-                          }
-                        }}
+                <div className="home-divider-wrap" style={{ marginTop: 0 }}>
+                  <div className="home-tabs-nav">
+                    <div className="home-tabs-left">
+                      <button
+                        className={`home-tab-btn ${homeTab === "all" ? "active" : ""}`}
+                        onClick={() => setHomeTab("all")}
                       >
-                        <div className="home-project-preview-box">
-                          {item.thumbnail ? (
-                            <img className="home-project-real-thumb" src={item.thumbnail} alt={`Preview de ${item.name}`} />
-                          ) : (
-                            <div className="home-project-fallback-thumb">
-                              <div className="fallback-glow" />
-                              <div className="fallback-content">
-                                <div className="fallback-icon-wrap">
-                                  <Code2 size={24} />
-                                </div>
-                                <span className="fallback-title">{item.name}</span>
-                                <span className="fallback-badge">Projeto NekoAI</span>
-                              </div>
-                            </div>
-                          )}
-                          <button
-                            className={`home-project-fav-btn ${item.favorite ? "favorited" : ""}`}
-                            onClick={e => toggleFavoriteProject(item.path, e)}
-                            title={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
-                            aria-label={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
-                          >
-                            <Star size={14} fill={item.favorite ? "#a855f7" : "none"} />
-                          </button>
-                        </div>
-                        <div className="home-project-footer">
-                          <div className="home-project-info">
-                            <span className="home-project-name" title={item.name}>{item.name}</span>
-                            <small className="home-project-time">{formatTimeAgo(item.lastEdited || item.lastOpened)}</small>
-                          </div>
-                          <button
-                            className="home-project-open-btn"
-                            onClick={e => {
-                              e.stopPropagation();
-                              void openRecentProject(item.path, "Home");
-                            }}
-                            aria-label={`Abrir projeto ${item.name}`}
-                          >
-                            <FolderOpen size={14} />
-                            <span>Abrir Projeto</span>
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                        Meus projetos ({recentProjects.length})
+                      </button>
+                      <button
+                        className={`home-tab-btn ${homeTab === "favorites" ? "active" : ""}`}
+                        onClick={() => setHomeTab("favorites")}
+                      >
+                        Favoritos ({recentProjects.filter(p => p.favorite).length})
+                      </button>
+                    </div>
                   </div>
-                );
-              })()}
-            </div>
+                </div>
+
+                <div className="home-projects-area">
+                  {(() => {
+                    const query = projectSearchQuery.trim().toLowerCase();
+                    const filteredByTab = homeTab === "favorites"
+                      ? recentProjects.filter(p => p.favorite)
+                      : recentProjects;
+                    const displayProjects = query
+                      ? filteredByTab.filter(p =>
+                          (p.name && p.name.toLowerCase().includes(query)) ||
+                          (p.path && p.path.toLowerCase().includes(query)) ||
+                          (p.technology && p.technology.toLowerCase().includes(query))
+                        )
+                      : filteredByTab;
+
+                    if (displayProjects.length === 0) {
+                      return (
+                        <div className="home-empty-projects">
+                          <Sparkles size={28} className="home-empty-icon" />
+                          <h3>{query ? "Nenhum projeto encontrado" : homeTab === "favorites" ? "Nenhum projeto favoritado" : "Nenhum projeto recente"}</h3>
+                          <p>
+                            {query
+                              ? "Tente buscar por outro termo ou nome de pasta."
+                              : homeTab === "favorites"
+                              ? "Clique na estrela de qualquer projeto para adicioná-lo aos favoritos."
+                              : "Crie um novo projeto ou abra uma pasta existente para começar."}
+                          </p>
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div className="home-projects-grid">
+                        {displayProjects.map(item => renderProjectCard(item, "AllProjects"))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="home-hero">
+                  <div className="home-brand-logo-wrap">
+                    <img className="home-brand-logo" src={nekoLogo} alt="NekoAI Logo" />
+                  </div>
+                  <h1 className="home-hero-title">O que iremos construir juntos?</h1>
+                  <p className="home-hero-subtitle">
+                    Comece um projeto ou abra um existente, nós cuidamos de tudo,<br />
+                    as tecnologias, dependências e servidor
+                  </p>
+                  <div className="home-hero-actions">
+                    <button className="home-btn home-btn-primary" onClick={() => void createProject()}>
+                      <FolderPlus size={17} />
+                      <span>Criar novo projeto</span>
+                    </button>
+                    <button className="home-btn home-btn-secondary" onClick={() => void openOtherProject()}>
+                      <Folder size={17} />
+                      <span>Abrir projeto existente</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="home-divider-wrap">
+                  <div className="home-tabs-nav">
+                    <div className="home-tabs-left">
+                      <button
+                        className={`home-tab-btn ${homeTab === "all" ? "active" : ""}`}
+                        onClick={() => setHomeTab("all")}
+                      >
+                        Meus projetos
+                      </button>
+                      <button
+                        className={`home-tab-btn ${homeTab === "favorites" ? "active" : ""}`}
+                        onClick={() => setHomeTab("favorites")}
+                      >
+                        Favoritos
+                      </button>
+                    </div>
+                    <button className="home-view-all-link" onClick={() => { setHomeView("allProjects"); setProjectSearchQuery(""); }}>
+                      <span>Ver todos</span>
+                      <ArrowRight size={14} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="home-projects-area">
+                  {(() => {
+                    const candidates = homeTab === "favorites"
+                      ? recentProjects.filter(p => p.favorite)
+                      : recentProjects;
+                    // Limite na Home: máximo 8 projetos ordenados por último acesso descrescente
+                    const displayProjects = candidates.slice(0, 8);
+
+                    if (displayProjects.length === 0) {
+                      return (
+                        <div className="home-empty-projects">
+                          <Sparkles size={28} className="home-empty-icon" />
+                          <h3>{homeTab === "favorites" ? "Nenhum projeto favoritado" : "Nenhum projeto recente"}</h3>
+                          <p>
+                            {homeTab === "favorites"
+                              ? "Clique na estrela de qualquer projeto para adicioná-lo aos favoritos."
+                              : "Crie um novo projeto ou abra uma pasta existente para começar."}
+                          </p>
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div className="home-projects-grid">
+                        {displayProjects.map(item => renderProjectCard(item, "Home"))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              </>
+            )}
           </div>
         </main>
         </>

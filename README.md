@@ -352,7 +352,7 @@ O NekoAI está em desenvolvimento contínuo.
 
 Novos recursos, melhorias de estabilidade, integrações e ferramentas de desenvolvimento são adicionados constantemente.
 
-Versão atual: **0.4.81**
+Versão atual: **0.4.82**
 
 ---
 
