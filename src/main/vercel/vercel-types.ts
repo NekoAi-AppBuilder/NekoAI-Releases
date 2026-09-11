@@ -29,6 +29,7 @@ export interface VercelProjectDeployment {
   projectPath: string;
   projectName?: string;
   deploymentUrl: string;
+  username?: string;
   updatedAt: string;
 }
 

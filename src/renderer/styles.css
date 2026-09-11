@@ -1604,18 +1604,12 @@ button svg, .tree-icon svg, .tree-caret svg, .code-title svg, .model-search svg,
 @media(max-height:560px){.model-popover{height:calc(100vh - 70px) !important;max-height:calc(100vh - 70px) !important;bottom:40px !important}}
 
 .plan-approval-card{margin:8px 0 12px;padding:12px;border:1px solid rgba(155,92,255,.35);background:linear-gradient(180deg,rgba(120,55,190,.12),rgba(20,16,28,.94));border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.16)}
-.plan-approval-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;color:#b77cff}.plan-approval-head>div{display:flex;flex-direction:column;gap:3px}.plan-approval-head b{font-size:10px;color:#eee7f5}.plan-approval-head span{font-size:8px;color:#8c8297;line-height:1.45}.plan-approval-title{margin-top:11px;margin-bottom:6px;font-size:9px;font-weight:800;color:#c99aff;text-transform:uppercase;letter-spacing:.06em}.plan-approval-body{max-height:220px;overflow-y:auto;padding:10px 11px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(8,7,12,.72);color:#d9d1df;font-size:9px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;scrollbar-width:thin}.plan-approval-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:10px}.plan-reject-btn,.plan-approve-btn{height:29px;padding:0 11px;border-radius:7px;font-size:9px;font-weight:700;cursor:pointer}.plan-reject-btn{border:1px solid rgba(255,255,255,.1);background:#211d25;color:#bfb6c8}.plan-approve-btn{border:1px solid rgba(158,92,255,.55);background:linear-gradient(135deg,#9b4cff,#6b35bd);color:#fff;box-shadow:0 5px 16px rgba(130,64,210,.2)}.plan-reject-btn:disabled,.plan-approve-btn:disabled{opacity:.55;cursor:not-allowed}
-
-/* v0.4.24 â€” compact Plan handoff + staged OpenCode approvals */
-.plan-approval-preview{max-height:96px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow-wrap:anywhere}
-.plan-expand-btn{display:flex;align-items:center;justify-content:center;gap:5px;width:100%;margin-top:6px;padding:6px 8px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(255,255,255,.025);color:#bfa8d0;font-size:8px;font-weight:700;cursor:pointer}
-.plan-expand-btn:hover{background:rgba(155,92,255,.08);color:#d9c2ea}
-.plan-approval-full{margin-top:6px;max-height:240px}
+.plan-approval-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;color:#b77cff}.plan-approval-head>div{display:flex;flex-direction:column;gap:3px}.plan-approval-head b{font-size:10px;color:#eee7f5}.plan-approval-head span{font-size:8px;color:#8c8297;line-height:1.45}.plan-approval-title{margin-top:11px;margin-bottom:6px;font-size:9px;font-weight:800;color:#c99aff;text-transform:uppercase;letter-spacing:.06em}.plan-approval-body{max-height:none;overflow:visible;padding:10px 11px;border:1px solid rgba(255,255,255,.08);border-radius:8px;background:rgba(8,7,12,.72);color:#d9d1df;font-size:9px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}.plan-approval-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:10px}.plan-reject-btn,.plan-approve-btn{height:29px;padding:0 11px;border-radius:7px;font-size:9px;font-weight:700;cursor:pointer}.plan-reject-btn{border:1px solid rgba(255,255,255,.1);background:#211d25;color:#bfb6c8}.plan-approve-btn{border:1px solid rgba(158,92,255,.55);background:linear-gradient(135deg,#9b4cff,#6b35bd);color:#fff;box-shadow:0 5px 16px rgba(130,64,210,.2)}.plan-reject-btn:disabled,.plan-approve-btn:disabled{opacity:.55;cursor:not-allowed}
 .plan-approved-card{margin:8px 0 12px;padding:10px 11px;border:1px solid rgba(82,210,145,.2);background:linear-gradient(180deg,rgba(45,130,90,.08),rgba(20,16,28,.92));border-radius:10px}
 .plan-approved-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#8ce8b6;font-size:8px;font-weight:800;letter-spacing:.05em}
 .plan-approved-head span{display:flex;align-items:center;gap:5px}
 .plan-approved-head span:last-child{color:#8f8797;font-weight:600;letter-spacing:0}
-.plan-approved-summary{margin-top:8px;color:#cfc5d6;font-size:8.5px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;max-height:74px;overflow:hidden}
+.plan-approved-card .plan-approval-body{margin-top:8px}
 .permission-reason{display:block;margin-top:7px;color:#81768a;font-size:8px;line-height:1.4}
 .permission-card{position:relative}
 .permission-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;border-radius:2px;background:linear-gradient(180deg,#b25cff,#6f36c6)}
@@ -3090,17 +3084,31 @@ html, body, #root, * {
   position: relative;
   max-height: 320px;
   overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 56px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 56px), transparent 100%);
 }
 
 .message-body-wrap.is-collapsed .message-body.collapsible-collapsed::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 56px;
-  background: linear-gradient(to bottom, rgba(10, 8, 17, 0), rgba(10, 8, 17, 1));
-  pointer-events: none;
+  display: none;
+}
+
+.message-body.collapsible-rich-content {
+  white-space: normal !important;
+}
+
+.decision-card .message-body-wrap {
+  width: 100%;
+}
+
+.decision-card .message-expand-toggle {
+  margin-top: 8px;
+  margin-bottom: 2px;
+}
+
+@media (max-width: 640px) {
+  .message-body.collapsible-collapsed {
+    max-height: 260px;
+  }
 }
 
 .message-expand-toggle {

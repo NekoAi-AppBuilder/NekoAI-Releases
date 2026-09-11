@@ -628,6 +628,19 @@ export class SupabaseCli {
     await this.runCli(["login", "--token", token.trim()], 45000);
   }
 
+  public async logout(): Promise<void> {
+    try {
+      await this.runCli(["logout"], 15000);
+    } catch {}
+    try {
+      const home = os.homedir();
+      const tokenPath = path.join(home, ".supabase", "access-token");
+      if (fsSync.existsSync(tokenPath)) {
+        fsSync.unlinkSync(tokenPath);
+      }
+    } catch {}
+  }
+
   public async listProjects(): Promise<SupabaseProject[]> {
     const result = await this.runCli(["projects", "list", "--output-format", "json"]);
     try {

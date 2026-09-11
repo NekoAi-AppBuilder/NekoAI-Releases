@@ -368,6 +368,10 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
 
   record.state = state;
   record.stateAt = Date.now();
+  if (state === "completed" || state === "cancelled" || state === "failed") {
+    previewErrorEmissionAt.clear();
+    attemptedErrorSignatures.clear();
+  }
   logTask("state-change", record.taskId, sessionId, `state=${state} previous=${previous} reason=${logSafeText(reason)}`);
   mainWindow?.webContents.send("opencode:event", {
     type: "neko.task.state",
@@ -460,25 +464,95 @@ async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000):
   }
 }
 
+// Detects whether an assistant message is a completion report / execution summary.
+// Completion reports must NEVER be treated as interactive questions, even if
+// they contain polite closing phrases like "Deseja fazer mais alguma alteração?".
+function isCompletionReport(text: string): boolean {
+  const normalized = String(text ?? "").trim();
+  if (!normalized) return false;
+
+  // 1. Títulos de relatório Markdown (# Resumo, ## Alterações, ## Arquivos modificados, etc.)
+  if (/^#{1,4}\s+(?:resumo|altera[çc][õo]es|modifica[çc][õo]es|arquivos|conclus[ãa]o|o que foi feito|implementa[çc][ãa]o|resultado|status|relat[óo]rio|summary|changes|completed|done|report|overview|changelog)(?:$|[^\p{L}\p{N}])/imu.test(normalized)) {
+    return true;
+  }
+
+  // 2. Frases clássicas de conclusão de tarefa / execução (com suporte a acentuação unicode)
+  const boundaryBefore = "(?:^|[^\\p{L}\\p{N}])";
+  const boundaryAfter = "(?:$|[^\\p{L}\\p{N}])";
+  const completionPhrases = [
+    "conclu[íi]",
+    "concluido",
+    "conclu[íi]da?",
+    "finalizei",
+    "finalizado",
+    "implementei",
+    "implementado",
+    "as altera[çc][õo]es foram",
+    "o projeto foi (?:atualizado|configurado)",
+    "o build passou",
+    "testes passaram",
+    "tudo pronto",
+    "conclu[íi]da? com sucesso",
+    "i have (?:completed|implemented|updated|created|fixed)",
+    "changes have been (?:made|applied)",
+    "build succeeded"
+  ].join("|");
+  const completionRegex = new RegExp(`${boundaryBefore}(?:${completionPhrases})${boundaryAfter}`, "iu");
+  if (completionRegex.test(normalized)) {
+    return true;
+  }
+
+  // 3. Lista de arquivos modificados (linhas como "- src/..." ou "* src/..." ou "1. src/...")
+  const fileListMatches = normalized.match(/(?:^|\n)\s*(?:[-*]|\d+[.)])\s+(?:`?[a-zA-Z0-9_\-./\\]+\.(?:tsx?|jsx?|css|html|json|md|py|go|rs|vue|svelte|env)[`:]?)/g);
+  if (fileListMatches && fileListMatches.length >= 2) {
+    return true;
+  }
+
+  return false;
+}
+
 // The engine can ask questions via native tool or trailing text question.
 // A question ends asking the user or offers choice options.
 function detectQuestion(text: string): boolean {
   const normalized = String(text ?? "").trim();
   if (!normalized) return false;
-  // Tolerate small trailing formatting differences (a stray period, closing
-  // quote/bracket, line break or whitespace) without turning arbitrary text
-  // into a question. The message still has to actually end with a "?".
+
+  // Relatórios de conclusão NUNCA são perguntas interativas
+  if (isCompletionReport(normalized)) return false;
+
+  // Textos longos (> 500 caracteres) são explicações ou relatórios, nunca questions interativas
+  if (normalized.length > 500) return false;
+
   const cleaned = normalized.replace(/[)}\]"'`»“”]+$/, "");
-  if (/[?？]\s*$/.test(cleaned)) return true;
-  if (/[?？]/.test(normalized) && extractQuestionOptions(normalized).length >= 2) return true;
+  // Pergunta direta: deve terminar com ponto de interrogação
+  if (/[?？]\s*$/.test(cleaned)) {
+    // Se termina com pergunta de cortesia típica de finalização, NÃO é question interativa
+    const courtesy = "(?:^|[^\\p{L}\\p{N}])(?:deseja (?:fazer|testar|adicionar)? mais (?:algo|alguma altera[çc][ãa]o)|posso ajudar com mais algo|qualquer d[úu]vida|o que gostaria de fazer|would you like to (?:do|test)? anything else|let me know)(?:$|[^\\p{L}\\p{N}])";
+    if (new RegExp(courtesy, "iu").test(cleaned)) {
+      return false;
+    }
+    return true;
+  }
+
+  // Pergunta com opções (onde as opções vêm nas linhas abaixo da pergunta)
+  if (/[?？]/.test(normalized) && extractQuestionOptions(normalized).length >= 2) {
+    return true;
+  }
+
   return false;
 }
 
 function extractQuestionOptions(text: string): string[] {
+  if (isCompletionReport(text)) return [];
   const options: string[] = [];
   for (const line of String(text ?? "").split(/\r?\n/)) {
     const match = line.trim().match(/^(?:(\d+)[.)]|[-*])\s+(.{2,140})$/);
-    if (match) options.push((match[1] ? `${match[1]}. ` : "") + match[2].trim());
+    if (match) {
+      const optText = match[2].trim();
+      // Não tratar caminhos de arquivos como opções de pergunta
+      if (/\b[a-zA-Z0-9_\-./\\]+\.(?:tsx?|jsx?|css|html|json|md|py|go|rs|env)\b/i.test(optText)) continue;
+      options.push((match[1] ? `${match[1]}. ` : "") + optText);
+    }
   }
   return options.length >= 2 ? options : [];
 }
@@ -716,6 +790,18 @@ function tryDetectQuestion(record: TaskRecord, latest: { id: string; text: strin
   if (!latest?.text) return false;
   if (!(normalizeTimestamp(latest.created) >= normalizeTimestamp(record.createdAt))) return false; // message from an older task
   if (record.lastAssistantMessageId === latest.id && record.askedQuestionIds.length > 0) return false; // duplicate
+
+  // Se a tarefa teve trabalho executado (sawBusy) em modo Build, a mensagem é o
+  // relatório final da execução. NUNCA classificar como pergunta!
+  if (record.sawBusy && !record.planMode) {
+    return false;
+  }
+
+  // Relatório de conclusão de tarefa nunca é pergunta
+  if (isCompletionReport(latest.text)) {
+    return false;
+  }
+
   if (detectQuestion(latest.text)) {
     const isPlanApproval = Boolean(record.planMode);
     record.lastAssistantMessageId = latest.id;
@@ -818,6 +904,17 @@ async function runIdleDetermination(sessionId: string, taskId: string, isQuestio
     const latest = await fetchLatestAssistantMessage(sessionId);
     const currentAfterMessages = taskRecords.get(sessionId);
     if (currentAfterMessages !== record) return; // a new task replaced this one mid-check
+
+    // Em modo Build com trabalho realizado (sawBusy = true), o assistente concluiu
+    // a execução e entregou o relatório final. Finaliza diretamente como completed.
+    if (record.sawBusy && !record.planMode) {
+      clearActiveAgentRequest(sessionId);
+      setTaskState(sessionId, "completed", "session-idle");
+      logTask("completion-detected", taskId, sessionId);
+      logTask("completed", taskId, sessionId);
+      return;
+    }
+
     if (tryDetectQuestion(record, latest)) return;
     // Message-commit race: the engine reached idle but the message endpoint
     // is not exposing the newest streamed assistant message yet (an older,
@@ -868,6 +965,7 @@ function resetTaskRuntime() {
   diagMessageLogCounts.clear();
   postAckDiagScheduled.clear();
   previewErrorEmissionAt.clear();
+  attemptedErrorSignatures.clear();
   clearVisionFallbackSessions();
   cancelAllSiteClones();
   clearStatusCache();
@@ -919,6 +1017,10 @@ function extractAgentError(raw: any) {
 function isRecoverableAgentError(raw: any) {
   const { statusCode, message, retryable } = extractAgentError(raw);
   if (retryable === false) return false;
+  // Erros definitivos de cota, plano, saldo ou cancelamento/abort nunca são recuperáveis
+  if (/free usage exceeded|subscribe to go|quota exceeded|insufficient quota|credit balance|usage limit|nekoaborted|\babort(ed)?\b/i.test(message)) {
+    return false;
+  }
   if (retryable === true) return true;
   return statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500 || /temporar|overload|upstream|timeout|streaming|gateway|connection reset|service unavailable/i.test(message);
 }
@@ -954,6 +1056,10 @@ function scheduleAgentRetry(sessionId: string, rawError: any) {
         const body = await response.text().catch(() => "");
         const synthetic = { error: { data: { statusCode: response.status, message: body.slice(0, 500), isRetryable: response.status >= 500 || response.status === 429 } } };
         if (!scheduleAgentRetry(sessionId, synthetic)) {
+          if (taskRecords.has(sessionId)) {
+            setTaskState(sessionId, "failed", "retry-exhausted");
+            logTask("failed", resolveTaskIdForSession(sessionId), sessionId, "reason=retry-exhausted");
+          }
           mainWindow?.webContents.send("opencode:event", { type: "session.error", properties: synthetic.error });
           clearActiveAgentRequest(sessionId);
         }
@@ -965,6 +1071,10 @@ function scheduleAgentRetry(sessionId: string, rawError: any) {
     } catch (error: any) {
       const synthetic = { error: { data: { message: String(error?.message ?? error), isRetryable: true } } };
       if (!scheduleAgentRetry(sessionId, synthetic)) {
+        if (taskRecords.has(sessionId)) {
+          setTaskState(sessionId, "failed", "retry-exhausted");
+          logTask("failed", resolveTaskIdForSession(sessionId), sessionId, "reason=retry-exhausted");
+        }
         mainWindow?.webContents.send("opencode:event", { type: "session.error", properties: synthetic.error });
         clearActiveAgentRequest(sessionId);
       }
@@ -4481,6 +4591,26 @@ ipcMain.handle("github:disconnect", async () => {
   return true;
 });
 
+ipcMain.handle("github:unlinkProject", async () => {
+  licenseManager.assertAccess("desvinculação de repositórios no GitHub");
+  if (!currentProject) throw new Error("Abra um projeto antes de desvinculá-lo do GitHub.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-unlink");
+
+  return withProjectGitLock(projectPath, async () => {
+    const gitStatus = await getGitStatus();
+    if (gitStatus.initialized && gitStatus.remote) {
+      await runGit(projectPath, ["remote", "remove", "origin"], {}, 15000);
+    }
+    invalidateProjectCheckpoints(projectPath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: projectPath, reason: "git.unlink" }
+    });
+    const status = await getGitStatus();
+    return { ok: true, status };
+  });
+});
+
 
 
 ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
@@ -5890,6 +6020,24 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   engineRetryStates.delete(payload.sessionId);
   forwardedSessionStatus.delete(payload.sessionId);
   clearStatusCacheForSession(payload.sessionId);
+
+  // Limpeza de ciclo e timers da tarefa anterior nesta mesma sessão
+  const existingIdleTimer = idleRecheckTimers.get(payload.sessionId);
+  if (existingIdleTimer) {
+    clearTimeout(existingIdleTimer);
+    idleRecheckTimers.delete(payload.sessionId);
+  }
+  for (const [key, item] of questionRecheckTimers.entries()) {
+    if (key.endsWith(`:${payload.sessionId}`)) {
+      clearTimeout(item.timer);
+      questionRecheckTimers.delete(key);
+    }
+  }
+  idleDeterminationGate.delete(payload.sessionId);
+  cancelAgentInactivityWatchdog(payload.sessionId);
+  previewErrorEmissionAt.clear();
+  attemptedErrorSignatures.clear();
+
   const taskCorrelationId = newTaskCorrelationId(payload.sessionId);
   // A new prompt is a new task: fresh state record for the session so old
   // permissions/questions never leak into this execution.
@@ -6197,32 +6345,34 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
     }
   }
   cancelAgentInactivityWatchdog(sessionId);
-  if (!opencodeUrl) throw new Error("OpenCode não está conectado.");
-
-  const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
-    method: "POST",
-    headers: opencodeRequestHeaders()
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`Falha ao interromper a sessão (HTTP ${response.status}).${body ? ` ${body.slice(0, 240)}` : ""}`);
-  }
 
   // STOP cancels the execution, never the already-written files. The agent
   // is asked to stop, the task transitions to cancelled and the Preview and
   // workspace stay exactly as they are. A running Vision Fallback for this
   // session is cancelled together with the task: a late visual analysis can
   // never resurrect a cancelled task.
+  // Garantia estrutural: o estado local é cancelado imediatamente independente do OpenCode.
   if (taskRecords.has(sessionId)) {
     setTaskState(sessionId, "cancelled", "user-stop");
     logTask("cancelled", resolveTaskIdForSession(sessionId), sessionId);
   }
   cancelVisionFallbackFor(sessionId);
   perfFlushTask(sessionId, "aborted");
+
+  if (!opencodeUrl) return true;
+
   try {
-    return Boolean(await response.json());
-  } catch {
+    const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
+      method: "POST",
+      headers: opencodeRequestHeaders()
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      console.warn(`[Neko/Agent] abort remoto falhou mas tarefa local foi cancelada (HTTP ${response.status}): ${body.slice(0, 160)}`);
+    }
+    return true;
+  } catch (err) {
+    console.warn("[Neko/Agent] erro ao contatar abort remoto (tarefa local cancelada):", err);
     return true;
   }
 });
@@ -6732,8 +6882,12 @@ ipcMain.handle("supabase:select-project", async (_event, ref: string) => {
 });
 
 ipcMain.handle("supabase:disconnect", async () => {
-  const projectRoot = assertProjectRootSafe(currentProject, "supabase-disconnect");
-  return await supabaseManager.disconnect(projectRoot);
+  return await supabaseManager.disconnect();
+});
+
+ipcMain.handle("supabase:unlink", async () => {
+  const projectRoot = assertProjectRootSafe(currentProject, "supabase-unlink");
+  return await supabaseManager.unlinkProject(projectRoot);
 });
 
 ipcMain.handle("supabase:open-token-page", async () => {
@@ -6758,6 +6912,11 @@ ipcMain.handle("vercel:connect", async () => {
 
 ipcMain.handle("vercel:disconnect", async () => {
   return await vercelManager.disconnect();
+});
+
+ipcMain.handle("vercel:unlink", async () => {
+  const projectRoot = assertProjectRootSafe(currentProject, "vercel-unlink");
+  return await vercelManager.unlinkProject(projectRoot);
 });
 
 ipcMain.handle("vercel:publish", async (_event, customProjectName?: string) => {
@@ -6955,18 +7114,22 @@ function isRealPreviewError(message: string, level: number, source: string): boo
   if (!message.trim()) return false;
   // Apenas erros (level >= 3) são considerados erros reais
   if (level < 3) return false;
+  const msgLower = message.toLowerCase();
   // Ignora mensagens de HMR/desenvolvimento do Vite
-  if (message.includes("[vite]") && (message.includes("hmr") || message.includes("hmr update") || message.includes("connected") || message.includes("update"))) return false;
+  if (msgLower.includes("[vite]") && (msgLower.includes("hmr") || msgLower.includes("hmr update") || msgLower.includes("connected") || msgLower.includes("update") || msgLower.includes("connecting"))) return false;
   // Ignora mensagens de hot module replacement
-  if (message.includes("hmr") || message.includes("hot module")) return false;
+  if (msgLower.includes("hmr") || msgLower.includes("hot module")) return false;
   // Ignora logs de desenvolvimento do webpack/vite
-  if (message.includes("webpack") || message.includes("vite") && message.includes("dev")) return false;
+  if (msgLower.includes("webpack") || (msgLower.includes("vite") && msgLower.includes("dev"))) return false;
   // Ignora source map warnings
-  if (message.includes("source map") || message.includes("sourcemap")) return false;
+  if (msgLower.includes("source map") || msgLower.includes("sourcemap")) return false;
   // Ignora warnings de depreciação
-  if (level === 2 && (message.includes("deprecat") || message.includes("Deprecation"))) return false;
-  // Ignora avisos de React sobre chaves, props, etc. (warnings, não erros)
+  if (level === 2 && (msgLower.includes("deprecat") || msgLower.includes("deprecation"))) return false;
+  // Ignora avisos de React sobre chaves, props, devtools, etc.
   if (level === 2) return false;
+  if (msgLower.includes("react devtools") || msgLower.includes("download the react")) return false;
+  // Ignora 404 inofensivo de favicon / manifest / browser extensions
+  if (msgLower.includes("favicon.ico") || msgLower.includes("chrome-extension://") || msgLower.includes("moz-extension://")) return false;
   return true;
 }
 
@@ -7087,9 +7250,26 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
       const isRealError = isRealPreviewError(message, level, source);
       if (isRealError) {
         const diagnosticInfo = createStructuredDiagnostic(message, sourceId, lineNumber, level);
-        console.log(`[Neko/PreviewDiag] error-detected signature=${diagnosticInfo.signature} level=${level} line=${lineNumber}`);
         
-        // Verifica se já tentamos corrigir este erro muitas vezes
+        let activeSessionId = "";
+        let activeTaskId = "";
+        let isTaskRunning = false;
+        for (const [sId, record] of taskRecords.entries()) {
+          if (record.state === "running") {
+            activeSessionId = sId;
+            activeTaskId = record.taskId;
+            isTaskRunning = true;
+            break;
+          }
+        }
+        if (!activeSessionId && sessionTaskIds.size === 1) {
+          activeSessionId = Array.from(sessionTaskIds.keys())[0] || "";
+          activeTaskId = Array.from(sessionTaskIds.values())[0] || "";
+        }
+        
+        console.log(`[Neko/PreviewDiag] error-detected signature=${diagnosticInfo.signature} level=${level} line=${lineNumber} taskRunning=${isTaskRunning} taskId=${activeTaskId || "none"}`);
+        
+        // Verifica se já tentamos registrar este erro muitas vezes
         const attemptInfo = attemptedErrorSignatures.get(diagnosticInfo.signature);
         const attemptCount = attemptInfo?.count ?? 0;
         
@@ -7097,19 +7277,24 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
         console.log(`[Neko/PreviewDiag] error-detected signature=${diagnosticInfo.signature} attempt=${attemptCount + 1}/3`);
         
         // Envia diagnóstico estruturado para o renderer. A emissão é limitada:
-        // no máximo 3 tentativas por assinatura e um intervalo mínimo entre
-        // emissões idênticas, para que um erro repetitivo do Preview nunca
-        // dispare várias execuções do agente.
+        // no máximo 3 tentativas por assinatura e um intervalo mínimo de 3s entre
+        // emissões idênticas, para que um erro repetitivo do Preview durante HMR
+        // nunca inunde os logs ou gere falso alarme.
         const nowEmission = Date.now();
         const lastEmission = previewErrorEmissionAt.get(diagnosticInfo.signature) ?? 0;
         if (attemptCount < 3 && nowEmission - lastEmission >= 3000) {
           previewErrorEmissionAt.set(diagnosticInfo.signature, nowEmission);
+          attemptedErrorSignatures.set(diagnosticInfo.signature, { count: attemptCount + 1, lastAttempt: nowEmission });
           mainWindow?.webContents.send("preview:event", { 
             type: "preview.error-detected", 
             properties: { 
               ...diagnosticInfo,
               attempt: attemptCount + 1,
-              maxAttempts: 3
+              maxAttempts: 3,
+              sessionId: activeSessionId,
+              taskId: activeTaskId,
+              taskRunning: isTaskRunning,
+              projectPath: currentProject || activeWorkspace?.projectPath || ""
             } 
           });
         }

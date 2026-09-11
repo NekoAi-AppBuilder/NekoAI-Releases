@@ -170,7 +170,11 @@ function formatAgentError(raw: any) {
 
   const lower = `${code} ${message} ${providerType}`.toLowerCase();
   let friendly = "O provedor não conseguiu executar esta solicitação.";
-  if (lower.includes("content-blocked") || lower.includes("content blocked")) {
+  if (lower.includes("free usage") || lower.includes("subscribe to go") || lower.includes("quota exceeded") || lower.includes("insufficient quota") || lower.includes("credit balance")) {
+    friendly = "Limite de uso gratuito ou cota do provedor excedida. Atualize seu plano ou utilize outro modelo/provedor.";
+  } else if (lower.includes("nekoaborted") || lower.includes("aborted") || lower.includes("cancelled")) {
+    friendly = "A execução da tarefa foi cancelada.";
+  } else if (lower.includes("content-blocked") || lower.includes("content blocked")) {
     friendly = "O provedor recusou esta solicitação por política de conteúdo.";
   } else if (statusCode === 401 || lower.includes("unauthorized") || lower.includes("authentication")) {
     friendly = "A autenticação do provedor não é válida ou expirou.";
@@ -448,15 +452,23 @@ function pathNormalizedEqual(a: string, b: string): boolean {
 }
 
 // CollapsibleMessageBody: recolhimento VISUAL local para mensagens de texto
-// longas (<320px de altura visível). O texto completo NUNCA é truncado — o
-// usuário recebe a string integral e apenas o overflow é ocultado com fade.
-// Estado estritamente local (expanded); nenhuma chamada IPC/OpenCode/gestão.
-function CollapsibleMessageBody({ text }: { text: string }) {
+// e cards interativos com contedo longo (<320px de altura visvel). O contedo
+// completo NUNCA  truncado  o usurio recebe todas as opes/texto e apenas
+// o overflow  ocultado com fade nativo.
+// Estado estritamente local (expanded); nenhuma chamada IPC/OpenCode/gesto.
+interface CollapsibleMessageBodyProps {
+  text?: string;
+  children?: React.ReactNode;
+  className?: string;
+  maxHeight?: number;
+}
+
+function CollapsibleMessageBody({ text, children, className = "", maxHeight }: CollapsibleMessageBodyProps) {
   const [expanded, setExpanded] = React.useState(false);
   const [collapsible, setCollapsible] = React.useState(false);
   const bodyRef = React.useRef<HTMLDivElement | null>(null);
 
-  // Mede overflow apenas no estado recolhido (scrollHeight inclui o conteúdo
+  // Mede overflow apenas no estado recolhido (scrollHeight inclui o contedo
   // cortado). ResizeObserver local, desconectado na limpeza; sem polling/timers.
   React.useLayoutEffect(() => {
     if (expanded) return;
@@ -468,11 +480,24 @@ function CollapsibleMessageBody({ text }: { text: string }) {
     const observer = new ResizeObserver(update);
     observer.observe(el);
     return () => observer.disconnect();
-  }, [text, expanded]);
+  }, [text, children, expanded]);
+
+  const customStyle = React.useMemo(() => {
+    if (maxHeight && !expanded) {
+      return { maxHeight: `${maxHeight}px` };
+    }
+    return undefined;
+  }, [maxHeight, expanded]);
 
   return (
-    <div className={`message-body-wrap${collapsible && !expanded ? " is-collapsed" : ""}`}>
-      <div ref={bodyRef} className={`message-body${!expanded ? " collapsible-collapsed" : ""}`}>{text}</div>
+    <div className={`message-body-wrap${collapsible && !expanded ? " is-collapsed" : ""}${className ? ` ${className}` : ""}`}>
+      <div
+        ref={bodyRef}
+        className={`message-body${!expanded ? " collapsible-collapsed" : ""}${children !== undefined ? " collapsible-rich-content" : ""}`}
+        style={customStyle}
+      >
+        {children !== undefined ? children : text}
+      </div>
       {collapsible && (
         <button type="button" className="message-expand-toggle" onClick={() => setExpanded(v => !v)} aria-expanded={expanded}>
           {expanded ? "Ver menos" : "Ver mais..."}
@@ -483,8 +508,11 @@ function CollapsibleMessageBody({ text }: { text: string }) {
 }
 
 // Interactive Decision Card: apresenta uma pergunta real do agente (estado
-// waiting_for_user) como card nativo — opções selecionáveis e/ou resposta
-// livre. Envia a resposta para a MESMA sessão do agente (não cria sessão nova).
+// waiting_for_user) como card nativo  opes selecionveis e/ou resposta
+// livre. Envia a resposta para a MESMA sesso do agente (no cria sesso nova).
+// Quando a pergunta e/ou suas opes forem longas, o conjunto  recolhido
+// com o mesmo mecanismo do chat ("Ver mais..."), preservando todas as opes
+// totalmente clicveis e funcionais ao expandir.
 function AgentDecisionCard({ question, onAnswer, onDismiss }: {
   question: AgentQuestion;
   onAnswer: (value: string) => void;
@@ -505,7 +533,7 @@ function AgentDecisionCard({ question, onAnswer, onDismiss }: {
     const value = custom ? text.trim() : (selected as string);
     setSending(true);
     // Mostra brevemente "Enviando..." e marca enviado; o fluxo real continua
-    // na mesma sessão via onAnswer (que limpa o card e volta o Task Runner).
+    // na mesma sesso via onAnswer (que limpa o card e volta o Task Runner).
     window.setTimeout(() => { setSent(true); }, 120);
     window.setTimeout(() => onAnswer(value), 260);
   };
@@ -513,39 +541,42 @@ function AgentDecisionCard({ question, onAnswer, onDismiss }: {
   return (
     <div className="decision-card" role="group" aria-label={`Pergunta do Neko: ${question.question}`}>
       <div className="decision-head"><CircleAlert size={15}/><b>1 de 1 perguntas</b></div>
-      <div className="decision-question">{question.question}</div>
-      {!sent && <div className="decision-label">Selecione uma resposta ou escreva a sua.</div>}
 
-      {options.length > 0 && !sent && options.map((option, i) => (
-        <button
-          type="button"
-          key={`${question.questionId}:${i}`}
-          className={`decision-option ${!custom && selected === option ? "selected" : ""}`}
-          onClick={() => { setCustom(false); setSelected(option); }}
-          aria-pressed={!custom && selected === option}
-        >
-          <span className="decision-radio">{!custom && selected === option ? <Check size={13}/> : null}</span>
-          <span className="decision-option-text">{option}</span>
-        </button>
-      ))}
+      <CollapsibleMessageBody>
+        <div className="decision-question">{question.question}</div>
+        {!sent && <div className="decision-label">Selecione uma resposta ou escreva a sua.</div>}
 
-      {question.allowFreeText !== false && !sent && (
-        <button type="button" className={`decision-option decision-custom ${custom ? "selected" : ""}`} onClick={() => { setCustom(true); setSelected(null); window.setTimeout(() => textRef.current?.focus(), 0); }} aria-pressed={custom}>
-          <span className="decision-radio">{custom ? <Check size={13}/> : null}</span>
-          <span className="decision-option-text">Digite sua própria resposta</span>
-        </button>
-      )}
-      {custom && !sent && (
-        <textarea
-          ref={textRef}
-          className="decision-text"
-          value={text}
-          onChange={e => setText(e.target.value)}
-          placeholder="Digite sua resposta..."
-          rows={2}
-          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }}
-        />
-      )}
+        {options.length > 0 && !sent && options.map((option, i) => (
+          <button
+            type="button"
+            key={`${question.questionId}:${i}`}
+            className={`decision-option ${!custom && selected === option ? "selected" : ""}`}
+            onClick={() => { setCustom(false); setSelected(option); }}
+            aria-pressed={!custom && selected === option}
+          >
+            <span className="decision-radio">{!custom && selected === option ? <Check size={13}/> : null}</span>
+            <span className="decision-option-text">{option}</span>
+          </button>
+        ))}
+
+        {question.allowFreeText !== false && !sent && (
+          <button type="button" className={`decision-option decision-custom ${custom ? "selected" : ""}`} onClick={() => { setCustom(true); setSelected(null); window.setTimeout(() => textRef.current?.focus(), 0); }} aria-pressed={custom}>
+            <span className="decision-radio">{custom ? <Check size={13}/> : null}</span>
+            <span className="decision-option-text">Digite sua própria resposta</span>
+          </button>
+        )}
+        {custom && !sent && (
+          <textarea
+            ref={textRef}
+            className="decision-text"
+            value={text}
+            onChange={e => setText(e.target.value)}
+            placeholder="Digite sua resposta..."
+            rows={2}
+            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }}
+          />
+        )}
+      </CollapsibleMessageBody>
 
       {!sent ? (
         <div className="decision-actions">
@@ -697,6 +728,7 @@ function App() {
   const [vercelError, setVercelError] = React.useState<string | null>(null);
   const [vercelLogs, setVercelLogs] = React.useState<string[]>([]);
   const [vercelProjectName, setVercelProjectName] = React.useState("");
+  const [vercelSwitchMode, setVercelSwitchMode] = React.useState(false);
   const [supabaseState, setSupabaseState] = React.useState<{
     status: "disconnected" | "checking" | "authorizing" | "selecting" | "validating" | "installing" | "connected" | "error";
     configured: boolean;
@@ -705,6 +737,7 @@ function App() {
     projectRef: string | null;
     projectName: string | null;
     projectUrl: string | null;
+    region?: string | null;
     pendingRuntimeSetup?: boolean;
     recentCreatedNotice?: string | null;
     error: string | null;
@@ -2419,16 +2452,8 @@ function App() {
       return;
     }
     
-    // Se estamos validando após correção, log
-    const isRepairValidation = repairState === "validating";
-    if (isRepairValidation) {
-      console.log("[Neko/PreviewDiag] validation-start after repair");
-    }
-    
     validationRunningRef.current = true;
-    setBusy(true);
-    setWorkingStatus(isRepairValidation ? "Validando correção..." : "Validando o projeto...");
-    
+    // Validação é informativa em segundo plano: NÃO bloqueia o Task Runner nem coloca busy = true
     try {
       previewRuntimeErrorRef.current = null;
       const preview = await window.neko.startPreview().catch(error => ({ status: "error", message: String(error?.message ?? error) } as any));
@@ -2438,18 +2463,16 @@ function App() {
       const buildFailed = build?.ok === false;
       
       if (previewFailed || buildFailed) {
-        if (repairAttemptsRef.current < 3) {
-          repairAttemptsRef.current += 1;
-          const previewDiagnostic = previewFailed ? String(previewRuntimeErrorRef.current || preview?.message || "O Preview não conseguiu iniciar.") : "";
-          const buildDiagnostic = buildFailed ? String(build?.output || build?.message || "O build encontrou erros.").slice(-8000) : "";
-          const diagnostic = [previewDiagnostic && `PREVIEW:\n${previewDiagnostic}`, buildDiagnostic && `BUILD:\n${buildDiagnostic}`].filter(Boolean).join("\n\n");
-          await dispatchRepairPrompt(diagnostic, "Problema encontrado na validação");
-          return;
-        }
         requestInFlightRef.current = false;
         requestObservedBusyRef.current = false;
-        setMessages(prev => [...prev, { role: "error", text: "O Neko encontrou um problema na validação final após várias tentativas de correção. Revise os detalhes na aba Erros." }]);
         setRepairState("idle");
+        upsertActivity({
+          id: "validation",
+          icon: "error",
+          title: "Verificação do projeto",
+          detail: previewFailed ? "Preview encontrou erros ao inicializar." : "Build encontrou avisos ou erros.",
+          state: "error"
+        });
       } else {
         // Validação passou - limpa estado de reparo
         repairAttemptsRef.current = 0;
@@ -2463,13 +2486,11 @@ function App() {
         setRepairState("idle");
         requestInFlightRef.current = false;
         requestObservedBusyRef.current = false;
-        setWorkingStatus("Projeto validado.");
         upsertActivity({ id: "validation", icon: "check", title: "Projeto validado", detail: "Build e Preview verificados.", state: "done" });
       }
     } catch (error) {
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
-      setMessages(prev => [...prev, { role: "error", text: `Falha na validação final: ${sanitizeUserFacingText(error instanceof Error ? error.message : error)}` }]);
       setRepairState("idle");
     } finally {
       validationRunningRef.current = false;
@@ -2478,7 +2499,7 @@ function App() {
         setWorkingStatus("");
       }
     }
-  }, [sessionId, selectedModel, effort, repairState, dispatchRepairPrompt, sanitizeUserFacingText, upsertActivity]);
+  }, [sessionId, repairState, currentErrorSignature, upsertActivity]);
 
   // Conclusion is driven by the main-process task state machine
   // (neko.task.state = completed). The renderer only reacts: clear busy,
@@ -2486,8 +2507,8 @@ function App() {
   // attempt counter is intentionally NOT reset here — it is reset only when
   // a NEW user task starts, so a failing validation can never loop forever.
   const concludeCurrentTask = React.useCallback((state: "completed" | "cancelled" = "completed") => {
-    if (taskPhaseRef.current === state) return;
     const beforePhase = taskPhaseRef.current;
+    if (taskPhaseRef.current === state && !busy) return;
     // Terminal state: from now on, delayed events cannot re-introduce busy.
     taskPhaseRef.current = state;
     // Aviso sonoro: conclusão REAL da tarefa (não para cancelamento/plan).
@@ -2498,12 +2519,11 @@ function App() {
     if (completionTimer.current) { window.clearTimeout(completionTimer.current); completionTimer.current = null; }
     requestInFlightRef.current = false;
     requestObservedBusyRef.current = false;
-    // Limpa estado de reparo ao concluir tarefa com sucesso
-    if (currentErrorSignature) {
-      console.log(`[Neko/PreviewDiag] task ${state} - clearing error signature=${currentErrorSignature}`);
-      attemptedErrorSignaturesRef.current.delete(currentErrorSignature);
-      setCurrentErrorSignature(null);
-    }
+    // Limpa estado operacional e de deduplicação transitório ao concluir a tarefa
+    attemptedErrorSignaturesRef.current.clear();
+    setCurrentErrorSignature(null);
+    previewRuntimeErrorRef.current = null;
+    repairAttemptsRef.current = 0;
     setRepairState("idle");
     setBusy(false);
     setWorkingStatus("");
@@ -2518,7 +2538,7 @@ function App() {
         void runTaskValidation();
       }
     }
-  }, [finishActivity, syncSessionOutput, runTaskValidation, currentErrorSignature]);
+  }, [finishActivity, syncSessionOutput, runTaskValidation, currentErrorSignature, busy]);
 
   // Authoritative task states coming from the main-process state machine.
   // The agent cycle (running -> question/approval -> running -> completed)
@@ -2914,11 +2934,12 @@ function App() {
       }
       if (type === "tool.execute.after") {
         if (!isTaskRunning()) return;
-        const tool = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
-        const toolName = typeof tool === "string" ? tool : (tool?.name ?? "");
         const state = props?.state ?? props?.part?.state;
-        if (state?.status === "error") setWorkingStatus("Corrigindo o que foi necessário...");
-        else setWorkingStatus(describeToolActivity(toolName, props?.input ?? props?.part?.state?.input));
+        if (state?.status === "error") {
+          setWorkingStatus("Corrigindo o que foi necessário...");
+        } else {
+          setWorkingStatus("Neko está trabalhando...");
+        }
       }
       // Some OpenCode versions expose live tool lifecycle through
       // message.part.updated instead of tool.execute.before/after. Use the
@@ -2931,6 +2952,8 @@ function App() {
             setWorkingStatus(describeToolActivity(part.tool, state.input));
           } else if (state?.status === "error" && isTaskRunning()) {
             setWorkingStatus("Corrigindo o que foi necessário...");
+          } else if ((state?.status === "completed" || state?.status === "done" || state?.status === "success") && isTaskRunning()) {
+            setWorkingStatus("Neko está trabalhando...");
           }
         }
       }
@@ -3057,55 +3080,33 @@ function App() {
           appendTerminalLine("error", `Preview interno nativo falhou: ${message}. Alternando para o iframe de compatibilidade.`, "Preview/Internal");
           setPreviewSurface("iframe");
         }
-        // Novo evento: erro detectado no preview - inicia ciclo de autocorreção
+        // Diagnóstico do preview: registra erros detectados para fins de telemetria/diagnóstico
         if (event.type === "preview.error-detected") {
-          const { signature, diagnostic, attempt, maxAttempts } = props;
-          console.log(`[Neko/PreviewDiag] error-detected received attempt=${attempt}/${maxAttempts} signature=${signature}`);
+          const { signature, diagnostic, attempt, maxAttempts, taskRunning } = props;
+          console.log(`[Neko/PreviewDiag] error-detected received signature=${signature} attempt=${attempt}/${maxAttempts} taskRunning=${Boolean(taskRunning)} phase=${taskPhaseRef.current}`);
           
-          // Verifica se já tentamos corrigir este erro muitas vezes
-          const attempted = attemptedErrorSignaturesRef.current.get(signature);
-          const attemptCount = attempted?.count ?? 0;
-          
-          if (attemptCount >= 3) {
-            console.log(`[Neko/PreviewDiag] recovery-failed signature=${signature} attempts=${attemptCount}`);
-            setRepairState("idle");
+          // CRÍTICO: Se a tarefa já está concluída, cancelada, falha ou ociosa (completed/none/idle):
+          // NUNCA reviver o Task Runner, NUNCA mudar fase para running/repairing, NUNCA disparar reparo.
+          if (isTaskTerminal() || taskPhaseRef.current === "completed" || taskPhaseRef.current === "none" || !isTaskRunning()) {
+            console.log(`[Neko/PreviewDiag] error-detected ignored outside running task (phase=${taskPhaseRef.current}) signature=${signature}`);
             return;
           }
           
-          // CRITICAL LOOP GUARDS: a repair prompt is only allowed when the
-          // app can actually start one. Never dispatch while another request
-          // is in flight, while a validation is running, or when the task is
-          // in a waiting/terminal state. This makes the
-          // "error -> prompt -> HMR -> error -> prompt" cycle impossible.
-          if (requestInFlightRef.current || validationRunningRef.current) {
-            console.log(`[Neko/PreviewDiag] repair-skipped reason=busy signature=${signature}`);
-            return;
-          }
-          if (taskPhaseRef.current !== "completed" && taskPhaseRef.current !== "none") {
-            console.log(`[Neko/PreviewDiag] repair-skipped reason=phase(${taskPhaseRef.current}) signature=${signature}`);
-            return;
-          }
-          if (repairState !== "idle") {
-            console.log(`[Neko/PreviewDiag] repair-skipped reason=repair-state(${repairState}) signature=${signature}`);
-            return;
-          }
+          // REGRA PRINCIPAL: Durante uma tarefa em execução: PREVIEW ERROR ≠ TASK FAILURE.
+          // O erro é registrado exclusivamente para fins de diagnóstico.
+          // NUNCA conclui que a tarefa falhou.
+          // NUNCA interrompe o agente.
+          // NUNCA abre uma nova tarefa.
+          // NUNCA dispara reparo imediatamente.
+          // NUNCA cria loop de reparo.
+          // O agente continua trabalhando normalmente.
+          console.log(`[Neko/PreviewDiag] error-detected recorded for diagnostic during task run (signature=${signature}) - agent continues unhindered`);
           
-          // Atualiza contador de tentativas
           attemptedErrorSignaturesRef.current.set(signature, { 
-            count: attemptCount + 1, 
+            count: Number(attempt || 1), 
             lastAttempt: Date.now() 
           });
           setCurrentErrorSignature(signature);
-          
-          // Log de diagnóstico
-          console.log(`[Neko/PreviewDiag] repair-start attempt=${attempt + 1}/3 signature=${signature}`);
-          
-          // Solicita correção ao Agent através do fluxo controlado, que
-          // registra taskId/in-flight/busy como qualquer outra tarefa.
-          if (sessionId) {
-            repairAttemptsRef.current = Math.max(repairAttemptsRef.current, 1);
-            void dispatchRepairPromptRef.current(String(diagnostic), "Problema encontrado no Preview");
-          }
         }
       }
     });
@@ -3375,6 +3376,9 @@ function App() {
       taskPhaseRef.current = "running";
       setRepairState("idle");
       repairAttemptsRef.current = 0;
+      attemptedErrorSignaturesRef.current.clear();
+      setCurrentErrorSignature(null);
+      previewRuntimeErrorRef.current = null;
       setWorkingStatus("Reconstruindo o site a partir da análise...");
       try {
         const result = await window.neko.prompt(sessionId, finalMessage, getEffectiveModel(selectedModel), [], [], false, effort);
@@ -3545,6 +3549,9 @@ function App() {
     retryActiveRef.current = false;
     setRepairState("idle");
     repairAttemptsRef.current = 0;
+    attemptedErrorSignaturesRef.current.clear();
+    setCurrentErrorSignature(null);
+    previewRuntimeErrorRef.current = null;
     setBusy(true);
     setWorkingStatus("Neko está trabalhando...");
     upsertActivity({ id: "user-request", icon: "brain", title: "Neko processando", detail: text.length > 60 ? text.slice(0, 57) + "..." : text, state: "running" });
@@ -3585,12 +3592,22 @@ function App() {
     setPendingPlan(null);
     planAwaitingRef.current = false;
     pendingPlanTaskRef.current = null;
+    taskPhaseRef.current = "cancelled";
+    requestInFlightRef.current = false;
+    requestObservedBusyRef.current = false;
+    retryActiveRef.current = false;
+    setBusy(false);
+    setWorkingStatus("");
+    finishActivity();
+    if (concludeCurrentTaskRef.current) {
+      concludeCurrentTaskRef.current("cancelled");
+    }
     try {
       await window.neko.abort(sessionId);
     } catch (error) {
       console.warn("[StopDevelopment] abort failed", String((error as Error)?.message ?? error));
     }
-  }, [sessionId]);
+  }, [sessionId, finishActivity]);
 
   const rejectPlan = React.useCallback(() => {
     const plan = pendingPlan;
@@ -3621,6 +3638,11 @@ function App() {
     setPendingPlan(null);
     setPlanExpanded(false);
     planAwaitingRef.current = false;
+    attemptedErrorSignaturesRef.current.clear();
+    setCurrentErrorSignature(null);
+    previewRuntimeErrorRef.current = null;
+    setRepairState("idle");
+    repairAttemptsRef.current = 0;
 
     // Show the approved plan card
     setApprovedPlan({ planText: plan.planText, approvedAt: Date.now(), messageCreatedAt: Date.now() });
@@ -3903,13 +3925,37 @@ function App() {
     setGithubError("");
     try {
       const result = await window.neko.githubStart();
-      if (result?.userCode) {
-        setGithubDevice({ userCode: result.userCode, verificationUri: result.verificationUri || "https://github.com/login/device", expiresIn: result.expiresIn || 900, interval: result.interval || 5 });
+      const device = result?.device || (result?.userCode ? result : null);
+      if (device?.userCode) {
+        setGithubDevice({
+          userCode: device.userCode,
+          verificationUri: device.verificationUri || "https://github.com/login/device",
+          expiresIn: device.expiresIn || 900,
+          interval: device.interval || 5
+        });
         setModal("githubDevice");
       }
     } catch (error) {
       setGithubError("Erro ao iniciar conexão com GitHub.");
       console.warn("[Github] connect failed", String((error as Error)?.message ?? error));
+      setGithubBusy(false);
+    }
+  }
+
+  async function unlinkGithubProject() {
+    if (githubBusy || !githubLinkStatus.linkedRepo) return;
+    setGithubBusy(true);
+    try {
+      const res = await window.neko.githubUnlinkProject();
+      if (res?.status) {
+        setGithubLinkStatus(res.status);
+      } else {
+        const git = await window.neko.githubGitStatus();
+        setGithubLinkStatus(git);
+      }
+    } catch (error) {
+      console.warn("[Github] unlink failed", String((error as Error)?.message ?? error));
+    } finally {
       setGithubBusy(false);
     }
   }
@@ -4094,6 +4140,18 @@ function App() {
     }
   }
 
+  async function unlinkSupabase() {
+    if (supabaseBusy) return;
+    setSupabaseBusy(true);
+    try {
+      await window.neko.supabaseUnlink();
+    } catch (error) {
+      console.warn("[Supabase] unlink failed", String((error as Error)?.message ?? error));
+    } finally {
+      setSupabaseBusy(false);
+    }
+  }
+
   async function openSupabaseTokenPage() {
     try {
       await window.neko.supabaseOpenTokenPage();
@@ -4197,13 +4255,30 @@ function App() {
     }
   }
 
+  async function handleUnlinkVercel() {
+    if (vercelBusy || vercelState.deployment === "deploying") return;
+    setVercelBusy(true);
+    try {
+      await window.neko.vercelUnlink();
+      setVercelSwitchMode(false);
+      setVercelError(null);
+    } catch (error) {
+      console.warn("[Vercel] unlink failed", String((error as Error)?.message ?? error));
+    } finally {
+      setVercelBusy(false);
+    }
+  }
+
   async function handlePublishVercel() {
     if (!project || vercelBusy || vercelState.deployment === "deploying") return;
+    const isChangingProject = vercelSwitchMode;
     if (!vercelState.linked && !isValidVercelProjectName(vercelProjectName)) return;
+    if (isChangingProject && !isValidVercelProjectName(vercelProjectName)) return;
     setVercelBusy(true);
     setVercelError(null);
     try {
-      await window.neko.vercelPublish(vercelState.linked ? undefined : vercelProjectName);
+      await window.neko.vercelPublish((vercelState.linked && !isChangingProject) ? undefined : vercelProjectName);
+      setVercelSwitchMode(false);
     } catch (error) {
       setVercelError("Erro ao publicar na Vercel.");
       console.warn("[Vercel] publish failed", String((error as Error)?.message ?? error));
@@ -4593,16 +4668,16 @@ function App() {
                   if (item.kind === "pendingPlan" && pendingPlan) return <div key={`pending-plan-${pendingPlan.messageCreatedAt}`} className="plan-approval-card">
                     <div className="plan-approval-head"><div><b>Plano pronto para revisão</b><span>O Neko analisou a tarefa. Revise um resumo antes de permitir as alterações.</span></div><Sparkles size={16}/></div>
                     <div className="plan-approval-title">Resumo do plano</div>
-                    <div className="plan-approval-body plan-approval-preview">{planPreview(pendingPlan.planText)}</div>
-                    <button className="plan-expand-btn" onClick={() => setPlanExpanded(v => !v)}>{planExpanded ? <><ChevronUp size={12}/> Ocultar plano completo</> : <><ChevronDown size={12}/> Ver plano completo</>}</button>
-                    {planExpanded && <div className="plan-approval-body plan-approval-full">{pendingPlan.planText}</div>}
+                    <div className="plan-approval-body">
+                      <CollapsibleMessageBody text={pendingPlan.planText} />
+                    </div>
                     <div className="plan-approval-actions"><button className="plan-reject-btn" onClick={rejectPlan} disabled={planApprovalBusy}>Cancelar</button><button className="plan-approve-btn" onClick={() => void approvePlan()} disabled={planApprovalBusy}>{planApprovalBusy ? "Executando..." : "Aprovar e executar"}</button></div>
                   </div>;
                   if (item.kind === "approvedPlan" && approvedPlan) return <div key={`approved-plan-${approvedPlan.approvedAt}`} className="plan-approved-card">
                     <div className="plan-approved-head"><span><Check size={13}/> PLANO APROVADO</span><span>Build iniciado</span></div>
-                    <div className="plan-approved-summary">{planPreview(approvedPlan.planText)}</div>
-                    <button className="plan-expand-btn" onClick={() => setPlanExpanded(v => !v)}>{planExpanded ? <><ChevronUp size={12}/> Ocultar plano completo</> : <><ChevronDown size={12}/> Ver plano completo</>}</button>
-                    {planExpanded && <div className="plan-approval-body plan-approval-full">{approvedPlan.planText}</div>}
+                    <div className="plan-approval-body">
+                      <CollapsibleMessageBody text={approvedPlan.planText} />
+                    </div>
                   </div>;
                   const index = item.index!; const message = messages[index];
                   return <div key={`message-${index}-${message.createdAt ?? timelineIndex}`} className={`message ${message.role}`}>
@@ -4629,7 +4704,12 @@ function App() {
             {pendingPermission && (
             <div className="permission-card">
               <div className="permission-head"><ShieldAlert size={15}/><div><b>O Neko precisa da sua autorização</b><small>Uma autorização é necessária para continuar esta etapa do projeto.</small></div></div>
-              <div className="permission-body"><b>Acesso necessário aos arquivos do projeto</b><small className="permission-reason">O Neko precisa desse acesso para continuar trabalhando. Nenhum detalhe interno do mecanismo é exibido aqui.</small></div>
+              <div className="permission-body">
+                <CollapsibleMessageBody>
+                  <b>Acesso necessário aos arquivos do projeto</b>
+                  <small className="permission-reason">O Neko precisa desse acesso para continuar trabalhando. Nenhum detalhe interno do mecanismo é exibido aqui.</small>
+                </CollapsibleMessageBody>
+              </div>
               <div className="permission-actions"><button className="permission-reject" onClick={() => void replyPermission("reject")}>Rejeitar</button><button className="permission-once" onClick={() => void replyPermission("once")}>Permitir uma vez</button><button className="permission-always" onClick={() => void replyPermission("always")}>Permitir sempre</button></div>
             </div>
           )}
@@ -5334,6 +5414,7 @@ function App() {
               <div className="github-connected-actions">
                 <button className="primary github-commit-btn" disabled={!githubLinkStatus.dirty || !githubCommitMessage.trim() || githubCommitBusy} onClick={() => void commitAndPushGithub()}>{githubCommitBusy ? <><Loader2 size={15} className="spin"/> Enviando...</> : <><Check size={15}/> Commit e Push</>}</button>
                 {linkedRepoUrl ? <button className="secondary github-view-repo-btn" onClick={() => void window.neko.githubOpen(linkedRepoUrl)} title="Abrir repositório no GitHub"><ExternalLinkIcon size={14}/> Ver no GitHub</button> : null}
+                <button className="secondary github-unlink-btn danger-action" onClick={() => void unlinkGithubProject()} disabled={githubBusy} title="Desvincular repositório deste projeto local"><Unlink size={14}/> Desvincular</button>
               </div>
             </div>;
           })() : null}
@@ -5473,10 +5554,23 @@ function App() {
         <div className="modal-scroll-body github-device-panel">
           <div className="device-label">Código de autorização</div>
           <div className="device-code">{githubDevice.userCode}</div>
-          <button className="secondary" onClick={(e) => void copyMessage(githubDevice.userCode, e.currentTarget)}><Copy size={14}/> Copiar código</button>
-          <button className="primary" onClick={() => window.neko.githubOpen(githubDevice.verificationUri)}><ExternalLinkIcon size={14}/> Abrir GitHub</button>
+          <div style={{ display: "flex", gap: 10, marginTop: 4, flexWrap: "wrap", justifyContent: "center" }}>
+            <button className="secondary" onClick={(e) => void copyMessage(githubDevice.userCode, e.currentTarget)}><Copy size={14}/> Copiar código</button>
+            <button className="primary" onClick={() => window.neko.githubOpen(githubDevice.verificationUri)}><ExternalLinkIcon size={14}/> Abrir página no GitHub</button>
+          </div>
+          <div className="device-instructions" style={{ maxWidth: 380, textAlign: "center", fontSize: 11, color: "#9c90a7", marginTop: 8, lineHeight: 1.6 }}>
+            1. Copie o código acima.<br/>
+            2. Cole na página do GitHub que será aberta no navegador.<br/>
+            3. Autorize o NekoAI para concluir a conexão.
+          </div>
           <div className="device-wait"><Loader2 size={15} className="spin"/> Aguardando autorização no GitHub...</div>
           {githubError && <div className="auth-error">{githubError}</div>}
+          <button className="secondary" style={{ marginTop: 10 }} onClick={() => {
+            setGithubBusy(false);
+            setGithubDevice(null);
+            setModal("github");
+            void window.neko.githubCancel?.().catch(() => {});
+          }}>Cancelar autorização</button>
         </div>
       </>}
 
@@ -5826,10 +5920,24 @@ function App() {
             <div className="modal-scroll-body supabase-connected-panel">
               <div className="connection-badge">
                 <Check size={16}/>
-                <span>Conectado</span>
+                <span>Projeto conectado</span>
               </div>
-              <h3>{supabaseState.projectName || "Projeto Supabase"}</h3>
-              <code>{supabaseState.projectRef}</code>
+              <div className="supabase-project-details" style={{ display: "flex", flexDirection: "column", gap: 6, background: "rgba(0,0,0,0.25)", padding: 14, borderRadius: 8, border: "1px solid rgba(255,255,255,0.08)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, color: "#8a7f94", textTransform: "uppercase", letterSpacing: 0.8, fontWeight: 700 }}>Nome do Projeto</span>
+                  <strong style={{ fontSize: 13, color: "#f0ebf7" }}>{supabaseState.projectName || "Projeto Supabase"}</strong>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, color: "#8a7f94", textTransform: "uppercase", letterSpacing: 0.8, fontWeight: 700 }}>Project Ref</span>
+                  <code style={{ fontSize: 11, color: "#3ee58b", background: "rgba(0,0,0,0.3)", padding: "2px 6px", borderRadius: 4 }}>{supabaseState.projectRef}</code>
+                </div>
+                {supabaseState.region ? (
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: "#8a7f94", textTransform: "uppercase", letterSpacing: 0.8, fontWeight: 700 }}>Região</span>
+                    <span style={{ fontSize: 11, color: "#a899b4" }}>{supabaseState.region}</span>
+                  </div>
+                ) : null}
+              </div>
               <p>
                 {supabaseState.pendingRuntimeSetup
                   ? "O MCP está configurado. O SDK será instalado quando existir um package.json nesta pasta."
@@ -5840,15 +5948,27 @@ function App() {
                   <AlertTriangle size={14}/> {supabaseError}
                 </div>
               )}
-              <div className="modal-actions split-actions">
-                <button
-                  type="button"
-                  className="secondary danger-action"
-                  disabled={supabaseBusy}
-                  onClick={() => void disconnectSupabase()}
-                >
-                  <Unplug size={14}/> Desconectar
-                </button>
+              <div className="modal-actions" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginTop: 10 }}>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    type="button"
+                    className="secondary danger-action"
+                    disabled={supabaseBusy}
+                    onClick={() => void disconnectSupabase()}
+                    title="Encerrar sessão do Supabase no NekoAI"
+                  >
+                    <Unplug size={14}/> Desconectar
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={supabaseBusy}
+                    onClick={() => void unlinkSupabase()}
+                    title="Desvincular este projeto local do Supabase"
+                  >
+                    <Unlink size={14}/> Desvincular
+                  </button>
+                </div>
                 <button
                   type="button"
                   className="primary"
@@ -5860,7 +5980,7 @@ function App() {
                     void refreshSupabaseProjects(true);
                   }}
                 >
-                  <SupabaseIcon size={14}/> Trocar projeto
+                  <RefreshCw size={14}/> Trocar projeto
                 </button>
               </div>
             </div>
@@ -6085,128 +6205,317 @@ function App() {
             </div>
           ) : (
             <div className="modal-scroll-body vercel-publish-step">
-              <div className="vercel-account-bar">
-                <div className="vercel-user-info">
-                  <CheckCircle2 size={16} className="text-success"/>
-                  <span>Conectado como <strong>{vercelState.username || "usuário"}</strong></span>
-                </div>
-                <div className="vercel-account-actions">
-                  <button type="button" className="secondary btn-sm" onClick={() => void window.neko.vercelOpenDashboard()}>
-                    <ExternalLink size={13}/> Dashboard
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary btn-sm danger-action"
-                    disabled={vercelState.deployment === "deploying" || vercelBusy}
-                    onClick={() => void handleDisconnectVercel()}
-                  >
-                    <Unplug size={13}/> Desconectar
-                  </button>
-                </div>
-              </div>
+              {vercelState.linked && vercelState.deploymentUrl && !vercelSwitchMode ? (
+                <>
+                  <div className="vercel-account-bar">
+                    <div className="vercel-user-info">
+                      <CheckCircle2 size={16} className="text-success"/>
+                      <span>Conectado como <strong>{vercelState.username || "usuário"}</strong></span>
+                    </div>
+                    <div className="vercel-account-actions">
+                      <button type="button" className="secondary btn-sm" onClick={() => void window.neko.vercelOpenDashboard()}>
+                        <ExternalLink size={13}/> Dashboard
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary btn-sm danger-action"
+                        disabled={vercelState.deployment === "deploying" || vercelBusy}
+                        onClick={() => void handleDisconnectVercel()}
+                        title="Desconectar conta da Vercel"
+                      >
+                        <Unplug size={13}/> Desconectar
+                      </button>
+                    </div>
+                  </div>
 
-              <div className="vercel-project-card">
-                <span className="vercel-card-label">Frontend detectado</span>
-                <strong className="vercel-card-name">{vercelState.projectName || (project ? (project.split(/[/\\]/).filter(Boolean).pop() || project) : "Nenhum projeto selecionado")}</strong>
-                <code className="vercel-card-path">{vercelState.projectPath || project || "Selecione uma pasta com um frontend válido."}</code>
-                {project ? (
-                  <small className="vercel-card-hint">
-                    {vercelState.linked
-                      ? "✓ Projeto já vinculado à Vercel (.vercel/project.json)"
-                      : "O projeto será criado e vinculado automaticamente no primeiro deploy"}
-                  </small>
-                ) : null}
-              </div>
+                  <div className="vercel-published-card" style={{ display: "flex", flexDirection: "column", gap: 10, padding: 16, background: "rgba(34, 197, 94, .06)", border: "1px solid rgba(34, 197, 94, .2)", borderRadius: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <div style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "#4ade80", fontSize: 11, fontWeight: 700, background: "rgba(34, 197, 94, .12)", border: "1px solid rgba(34, 197, 94, .25)", padding: "3px 8px", borderRadius: 20 }}>
+                        <CheckCircle2 size={13}/>
+                        <span>PUBLICADO</span>
+                      </div>
+                      <strong style={{ fontSize: 13, color: "#f0ebf7" }}>{vercelState.projectName || "Projeto Vercel"}</strong>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.8, color: "#8a7f94", fontWeight: 700 }}>URL de produção</span>
+                      <a
+                        href={vercelState.deploymentUrl}
+                        className="vercel-url-link"
+                        style={{ fontSize: 13, wordBreak: "break-all" }}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          void window.neko.vercelOpenDeployment();
+                        }}
+                      >
+                        {vercelState.deploymentUrl}
+                      </a>
+                    </div>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+                      <button
+                        type="button"
+                        className="secondary btn-sm"
+                        onClick={() => void window.neko.vercelOpenDeployment()}
+                      >
+                        <ExternalLink size={13}/> Abrir projeto
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary btn-sm"
+                        onClick={() => void window.neko.vercelOpenDashboard()}
+                      >
+                        <ExternalLink size={13}/> Dashboard
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary btn-sm"
+                        disabled={vercelBusy || vercelState.deployment === "deploying"}
+                        onClick={() => {
+                          setVercelSwitchMode(true);
+                          setVercelProjectName("");
+                          setVercelError(null);
+                        }}
+                        title="Vincular a outro projeto da Vercel"
+                      >
+                        <RefreshCw size={13}/> Trocar projeto
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary btn-sm danger-action"
+                        disabled={vercelBusy || vercelState.deployment === "deploying"}
+                        onClick={() => void handleUnlinkVercel()}
+                        title="Desvincular este projeto local da Vercel"
+                      >
+                        <Unlink size={13}/> Desvincular
+                      </button>
+                    </div>
+                  </div>
 
-              {!vercelState.linked && (
-                <div className="vercel-field-group">
-                  <label className="vercel-field-label">
-                    Nome do projeto na Vercel
-                  </label>
-                  <input
-                    type="text"
-                    className="api-input"
-                    value={vercelProjectName}
-                    onChange={(e) => {
-                      setVercelProjectName(e.target.value);
-                      if (vercelError) setVercelError(null);
-                    }}
-                    placeholder="ex: meu-projeto"
-                    disabled={vercelBusy || vercelState.deployment === "deploying"}
-                    maxLength={100}
-                    autoFocus
-                  />
-                  {vercelProjectName.trim() && !isValidVercelProjectName(vercelProjectName) && (
-                    <div className="auth-error" style={{ marginTop: 0 }}>
-                      {getVercelNameValidationError(vercelProjectName)}
+                  {vercelState.deployment === "deploying" ? (
+                    <div className="vercel-deploying-box">
+                      <Loader2 size={24} className="spin text-primary"/>
+                      <div>
+                        <strong>Publicando em produção...</strong>
+                        <span>A Vercel está enviando os arquivos e construindo o frontend.</span>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {(vercelError || vercelState.error) && (
+                    <div className="creation-error">
+                      <AlertTriangle size={14}/> {vercelError || vercelState.error}
                     </div>
                   )}
-                  {!vercelProjectName.trim() && (
-                    <div className="auth-error" style={{ marginTop: 0 }}>
-                      Informe o nome do projeto na Vercel.
+
+                  <div className="modal-actions" style={{ marginTop: 10, display: "flex", justifyContent: "flex-end" }}>
+                    <button
+                      type="button"
+                      className="primary vercel-publish-btn"
+                      disabled={!project || vercelState.deployment === "deploying" || vercelBusy}
+                      onClick={() => void handlePublishVercel()}
+                    >
+                      {vercelState.deployment === "deploying" || vercelBusy ? (
+                        <Loader2 size={16} className="spin"/>
+                      ) : (
+                        <CloudUpload size={16}/>
+                      )}
+                      Publicar novamente
+                    </button>
+                  </div>
+                </>
+              ) : vercelSwitchMode ? (
+                <>
+                  <div className="vercel-account-bar">
+                    <div className="vercel-user-info">
+                      <CheckCircle2 size={16} className="text-success"/>
+                      <span>Conectado como <strong>{vercelState.username || "usuário"}</strong></span>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary btn-sm danger-action"
+                      disabled={vercelState.deployment === "deploying" || vercelBusy}
+                      onClick={() => void handleDisconnectVercel()}
+                    >
+                      <Unplug size={13}/> Desconectar
+                    </button>
+                  </div>
+
+                  <div className="vercel-project-card">
+                    <span className="vercel-card-label">Trocar Projeto Vercel</span>
+                    <strong className="vercel-card-name">Informe o novo nome do projeto na Vercel</strong>
+                    <span className="vercel-card-hint">O projeto local será vinculado a este novo projeto e implantado em produção.</span>
+                  </div>
+
+                  <div className="vercel-field-group">
+                    <label className="vercel-field-label">
+                      Novo nome do projeto na Vercel
+                    </label>
+                    <input
+                      type="text"
+                      className="api-input"
+                      value={vercelProjectName}
+                      onChange={(e) => {
+                        setVercelProjectName(e.target.value);
+                        if (vercelError) setVercelError(null);
+                      }}
+                      placeholder="ex: meu-novo-projeto"
+                      disabled={vercelBusy || vercelState.deployment === "deploying"}
+                      maxLength={100}
+                      autoFocus
+                    />
+                    {vercelProjectName.trim() && !isValidVercelProjectName(vercelProjectName) && (
+                      <div className="auth-error" style={{ marginTop: 0 }}>
+                        {getVercelNameValidationError(vercelProjectName)}
+                      </div>
+                    )}
+                    {!vercelProjectName.trim() && (
+                      <div className="auth-error" style={{ marginTop: 0 }}>
+                        Informe o nome do novo projeto na Vercel.
+                      </div>
+                    )}
+                  </div>
+
+                  {vercelState.deployment === "deploying" ? (
+                    <div className="vercel-deploying-box">
+                      <Loader2 size={24} className="spin text-primary"/>
+                      <div>
+                        <strong>Publicando em produção...</strong>
+                        <span>A Vercel está enviando os arquivos e construindo o frontend.</span>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {(vercelError || vercelState.error) && (
+                    <div className="creation-error">
+                      <AlertTriangle size={14}/> {vercelError || vercelState.error}
                     </div>
                   )}
-                </div>
-              )}
 
-              {vercelState.deployment === "deploying" ? (
-                <div className="vercel-deploying-box">
-                  <Loader2 size={24} className="spin text-primary"/>
-                  <div>
-                    <strong>Publicando em produção...</strong>
-                    <span>A Vercel está enviando os arquivos e construindo o frontend.</span>
+                  <div className="modal-actions split-actions">
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={vercelBusy || vercelState.deployment === "deploying"}
+                      onClick={() => {
+                        setVercelSwitchMode(false);
+                        setVercelError(null);
+                      }}
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      type="button"
+                      className="primary vercel-publish-btn"
+                      disabled={!project || vercelState.deployment === "deploying" || vercelBusy || !isValidVercelProjectName(vercelProjectName)}
+                      onClick={() => void handlePublishVercel()}
+                    >
+                      {vercelState.deployment === "deploying" || vercelBusy ? (
+                        <Loader2 size={16} className="spin"/>
+                      ) : (
+                        <CloudUpload size={16}/>
+                      )}
+                      Publicar e Vincular
+                    </button>
                   </div>
-                </div>
-              ) : vercelState.deploymentUrl ? (
-                <div className="vercel-success-box">
-                  <div className="connection-badge">
-                    <CheckCircle2 size={18}/>
-                    <span>Publicado com sucesso</span>
+                </>
+              ) : (
+                <>
+                  <div className="vercel-account-bar">
+                    <div className="vercel-user-info">
+                      <CheckCircle2 size={16} className="text-success"/>
+                      <span>Conectado como <strong>{vercelState.username || "usuário"}</strong></span>
+                    </div>
+                    <div className="vercel-account-actions">
+                      <button type="button" className="secondary btn-sm" onClick={() => void window.neko.vercelOpenDashboard()}>
+                        <ExternalLink size={13}/> Dashboard
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary btn-sm danger-action"
+                        disabled={vercelState.deployment === "deploying" || vercelBusy}
+                        onClick={() => void handleDisconnectVercel()}
+                      >
+                        <Unplug size={13}/> Desconectar
+                      </button>
+                    </div>
                   </div>
-                  <a
-                    href={vercelState.deploymentUrl}
-                    className="vercel-url-link"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      void window.neko.vercelOpenDeployment();
-                    }}
-                  >
-                    {vercelState.deploymentUrl}
-                  </a>
-                </div>
-              ) : null}
 
-              {(vercelError || vercelState.error) && (
-                <div className="creation-error">
-                  <AlertTriangle size={14}/> {vercelError || vercelState.error}
-                </div>
-              )}
+                  <div className="vercel-project-card">
+                    <span className="vercel-card-label">Frontend detectado</span>
+                    <strong className="vercel-card-name">{vercelState.projectName || (project ? (project.split(/[/\\]/).filter(Boolean).pop() || project) : "Nenhum projeto selecionado")}</strong>
+                    <code className="vercel-card-path">{vercelState.projectPath || project || "Selecione uma pasta com um frontend válido."}</code>
+                    {project ? (
+                      <small className="vercel-card-hint">
+                        {vercelState.linked
+                          ? "✓ Projeto já vinculado à Vercel (.vercel/project.json)"
+                          : "O projeto será criado e vinculado automaticamente no primeiro deploy"}
+                      </small>
+                    ) : null}
+                  </div>
 
-              <div className="modal-actions split-actions">
-                {vercelState.deploymentUrl ? (
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => void window.neko.vercelOpenDeployment()}
-                  >
-                    <ExternalLink size={14}/> Abrir site
-                  </button>
-                ) : <div />}
-
-                <button
-                  type="button"
-                  className="primary vercel-publish-btn"
-                  disabled={!project || vercelState.deployment === "deploying" || vercelBusy || (!vercelState.linked && !isValidVercelProjectName(vercelProjectName))}
-                  onClick={() => void handlePublishVercel()}
-                >
-                  {vercelState.deployment === "deploying" || vercelBusy ? (
-                    <Loader2 size={16} className="spin"/>
-                  ) : (
-                    <CloudUpload size={16}/>
+                  {!vercelState.linked && (
+                    <div className="vercel-field-group">
+                      <label className="vercel-field-label">
+                        Nome do projeto na Vercel
+                      </label>
+                      <input
+                        type="text"
+                        className="api-input"
+                        value={vercelProjectName}
+                        onChange={(e) => {
+                          setVercelProjectName(e.target.value);
+                          if (vercelError) setVercelError(null);
+                        }}
+                        placeholder="ex: meu-projeto"
+                        disabled={vercelBusy || vercelState.deployment === "deploying"}
+                        maxLength={100}
+                        autoFocus
+                      />
+                      {vercelProjectName.trim() && !isValidVercelProjectName(vercelProjectName) && (
+                        <div className="auth-error" style={{ marginTop: 0 }}>
+                          {getVercelNameValidationError(vercelProjectName)}
+                        </div>
+                      )}
+                      {!vercelProjectName.trim() && (
+                        <div className="auth-error" style={{ marginTop: 0 }}>
+                          Informe o nome do projeto na Vercel.
+                        </div>
+                      )}
+                    </div>
                   )}
-                  {vercelState.deploymentUrl ? "Publicar novamente" : "Publicar em produção"}
-                </button>
-              </div>
+
+                  {vercelState.deployment === "deploying" ? (
+                    <div className="vercel-deploying-box">
+                      <Loader2 size={24} className="spin text-primary"/>
+                      <div>
+                        <strong>Publicando em produção...</strong>
+                        <span>A Vercel está enviando os arquivos e construindo o frontend.</span>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {(vercelError || vercelState.error) && (
+                    <div className="creation-error">
+                      <AlertTriangle size={14}/> {vercelError || vercelState.error}
+                    </div>
+                  )}
+
+                  <div className="modal-actions" style={{ display: "flex", justifyContent: "flex-end" }}>
+                    <button
+                      type="button"
+                      className="primary vercel-publish-btn"
+                      disabled={!project || vercelState.deployment === "deploying" || vercelBusy || (!vercelState.linked && !isValidVercelProjectName(vercelProjectName))}
+                      onClick={() => void handlePublishVercel()}
+                    >
+                      {vercelState.deployment === "deploying" || vercelBusy ? (
+                        <Loader2 size={16} className="spin"/>
+                      ) : (
+                        <CloudUpload size={16}/>
+                      )}
+                      {vercelState.deploymentUrl ? "Publicar novamente" : "Publicar em produção"}
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           )}
         </>

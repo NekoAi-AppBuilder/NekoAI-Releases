@@ -55,6 +55,12 @@ export class VercelManager extends EventEmitter {
   private shuttingDown = false;
   private deploymentUrls = new Map<string, string>();
 
+  constructor(vault?: VercelVaultManager, cliWrapper?: VercelCli) {
+    super();
+    if (vault) this.vault = vault;
+    if (cliWrapper) this.cliWrapper = cliWrapper;
+  }
+
   public getState(): VercelState {
     return { ...this.state };
   }
@@ -84,37 +90,153 @@ export class VercelManager extends EventEmitter {
     console.log(`[Neko/Vercel] whoami result=${username || "null"}`);
     if (username) {
       console.log(`[Neko/Vercel] authentication successful user=${username}`);
+      this.setState({
+        connection: "connected",
+        username,
+        error: null,
+      });
+      if (this.state.projectPath) {
+        await this.restoreProjectBinding(this.state.projectPath, username);
+      }
+    } else {
+      this.setState({
+        connection: "disconnected",
+        username: null,
+        error: null,
+      });
     }
-    this.setState({
-      connection: username ? "connected" : "disconnected",
-      username,
-      error: null,
-    });
+  }
+
+  public async restoreProjectBinding(projectPath: string | null, username: string | null): Promise<void> {
+    if (!projectPath) return;
+    const deployment = await this.vault.getDeployment(projectPath);
+    const hasProjectJson = await this.pathExists(path.join(projectPath, ".vercel", "project.json"));
+
+    if (deployment) {
+      if (!deployment.username || !username || deployment.username === username) {
+        // Same account or legacy: restore deployment & linked status
+        this.deploymentUrls.set(projectPath, deployment.deploymentUrl);
+        this.setState({
+          projectName: deployment.projectName || path.basename(projectPath),
+          deploymentUrl: deployment.deploymentUrl,
+          linked: hasProjectJson || Boolean(deployment.projectName),
+          error: null,
+        });
+      } else {
+        // Different account: verify ownership/access before restoring
+        let hasAccess = false;
+        if (this.cli && deployment.projectName) {
+          try {
+            const listRes = await this.cliWrapper.runCli(this.cli, ["project", "ls"], undefined, 15000);
+            if (cleanVercelOutput(listRes.stdout).toLowerCase().includes(deployment.projectName.toLowerCase())) {
+              hasAccess = true;
+            }
+          } catch {}
+        }
+        if (hasAccess) {
+          await this.vault.saveDeployment(projectPath, deployment.deploymentUrl, deployment.projectName, username);
+          this.deploymentUrls.set(projectPath, deployment.deploymentUrl);
+          this.setState({
+            projectName: deployment.projectName,
+            deploymentUrl: deployment.deploymentUrl,
+            linked: hasProjectJson || true,
+            error: null,
+          });
+        } else {
+          // Account B does not have access to Account A's project
+          this.setState({
+            projectName: path.basename(projectPath),
+            deploymentUrl: null,
+            linked: false,
+          });
+        }
+      }
+    } else if (hasProjectJson) {
+      this.setState({ linked: true });
+    }
   }
 
   public async setProject(projectPath: string | null): Promise<void> {
     const generation = ++this.projectGeneration;
-    const cachedUrl = projectPath
-      ? this.deploymentUrls.get(projectPath) ?? (await this.vault.getDeploymentUrl(projectPath))
-      : null;
-    const cachedProjectName = projectPath
-      ? await this.vault.getProjectName(projectPath)
-      : null;
+    if (!projectPath) {
+      this.setState({
+        projectPath: null,
+        projectName: null,
+        linked: false,
+        deployment: "idle",
+        deploymentUrl: null,
+        error: null,
+      });
+      return;
+    }
+
+    const linked = await this.pathExists(path.join(projectPath, ".vercel", "project.json"));
+    const deployment = await this.vault.getDeployment(projectPath);
+    const cachedUrl = this.deploymentUrls.get(projectPath) ?? deployment?.deploymentUrl ?? null;
+    const effectiveProjectName = deployment?.projectName || path.basename(projectPath);
+
+    if (generation !== this.projectGeneration) return;
+
+    if (this.state.username && deployment?.username && deployment.username !== this.state.username) {
+      // Different account connected! Verify access
+      let hasAccess = false;
+      if (this.cli && deployment.projectName) {
+        try {
+          const listRes = await this.cliWrapper.runCli(this.cli, ["project", "ls"], undefined, 15000);
+          if (cleanVercelOutput(listRes.stdout).toLowerCase().includes(deployment.projectName.toLowerCase())) {
+            hasAccess = true;
+          }
+        } catch {}
+      }
+      if (hasAccess) {
+        this.setState({
+          projectPath,
+          projectName: effectiveProjectName,
+          linked: linked || Boolean(cachedUrl),
+          deployment: "idle",
+          deploymentUrl: cachedUrl,
+          error: null,
+        });
+      } else {
+        this.setState({
+          projectPath,
+          projectName: path.basename(projectPath),
+          linked: false,
+          deployment: "idle",
+          deploymentUrl: null,
+          error: null,
+        });
+      }
+      return;
+    }
 
     this.setState({
       projectPath,
-      projectName: cachedProjectName || (projectPath ? path.basename(projectPath) : null),
-      linked: false,
+      projectName: effectiveProjectName,
+      linked: linked || Boolean(cachedUrl),
       deployment: "idle",
       deploymentUrl: cachedUrl,
       error: null,
     });
+  }
 
-    if (!projectPath) return;
-    const linked = await this.pathExists(path.join(projectPath, ".vercel", "project.json"));
-    if (generation === this.projectGeneration) {
-      this.setState({ linked });
+  public async unlinkProject(projectPath: string): Promise<VercelState> {
+    if (!projectPath) return this.getState();
+    const vercelDir = path.join(projectPath, ".vercel");
+    await fs.rm(vercelDir, { recursive: true, force: true }).catch(() => {});
+    await this.vault.removeDeployment(projectPath);
+    this.deploymentUrls.delete(projectPath);
+
+    if (this.state.projectPath === projectPath) {
+      this.setState({
+        linked: false,
+        deploymentUrl: null,
+        projectName: path.basename(projectPath),
+        deployment: "idle",
+        error: null,
+      });
     }
+    return this.getState();
   }
 
   public async disconnect(): Promise<VercelState> {
@@ -131,8 +253,6 @@ export class VercelManager extends EventEmitter {
         connection: "disconnected",
         username: null,
         deployment: "idle",
-        linked: false,
-        deploymentUrl: null,
         error: null,
       });
     }
@@ -166,6 +286,7 @@ export class VercelManager extends EventEmitter {
     if (existingUser) {
       console.log(`[Neko/Vercel] authentication successful user=${existingUser}`);
       this.setState({ connection: "connected", username: existingUser, error: null });
+      await this.restoreProjectBinding(this.state.projectPath, existingUser);
       return this.getState();
     }
 
@@ -186,6 +307,7 @@ export class VercelManager extends EventEmitter {
         if (username) {
           console.log(`[Neko/Vercel] authentication successful user=${username}`);
           this.setState({ connection: "connected", username, error: null });
+          await this.restoreProjectBinding(this.state.projectPath, username);
           return this.getState();
         }
       }
@@ -317,7 +439,7 @@ export class VercelManager extends EventEmitter {
 
       const effectiveProjectName = customProjectName?.trim() || this.state.projectName || path.basename(projectPath);
       this.deploymentUrls.set(projectPath, deploymentUrl);
-      await this.vault.saveDeployment(projectPath, deploymentUrl, effectiveProjectName);
+      await this.vault.saveDeployment(projectPath, deploymentUrl, effectiveProjectName, username);
 
       this.setState({
         deployment: "ready",

@@ -27,6 +27,8 @@ export interface SupabaseIntegration {
   projectName: string;
   projectUrl: string;
   publishableKey: string;
+  region?: string;
+  orgId?: string;
   mcpName?: string;
   connectedAt?: number;
   openCodeConfigPath?: string | null;
@@ -54,6 +56,7 @@ export interface SupabaseState {
   projectRef: string | null;
   projectName: string | null;
   projectUrl: string | null;
+  region?: string | null;
   pendingRuntimeSetup?: boolean;
   recentCreatedNotice?: string | null;
   error: string | null;
@@ -96,6 +99,7 @@ export const EMPTY_SUPABASE_STATE: SupabaseState = {
   projectRef: null,
   projectName: null,
   projectUrl: null,
+  region: null,
   pendingRuntimeSetup: false,
   error: null,
 };

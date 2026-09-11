@@ -28,6 +28,12 @@ export class SupabaseManager extends EventEmitter {
   private activeProjectPath: string | null = null;
   private isBusy = false;
 
+  constructor(vault?: SupabaseVaultManager, cli?: SupabaseCli) {
+    super();
+    if (vault) this.vault = vault;
+    if (cli) this.cli = cli;
+  }
+
   public getState(): SupabaseState {
     return { ...this.state, projects: [...this.state.projects], organizations: [...this.state.organizations] };
   }
@@ -43,6 +49,25 @@ export class SupabaseManager extends EventEmitter {
 
   public async initialize(): Promise<void> {
     await this.vault.loadVault();
+    try {
+      const projects = await this.cli.listProjects();
+      const organizations = await this.cli.listOrganizations();
+      this.setState({
+        configured: true,
+        projects,
+        organizations,
+      });
+      if (this.activeProjectPath) {
+        await this.setProject(this.activeProjectPath);
+      }
+    } catch {
+      this.setState({
+        configured: true,
+        status: "disconnected",
+        projects: [],
+        organizations: [],
+      });
+    }
   }
 
   public async setProject(projectPath: string | null): Promise<void> {
@@ -62,13 +87,18 @@ export class SupabaseManager extends EventEmitter {
 
     const integration = await this.vault.getIntegration(projectPath);
     if (integration) {
+      const hasAccess = currentProjects.length > 0
+        ? currentProjects.some(p => p.ref === integration.projectRef || p.id === integration.projectRef)
+        : false;
+
       this.setState({
         ...EMPTY_SUPABASE_STATE,
         configured: true,
-        status: "connected",
+        status: hasAccess ? "connected" : "disconnected",
         projectRef: integration.projectRef,
         projectName: integration.projectName,
         projectUrl: integration.projectUrl,
+        region: integration.region || null,
         pendingRuntimeSetup: integration.pendingRuntimeSetup || false,
         projects: currentProjects,
         organizations: currentOrganizations,
@@ -94,8 +124,38 @@ export class SupabaseManager extends EventEmitter {
       this.setProgress("selecting");
       const projects = await this.cli.listProjects();
       const organizations = await this.cli.listOrganizations();
+
+      let autoConnected = false;
+      let connectedRef: string | null = null;
+      let connectedName: string | null = null;
+      let connectedUrl: string | null = null;
+      let connectedRegion: string | null = null;
+      let pendingRuntime = false;
+
+      if (this.activeProjectPath) {
+        const integration = await this.vault.getIntegration(this.activeProjectPath);
+        if (integration) {
+          const matchingProject = projects.find(
+            (p) => p.ref === integration.projectRef || p.id === integration.projectRef
+          );
+          if (matchingProject) {
+            autoConnected = true;
+            connectedRef = integration.projectRef;
+            connectedName = matchingProject.name || integration.projectName;
+            connectedUrl = integration.projectUrl || `https://${integration.projectRef}.supabase.co`;
+            connectedRegion = matchingProject.region || integration.region || null;
+            pendingRuntime = integration.pendingRuntimeSetup || false;
+          }
+        }
+      }
+
       this.setState({
-        status: "disconnected",
+        status: autoConnected ? "connected" : "disconnected",
+        projectRef: connectedRef,
+        projectName: connectedName,
+        projectUrl: connectedUrl,
+        region: connectedRegion,
+        pendingRuntimeSetup: pendingRuntime,
         projects,
         organizations,
         error: null,
@@ -126,9 +186,42 @@ export class SupabaseManager extends EventEmitter {
     try {
       const projects = await this.cli.listProjects();
       const organizations = await this.cli.listOrganizations();
+
+      let autoConnected = previousState.status === "connected";
+      let connectedRef = previousState.projectRef;
+      let connectedName = previousState.projectName;
+      let connectedUrl = previousState.projectUrl;
+      let connectedRegion = previousState.region;
+
+      if (this.activeProjectPath) {
+        const integration = await this.vault.getIntegration(this.activeProjectPath);
+        if (integration) {
+          const matchingProject = projects.find(
+            (p) => p.ref === integration.projectRef || p.id === integration.projectRef
+          );
+          if (matchingProject) {
+            autoConnected = true;
+            connectedRef = integration.projectRef;
+            connectedName = matchingProject.name || integration.projectName;
+            connectedUrl = integration.projectUrl || `https://${integration.projectRef}.supabase.co`;
+            connectedRegion = matchingProject.region || integration.region || null;
+          } else {
+            autoConnected = false;
+            connectedRef = null;
+            connectedName = null;
+            connectedUrl = null;
+            connectedRegion = null;
+          }
+        }
+      }
+
       this.setState({
         ...previousState,
-        status: previousState.status === "connected" ? "connected" : "disconnected",
+        status: autoConnected ? "connected" : "disconnected",
+        projectRef: connectedRef,
+        projectName: connectedName,
+        projectUrl: connectedUrl,
+        region: connectedRegion,
         projects,
         organizations,
         recentCreatedNotice: clearNotice ? null : previousState.recentCreatedNotice,
@@ -295,6 +388,7 @@ export class SupabaseManager extends EventEmitter {
         projectName: project.name,
         projectUrl: url,
         publishableKey,
+        region: project.region,
         mcpName: `neko_supabase_${ref}`,
         openCodeConfigPath: setup.openCodeConfigPath,
         pendingRuntimeSetup: setup.pendingRuntimeSetup,
@@ -317,6 +411,7 @@ export class SupabaseManager extends EventEmitter {
         projectRef: ref,
         projectName: project.name,
         projectUrl: url,
+        region: project.region || null,
         pendingRuntimeSetup: setup.pendingRuntimeSetup,
         recentCreatedNotice: null,
         error: null,
@@ -339,15 +434,35 @@ export class SupabaseManager extends EventEmitter {
     }
   }
 
-  public async disconnect(projectPath: string): Promise<SupabaseState> {
+  public async disconnect(_projectPath?: string): Promise<SupabaseState> {
+    if (this.isBusy) throw new Error("Aguarde a operação atual do Supabase terminar.");
+    this.isBusy = true;
+
+    try {
+      await this.cli.logout().catch(() => {});
+      this.setState({
+        ...EMPTY_SUPABASE_STATE,
+        configured: true,
+        status: "disconnected",
+        projects: [],
+        organizations: [],
+      });
+
+      return this.getState();
+    } finally {
+      this.isBusy = false;
+    }
+  }
+
+  public async unlinkProject(projectPath: string): Promise<SupabaseState> {
     if (this.isBusy) throw new Error("Aguarde a operação atual do Supabase terminar.");
     this.isBusy = true;
 
     try {
       const integration = await this.vault.getIntegration(projectPath);
       if (integration) {
-        await removeSupabaseOpenCodeConfig(projectPath, integration.projectRef);
-        await removeSupabaseSkill(projectPath, integration.projectRef);
+        await removeSupabaseOpenCodeConfig(projectPath, integration.projectRef).catch(() => {});
+        await removeSupabaseSkill(projectPath, integration.projectRef).catch(() => {});
         await removeSupabaseVsCodeMcpConfig(projectPath, integration.projectRef).catch(() => {});
 
         const usedElsewhere = await this.vault.isProjectUsedElsewhere(projectPath, integration.projectRef);
@@ -358,11 +473,17 @@ export class SupabaseManager extends EventEmitter {
         await this.vault.removeIntegration(projectPath);
       }
 
-      this.setState({
-        ...EMPTY_SUPABASE_STATE,
-        configured: true,
-        status: "disconnected",
-      });
+      if (this.activeProjectPath === projectPath) {
+        this.setState({
+          status: "disconnected",
+          projectRef: null,
+          projectName: null,
+          projectUrl: null,
+          region: null,
+          pendingRuntimeSetup: false,
+          error: null,
+        });
+      }
 
       return this.getState();
     } finally {

@@ -10,9 +10,19 @@ export const projectKey = (projectPath: string): string =>
 
 export class SupabaseVaultManager {
   private vault: SupabaseVault | null = null;
+  private customVaultPath?: string;
+
+  constructor(customVaultPath?: string) {
+    this.customVaultPath = customVaultPath;
+  }
 
   private getVaultPath(): string {
-    return path.join(app.getPath("userData"), "supabase-vault.json");
+    if (this.customVaultPath) return this.customVaultPath;
+    try {
+      return path.join(app.getPath("userData"), "supabase-vault.json");
+    } catch {
+      return path.join(process.cwd(), "supabase-vault.json");
+    }
   }
 
   public async loadVault(): Promise<SupabaseVault> {
@@ -26,7 +36,7 @@ export class SupabaseVaultManager {
       const raw = await fs.readFile(vaultPath, "utf8");
       const parsed = JSON.parse(raw);
       if (parsed?.encrypted) {
-        if (safeStorage.isEncryptionAvailable()) {
+        if (safeStorage && typeof safeStorage.isEncryptionAvailable === "function" && safeStorage.isEncryptionAvailable()) {
           const decrypted = safeStorage.decryptString(Buffer.from(parsed.encrypted, "base64"));
           const data = JSON.parse(decrypted);
           this.vault = { version: 2, integrations: data.integrations || {} };
@@ -54,7 +64,7 @@ export class SupabaseVaultManager {
     const vaultPath = this.getVaultPath();
     const dataString = JSON.stringify(vault);
     let toWrite: string;
-    if (safeStorage.isEncryptionAvailable()) {
+    if (safeStorage && typeof safeStorage.isEncryptionAvailable === "function" && safeStorage.isEncryptionAvailable()) {
       try {
         const encrypted = safeStorage.encryptString(dataString).toString("base64");
         toWrite = JSON.stringify({ encrypted }, null, 2);

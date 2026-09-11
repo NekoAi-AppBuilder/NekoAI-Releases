@@ -9,7 +9,10 @@ export function clearStatusCache() {
 }
 
 export function clearStatusCacheForSession(sessionId: string) {
-  if (sessionId) statusCache.delete(sessionId);
+  if (sessionId) {
+    statusCache.delete(sessionId);
+    statusCache.delete("default");
+  }
 }
 
 export function normalizeOpenCodeEvent(event: any) {
@@ -18,7 +21,7 @@ export function normalizeOpenCodeEvent(event: any) {
   if (type === "session.updated" || type === "session.diff") return null;
 
   if (type === "session.status") {
-    const id = String(props?.sessionID ?? props?.sessionId ?? "default");
+    const id = String(props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? event?.sessionID ?? event?.sessionId ?? "default");
     const status = String(props?.status?.type ?? props?.status ?? "");
     const taskId = props?.taskId;
     if (statusCache.get(id) === status) return null;
