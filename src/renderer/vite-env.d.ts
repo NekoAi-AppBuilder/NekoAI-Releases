@@ -60,6 +60,7 @@ interface Window {
     githubGitStatus(): Promise<any>;
     githubListBranches(repoFullName: string): Promise<string[]>;
     githubCheckoutBranch(branchName: string): Promise<any>;
+    githubCreateBranch(name: string, baseBranch?: string): Promise<any>;
     githubLinkProject(repoFullName: string, replaceRemote?: boolean, overwriteLocalContent?: boolean): Promise<any>;
     githubChooseCloneDestination(): Promise<any>;
     githubOpenFolder(folderPath: string): Promise<boolean>;
@@ -67,8 +68,11 @@ interface Window {
     githubPublishProject(repoName: string, isPrivate?: boolean): Promise<any>;
     githubCancelPublish?(): Promise<any>;
     githubCommitPush(message: string): Promise<any>;
+    githubGetDefaultBranch(): Promise<string | null>;
+    githubCreatePullRequest(repoFullName: string, head: string, base: string, title?: string, body?: string): Promise<{ ok: boolean; error?: string; html_url?: string }>;
     onGithubEvent(callback: (event: any) => void): () => void;
     githubDiscardChanges(): Promise<boolean>;
+    githubCheckRepoAccess?(repoFullName: string): Promise<{ accessible: boolean; status: number }>;
     supabaseGetState(): Promise<any>;
     supabaseConnectWithToken(token: string): Promise<any>;
     supabaseRefreshProjects(clearNotice?: boolean): Promise<any>;

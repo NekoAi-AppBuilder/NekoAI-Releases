@@ -24,9 +24,10 @@ import {
 export class SupabaseManager extends EventEmitter {
   private state: SupabaseState = { ...EMPTY_SUPABASE_STATE };
   private vault = new SupabaseVaultManager();
-  private cli = new SupabaseCli();
+  public cli = new SupabaseCli();
   private activeProjectPath: string | null = null;
   private isBusy = false;
+  private currentAccessToken: string | null = null;
 
   constructor(vault?: SupabaseVaultManager, cli?: SupabaseCli) {
     super();
@@ -121,6 +122,7 @@ export class SupabaseManager extends EventEmitter {
 
     try {
       await this.cli.login(token);
+      this.currentAccessToken = token.trim();
       this.setProgress("selecting");
       const projects = await this.cli.listProjects();
       const organizations = await this.cli.listOrganizations();
@@ -440,6 +442,7 @@ export class SupabaseManager extends EventEmitter {
 
     try {
       await this.cli.logout().catch(() => {});
+      this.currentAccessToken = null;
       this.setState({
         ...EMPTY_SUPABASE_STATE,
         configured: true,
@@ -493,6 +496,20 @@ export class SupabaseManager extends EventEmitter {
 
   public async getIntegration(projectPath: string): Promise<SupabaseIntegration | null> {
     return this.vault.getIntegration(projectPath);
+  }
+
+  public async getAccessToken(projectPath?: string): Promise<string | null> {
+    if (this.currentAccessToken) {
+      return this.currentAccessToken;
+    }
+    const cliToken = this.cli.readStoredCliToken();
+    if (cliToken) {
+      this.currentAccessToken = cliToken;
+      return cliToken;
+    }
+    // As a fallback, if we have a project path, we might try to extract token from somewhere else,
+    // but typically it's only in the CLI or memory.
+    return null;
   }
 
   public shutdown() {

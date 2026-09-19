@@ -641,6 +641,17 @@ export class SupabaseCli {
     } catch {}
   }
 
+  public readStoredCliToken(): string | null {
+    try {
+      const home = os.homedir();
+      const tokenPath = path.join(home, ".supabase", "access-token");
+      if (fsSync.existsSync(tokenPath)) {
+        return fsSync.readFileSync(tokenPath, "utf8").trim() || null;
+      }
+    } catch {}
+    return null;
+  }
+
   public async listProjects(): Promise<SupabaseProject[]> {
     const result = await this.runCli(["projects", "list", "--output-format", "json"]);
     try {

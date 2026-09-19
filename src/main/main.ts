@@ -359,11 +359,18 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
   const previous = record.state;
   if (previous === state) return false;
 
-  // Guarda de estado terminal: eventos atrasados não podem ressuscitar uma tarefa finalizada
+  // Guarda de estado terminal: eventos atrasados não podem ressuscitar uma tarefa finalizada.
+  // "cancelled" é decisão do usuário e tem precedência absoluta — nem session.error (→ failed)
+  // nem session.idle (→ completed) podem sobrescrever um cancelamento.
   const isTerminal = previous === "completed" || previous === "cancelled" || previous === "failed";
-  if (isTerminal && reason !== "task-start" && state !== "completed" && state !== "cancelled" && state !== "failed") {
-    console.log(`[TaskState] Ignorando transição tardia de estado terminal (${previous} -> ${state}) sessionId=${sessionId.slice(0, 8)} taskId=${record.taskId || "none"} reason=${logSafeText(reason)}`);
-    return false;
+  if (isTerminal && reason !== "task-start") {
+    // Allow failed→failed or completed→completed no-ops (caught by previous===state check above).
+    // The only transition allowed from a terminal state is a fresh task-start replacing the record.
+    // Specifically: cancelled→failed MUST be blocked (late session.error after user Stop).
+    if (previous === "cancelled" || !(state === "completed" || state === "cancelled" || state === "failed")) {
+      console.log(`[TaskState] Ignorando transição tardia de estado terminal (${previous} -> ${state}) sessionId=${sessionId.slice(0, 8)} taskId=${record.taskId || "none"} reason=${logSafeText(reason)}`);
+      return false;
+    }
   }
 
   record.state = state;
@@ -930,6 +937,14 @@ async function runIdleDetermination(sessionId: string, taskId: string, isQuestio
       return;
     }
     clearActiveAgentRequest(sessionId);
+    // [plan_exit-fix C] Plan tasks MUST NOT be concluded as "completed" by session.idle alone.
+    // The plan agent must call plan_exit first (which transitions to waiting_for_user/plan-approval-asked).
+    // If session.idle arrives without a prior plan_exit the task stays open — waiting for the native
+    // plan_exit tool call. Only Build tasks auto-complete via session.idle.
+    if (record.planMode) {
+      console.log(`[TaskLifecycle] session.idle for Plan task — NOT completing: plan_exit not yet received session=${sessionId}`);
+      return;
+    }
     setTaskState(sessionId, "completed", "session-idle");
     logTask("completion-detected", taskId, sessionId);
     logTask("completed", taskId, sessionId);
@@ -2248,7 +2263,11 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     {
       cwd: safeProjectPath,
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      // Enable the native plan_exit tool in OpenCode 1.18.23.
+      // OPENCODE_CLIENT defaults to "cli" (required for plan_exit to be registered).
+      // OPENCODE_EXPERIMENTAL is NOT set here — only the specific plan mode flag is enabled.
+      env: { ...process.env, OPENCODE_EXPERIMENTAL_PLAN_MODE: "true" }
     }
   );
 
@@ -2603,8 +2622,10 @@ async function subscribeEvents(gen?: number) {
               clearActiveAgentRequest(sessionId);
               engineRetryStates.delete(sessionId);
               if (taskRecords.has(sessionId)) {
-                setTaskState(sessionId, "failed", "session-error");
-                logTask("failed", resolveTaskIdForSession(sessionId), sessionId);
+                const stateChanged = setTaskState(sessionId, "failed", "session-error");
+                if (stateChanged) {
+                  logTask("failed", resolveTaskIdForSession(sessionId), sessionId);
+                }
               }
             }
             perfFlushTask(sessionId, "error");
@@ -2743,6 +2764,30 @@ async function subscribeEvents(gen?: number) {
               record.askedQuestionIds.push(questionId);
             }
             console.log(`[TaskLifecycle] native question.asked session=${questionSessionId} requestId=${requestId} isPlan=${isPlanApproval} text=${questionText.slice(0, 60)}`);
+
+            // [plan-card-fix] When plan_exit fires, OpenCode provides the plan file path in the
+            // question text: "Plan at .opencode/plans/xxx.md is complete...".
+            // Extract and read that file so the card shows the real plan markdown, not the
+            // previous clarifying question which happens to be the last assistant message.
+            let planFileContent: string | undefined;
+            let planFilePath: string | undefined;
+            if (isPlanApproval && currentProject) {
+              // Match both forward-slash and backslash paths from OpenCode
+              const pathMatch = questionText.match(/plan\s+at\s+([^\s]+(?:\.md)?)/i);
+              if (pathMatch?.[1]) {
+                const rawPath = pathMatch[1].replace(/^["']|["']$/g, "").replace(/\\/g, "/");
+                planFilePath = rawPath;
+                try {
+                  const absPath = safePathWithinProject(currentProject, rawPath);
+                  planFileContent = await fs.promises.readFile(absPath, "utf8");
+                  console.log(`[TaskLifecycle] plan file read ok path=${rawPath} chars=${planFileContent.length}`);
+                } catch (readErr: any) {
+                  console.warn(`[TaskLifecycle] plan file read failed path=${rawPath} err=${readErr?.message}`);
+                  planFileContent = undefined; // will show error in renderer
+                }
+              }
+            }
+
             setTaskState(questionSessionId, "waiting_for_user", isPlanApproval ? "plan-approval-asked" : "question-asked", {
               questionId,
               requestId,
@@ -2750,7 +2795,9 @@ async function subscribeEvents(gen?: number) {
               isPlanApproval,
               question: questionText,
               options,
-              allowFreeText
+              allowFreeText,
+              planFileContent,
+              planFilePath
             });
             logTask("question", record?.taskId ?? "", questionSessionId, `requestId=${requestId} native=true planApproval=${isPlanApproval}`);
           }
@@ -6136,22 +6183,28 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   const languageInstruction = `IDIOMA OBRIGATÓRIO DA INTERFACE: Português do Brasil (pt-BR).
 Todas as respostas destinadas ao usuário devem ser escritas em português do Brasil, incluindo resumo, conclusão, explicações, nomes de etapas e qualquer texto final. Não responda em inglês, espanhol ou outro idioma. Preserve nomes técnicos inevitáveis (por exemplo, nomes de arquivos, APIs, bibliotecas, comandos, variáveis e URLs) somente quando forem necessários, mas explique o restante em português. Nunca copie ou reproduza logs, mensagens ou respostas internas de ferramentas como se fossem uma resposta ao usuário. Gere uma única resposta final, exclusivamente em português do Brasil. Não inclua uma versão em inglês antes ou depois da resposta em português.`;
 
-  const planInstruction = `You are NekoAI's planning agent. Analyze the user's request and the current project, then create a comprehensive, implementation-ready plan. Do not edit project files directly. Formulate the plan clearly, detailing what will be changed, where it will be changed, and how it will be validated. When your plan is ready, you must call the native plan_exit tool to request user approval before any implementation begins. If you need any clarification or architectural choices from the user during planning, use the native question tool.
-
-${languageInstruction}
-
-USER REQUEST:
-${userRequestText}`;
-
+  // [plan_exit-fix B] Para Plan mode: NÃO enviar o campo `system`.
+  // O campo `system` no prompt_async SUBSTITUI o system prompt nativo do agente "plan" do OpenCode.
+  // Esse system prompt nativo contém as instruções obrigatórias de usar plan_exit (Phase 5).
+  // Sem ele, o modelo nunca chama plan_exit e a sessão termina em session.idle sem o card de aprovação.
+  // A instrução de idioma vai em parts (como contexto) para não interferir no system prompt nativo.
+  // Para Build: o system customizado do NekoAI continua sendo enviado normalmente.
   const requestBody = {
     agent: payload.planMode ? "plan" : "build",
-    ...(payload.planMode ? {} : {
-      system: `You are the NekoAI software development agent. You have received an APPROVED PLAN from the user. Execute it now by modifying the project files directly in the current workspace. Do not merely describe the changes and do not ask for another approval. Do not run long-lived development servers such as npm run dev in the foreground and wait for them. The NekoAI Preview Manager handles dev servers separately. Focus on implementing the requested application, creating or editing files, installing dependencies when needed, and validating with short-lived commands. After implementation, verify that the requested changes actually exist in the files and report which files were changed. If you encounter critical ambiguity between multiple valid implementations or need the user's architectural choice, use the native question tool to ask the user.
-
-${languageInstruction}`
-    }),
+    ...(payload.planMode
+      ? {}  // Plan: sem system — usa o system prompt nativo do agente plan integralmente
+      : {
+          system: `You are the NekoAI software development agent. You have received an APPROVED PLAN from the user. Execute it now by modifying the project files directly in the current workspace. Do not merely describe the changes and do not ask for another approval. Do not run long-lived development servers such as npm run dev in the foreground and wait for them. The NekoAI Preview Manager handles dev servers separately. Focus on implementing the requested application, creating or editing files, installing dependencies when needed, and validating with short-lived commands. After implementation, verify that the requested changes actually exist in the files and report which files were changed. If you encounter critical ambiguity between multiple valid implementations or need the user's architectural choice, use the native question tool to ask the user.\n\n${languageInstruction}`
+        }
+    ),
     ...(payload.model ? { model: payload.model } : {}),
-    parts: [{ type: "text", text: payload.planMode ? planInstruction : userRequestText }, ...contextParts]
+    parts: [
+      // Para Plan mode: inclui instrução de idioma como primeiro part contextual.
+      // Fica fora do system para não sobrepor o system prompt nativo do plan agent.
+      ...(payload.planMode ? [{ type: "text", text: languageInstruction }] : []),
+      { type: "text", text: userRequestText },
+      ...contextParts
+    ]
   };
 
   const promptStartedAt = Date.now();

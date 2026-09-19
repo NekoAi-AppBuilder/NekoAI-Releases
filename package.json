@@ -1,6 +1,6 @@
 {
   "name": "nekoai",
-  "version": "0.4.84",
+  "version": "0.4.85",
   "private": true,
   "description": "NekoAI - AI software builder",
   "main": "dist/main/main.js",
@@ -19,6 +19,8 @@
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "shiki": "4.2.0"
   },
   "devDependencies": {

@@ -6,13 +6,15 @@ import {
   ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, ChevronUp, ChevronRight, CircleAlert, Code2, Download,
   ExternalLink, Eye, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
-  Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
+  Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitPullRequest, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
   Key, ShieldCheck, Laptop, Calendar, BadgeCheck
 } from "lucide-react";
 import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
 import { nextChatMode, chatModeLabel, CHAT_MODES, type ChatMode } from "../shared/chat-mode";
 import { getNekoTutorials, type NekoTutorial } from "./tutorials";
+import { MarkdownRenderer } from "./components/MarkdownRenderer";
+
 import { notifyOnce, playNotify, soundEnabled, setSoundEnabled, unlockAudio } from "./sounds";
 import { buildAgentCaptureContext, htmlToText } from "../main/site-capture";
 import { CodeWorkspace } from "./components/code";
@@ -371,7 +373,7 @@ function formatProjectActivity(item: RecentProject): string {
 
 type Node = { name: string; path: string; type: "file" | "directory"; children?: Node[] };
 type Message = { role: "user" | "assistant" | "system" | "error"; text: string; attachments?: Attachment[]; taskId?: string; durationMs?: number; createdAt?: number };
-type PendingPlan = { request: string; attachments: Attachment[]; contextPaths: string[]; planText: string; messageCreatedAt: number; requestId?: string; taskId?: string; sessionID?: string };
+type PendingPlan = { request: string; attachments: Attachment[]; contextPaths: string[]; planText: string; messageCreatedAt: number; requestId?: string; taskId?: string; sessionID?: string; options?: string[]; planFilePath?: string };
 type ApprovedPlan = { planText: string; approvedAt: number; messageCreatedAt: number };
 type Activity = { id: string; icon: "brain" | "tool" | "file" | "command" | "status" | "check" | "error" | "wait"; title: string; detail?: string; state: "running" | "done" | "error"; ts: number };
 type PermissionRequest = { id: string; sessionID: string; permission: string; patterns: string[]; always?: string[]; metadata?: Record<string, unknown>; tool?: { messageID?: string; callID?: string } };
@@ -1184,7 +1186,10 @@ function App() {
   const [githubBranches, setGithubBranches] = React.useState<string[]>([]);
   const [githubBranchMenuOpen, setGithubBranchMenuOpen] = React.useState(false);
   const [githubBranchBusy, setGithubBranchBusy] = React.useState(false);
+  const [githubBranchRefreshing, setGithubBranchRefreshing] = React.useState(false);
   const [githubBranchError, setGithubBranchError] = React.useState("");
+  const [isCreatingBranch, setIsCreatingBranch] = React.useState(false);
+  const [newBranchInput, setNewBranchInput] = React.useState("");
   const [pendingTargetBranch, setPendingTargetBranch] = React.useState<string | null>(null);
   const [showBranchDiffList, setShowBranchDiffList] = React.useState(false);
   const [branchCommitMessage, setBranchCommitMessage] = React.useState("WIP: alterações antes de trocar de branch");
@@ -1200,6 +1205,12 @@ function App() {
   const [githubShowRepos, setGithubShowRepos] = React.useState(false);
   const [githubCommitMessage, setGithubCommitMessage] = React.useState("");
   const [githubCommitBusy, setGithubCommitBusy] = React.useState(false);
+  const [githubAutoCommit, setGithubAutoCommit] = React.useState(false);
+  const githubAutoCommitRef = React.useRef(githubAutoCommit);
+  React.useEffect(() => { githubAutoCommitRef.current = githubAutoCommit; }, [githubAutoCommit]);
+  const [githubPullBusy, setGithubPullBusy] = React.useState(false);
+  const [githubPullError, setGithubPullError] = React.useState("");
+  const [githubPullSuccess, setGithubPullSuccess] = React.useState(false);
   const [githubCommitError, setGithubCommitError] = React.useState("");
   const [githubCommitSuccess, setGithubCommitSuccess] = React.useState(false);
   const [newProjectName, setNewProjectName] = React.useState("");
@@ -1780,12 +1791,20 @@ function App() {
     return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("mousedown", onClick); };
   }, [chatModeMenuOpen]);
 
-  // Seletor de projetos: ao abrir o dropdown, esconde a view nativa do Preview
-  // (WebContentsView é pintada acima de TODO o DOM). Restaura ao fechar.
-  const anyProjectMenuOpen = projectMenuOpen || recentProjectsMenuOpen;
+  // Overlays (modais e dropdowns): quando um overlay está aberto, a visibilidade da view
+  // nativa (WebContentsView) é suspensa via setInternalPreviewOverlay para que o overlay DOM
+  // pinte perfeitamente sobre a superfície de preview (o iframe underlay permanece renderizado
+  // no DOM, garantindo que o Preview continue visível ao fundo sem desaparecer).
+  const isModalOpen = Boolean(modal || isSwitchingProject || lightboxImage);
+  const isTopbarDropdownOpen = Boolean(githubBranchMenuOpen || projectMenuOpen || recentProjectsMenuOpen);
+  const isInternalDropdownOpen = Boolean(previewRouteOpen);
+  const isAnyOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen);
+
   React.useEffect(() => {
-    window.neko.setInternalPreviewOverlay(anyProjectMenuOpen).catch(() => {});
-  }, [anyProjectMenuOpen]);
+    if (previewSurface === "webcontents" && workspaceTab === "preview" && previewUrl) {
+      window.neko.setInternalPreviewOverlay(isAnyOverlayOpen).catch(() => {});
+    }
+  }, [isAnyOverlayOpen, previewSurface, workspaceTab, previewUrl]);
 
   const pendingPlanTaskRef = React.useRef<string | null>(null);
   const providersGenerationRef = React.useRef(0);
@@ -1990,31 +2009,28 @@ function App() {
     return () => { alive = false; window.clearInterval(timer); };
   }, [project]);
 
-  React.useEffect(() => {
-    let alive = true;
-    const syncGithubContext = async () => {
-      try {
-        const git = await window.neko.githubGitStatus();
-        if (!alive) return;
-        setGithubLinkStatus(git);
-        if (git.linkedRepo) {
-          const names = await window.neko.githubListBranches(git.linkedRepo);
-          if (!alive) return;
-          const filtered = Array.from(new Set(names.filter((name: string) => name && name !== "origin" && name !== "HEAD" && name !== "origin/HEAD")));
-          setGithubBranches(filtered.length ? filtered : [git.branch || "main"]);
-        } else {
-          setGithubBranches(git.branch ? [git.branch] : []);
-        }
-      } catch {
-        if (alive) {
-          setGithubLinkStatus({ initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false });
-          setGithubBranches([]);
-        }
+  const syncGithubContext = React.useCallback(async () => {
+    try {
+      const git = await window.neko.githubGitStatus();
+      setGithubLinkStatus(git);
+      if (git.linkedRepo) {
+        const names = await window.neko.githubListBranches(git.linkedRepo);
+        const filtered = Array.from(new Set(names.filter((name: string) => name && name !== "origin" && name !== "HEAD" && name !== "origin/HEAD")));
+        setGithubBranches(filtered.length ? filtered : [git.branch || "main"]);
+      } else {
+        setGithubBranches(git.branch ? [git.branch] : []);
       }
-    };
-    void syncGithubContext();
-    return () => { alive = false; };
+    } catch {
+      if (!project) {
+        setGithubLinkStatus({ initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false });
+        setGithubBranches([]);
+      }
+    }
   }, [project]);
+
+  React.useEffect(() => {
+    void syncGithubContext();
+  }, [project, syncGithubContext]);
 
   React.useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
@@ -2036,6 +2052,8 @@ function App() {
       }
       if (!target.closest(".top-branch-wrap") && !target.closest(".branch-picker-wrap")) {
         setGithubBranchMenuOpen(false);
+        setIsCreatingBranch(false);
+        setNewBranchInput("");
       }
       if (!target.closest(".composer")) {
         setShowSlashMenu(false);
@@ -2065,6 +2083,7 @@ function App() {
             setGithubDevice(null);
           }
           setModal("github");
+          window.neko.githubGitStatus().then(git => setGithubLinkStatus(git)).catch(() => {});
           setGithubError("");
           setGithubBusy(false);
         } else {
@@ -2091,6 +2110,7 @@ function App() {
         setGithubDevice(null);
         setGithubError("");
         setModal("github");
+        void syncGithubContext();
       }
       if (event?.type === "github.cancelled") {
         setGithubBusy(false);
@@ -2100,8 +2120,14 @@ function App() {
         setGithubBusy(false);
         setGithubError(String(event.properties?.message || "Falha na conexão com o GitHub."));
       }
+      if (event?.type === "github.disconnected") {
+        setGithubStatus({ connected: false, repos: [] });
+        setGithubBusy(false);
+        setGithubDevice(null);
+        void syncGithubContext();
+      }
     });
-  }, []);
+  }, [syncGithubContext]);
 
   React.useEffect(() => {
     window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
@@ -2509,6 +2535,12 @@ function App() {
   const concludeCurrentTask = React.useCallback((state: "completed" | "cancelled" = "completed") => {
     const beforePhase = taskPhaseRef.current;
     if (taskPhaseRef.current === state && !busy) return;
+    // [Descartar-fix] If the task was already cancelled, a late "completed" event must be
+    // silently discarded: do NOT sync output, do NOT re-open busy, do NOT deliver responses.
+    if (taskPhaseRef.current === "cancelled" && state === "completed") {
+      console.log(`[TaskLifecycle] concludeCurrentTask: late 'completed' ignored — task already cancelled (phase=${taskPhaseRef.current})`);
+      return;
+    }
     // Terminal state: from now on, delayed events cannot re-introduce busy.
     taskPhaseRef.current = state;
     // Aviso sonoro: conclusão REAL da tarefa (não para cancelamento/plan).
@@ -2568,18 +2600,25 @@ function App() {
         if (questionId && !handledQuestionIdsRef.current.has(questionId)) {
           handledQuestionIdsRef.current.add(questionId);
           planAwaitingRef.current = true;
-          // Capture the last assistant message or props.question for the plan summary
-          const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
-          const planText = String(lastAssistant?.text || props?.question || "Plano de implementação concluído e pronto para revisão.").trim();
+          // [plan-card-fix] Use the real plan file content passed by main.ts from the .opencode/plans/*.md file.
+          // NEVER use lastAssistant.text — that is the previous clarifying question, not the plan.
+          // planFileContent is set by the question.asked handler in main.ts when isPlanApproval=true.
+          const planFileContent: string | undefined = props?.planFileContent ? String(props.planFileContent) : undefined;
+          const planFilePath: string | undefined = props?.planFilePath ? String(props.planFilePath) : undefined;
+          const planText = planFileContent
+            ?? (planFilePath ? `⚠️ Não foi possível ler o arquivo do plano: ${planFilePath}\n\nVerifique se o arquivo existe no projeto e tente novamente.` : "Plano de implementação concluído e pronto para revisão.");
+          const planOptions: string[] = Array.isArray(props?.options) ? props.options.map((o: any) => String(o)) : [];
           const pendingPlanObj: PendingPlan = {
-            request: String(props?.request || lastAssistant?.text || "Plano de implementação"),
+            request: String(props?.request || "Plano de implementação"),
             attachments: [],
             contextPaths: [],
             planText,
             messageCreatedAt: Date.now(),
             requestId,
             taskId: String(props?.taskId ?? currentTaskIdRef.current ?? ""),
-            sessionID
+            sessionID,
+            options: planOptions.length > 0 ? planOptions : undefined,
+            planFilePath
           };
           pendingPlanTaskRef.current = String(props?.taskId ?? currentTaskIdRef.current ?? "");
           setPendingPlan(pendingPlanObj);
@@ -3126,7 +3165,7 @@ function App() {
   // mode, tab changes and window resize all drive the native preview surface.
   React.useLayoutEffect(() => {
     const host = previewViewHostRef.current;
-    const visible = previewSurface === "webcontents" && workspaceTab === "preview" && !modal && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host);
+    const visible = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host);
     let raf = 0;
     const sync = () => {
       if (!visible || !host || !previewUrl) {
@@ -3135,8 +3174,12 @@ function App() {
         return;
       }
       const rect = host.getBoundingClientRect();
-      const bounds = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      const key = `${previewInternalSession}:${previewUrl}:${Math.round(bounds.x)}:${Math.round(bounds.y)}:${Math.round(bounds.width)}:${Math.round(bounds.height)}`;
+      const left = Math.round(rect.left);
+      const top = Math.round(rect.top);
+      const width = Math.max(1, Math.round(rect.right) - left);
+      const height = Math.max(1, Math.round(rect.bottom) - top);
+      const bounds = { x: left, y: top, width, height };
+      const key = `${previewInternalSession}:${previewUrl}:${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}`;
       if (key === previewViewSyncKeyRef.current) return;
       previewViewSyncKeyRef.current = key;
       void window.neko.syncInternalPreview({ session: previewInternalSession, url: previewUrl, visible: true, bounds }).catch(error => {
@@ -3150,7 +3193,7 @@ function App() {
     if (host) observer?.observe(host);
     window.addEventListener("resize", schedule);
     return () => { cancelAnimationFrame(raf); observer?.disconnect(); window.removeEventListener("resize", schedule); };
-  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen, modal]);
+  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen]);
 
   // Fallback watchdog for build execution. OpenCode can occasionally leave
   // session.status as busy or events can be dropped.
@@ -3214,6 +3257,7 @@ function App() {
     if (!previewUrl || previewStatus !== "ready") return;
     clearConsole();
     if (previewSurface === "webcontents") {
+      setPreviewFrameReloadKey(k => k + 1);
       try {
         const result = await window.neko.refreshPreview();
         if (!result?.ok) console.warn("[Preview] refresh not ok", result?.reason ?? "");
@@ -3610,6 +3654,7 @@ function App() {
   }, [sessionId, finishActivity]);
 
   const rejectPlan = React.useCallback(() => {
+    if (!sessionId) return;
     const plan = pendingPlan;
     setPendingPlan(null);
     setPlanExpanded(false);
@@ -3619,17 +3664,20 @@ function App() {
     taskPhaseRef.current = "cancelled";
     requestInFlightRef.current = false;
     requestObservedBusyRef.current = false;
+    retryActiveRef.current = false;
     setBusy(false);
     setWorkingStatus("");
+    finishActivity();
     upsertActivity({ id: "plan-rejected", icon: "error", title: "Plano cancelado", detail: "O plano não foi aprovado.", state: "error" });
 
-    if (plan?.requestId && sessionId) {
-      void window.neko.questionReply(sessionId, plan.requestId, [["No"]]).catch(err => {
-        console.warn("[Plan] reject reply error:", err);
-      });
-      console.log(`[Plan] native rejection sent requestId=${plan.requestId} session=${sessionId}`);
-    }
-  }, [sessionId, pendingPlan, upsertActivity]);
+    // [Descartar-fix] Abort the session unconditionally — same mechanism as the Stop button.
+    // We do NOT send questionReply("No") because that can cause the agent to continue execution.
+    // Abort is the authoritative stop signal; the session state will transition to "cancelled".
+    void window.neko.abort(sessionId).catch(err => {
+      console.warn("[Plan] abort error on reject:", err);
+    });
+    console.log(`[Plan] Descartar: abort sent session=${sessionId} requestId=${plan?.requestId || "-"}`);
+  }, [sessionId, pendingPlan, upsertActivity, finishActivity]);
 
   const approvePlan = React.useCallback(async () => {
     if (!sessionId || !pendingPlan || planApprovalBusy) return;
@@ -3648,7 +3696,7 @@ function App() {
     setApprovedPlan({ planText: plan.planText, approvedAt: Date.now(), messageCreatedAt: Date.now() });
 
     // 1. NATIVE OPENCODE PLAN APPROVAL:
-    // If this came from a native question (plan_exit), send "Yes" to the existing session!
+    // If this came from a native question (plan_exit), reply with the correct option to switch to Build agent.
     if (plan.requestId) {
       requestStartedAtRef.current = Date.now();
       requestInFlightRef.current = true;
@@ -3660,8 +3708,14 @@ function App() {
       setWorkingStatus("Executando o plano aprovado...");
 
       try {
-        await window.neko.questionReply(sessionId, plan.requestId, [["Yes"]]);
-        console.log(`[Plan] native approval sent requestId=${plan.requestId} session=${sessionId}`);
+        // [Aprovar-fix] Find the "Switch to build agent" option from the plan_exit question options.
+        // Sending "Yes" causes OpenCode to treat it as a free-text answer which can trigger
+        // a conversational reply ("Plano pronto. Posso prosseguir?") instead of switching to build mode.
+        // We must send the exact option string that plan_exit expects to start implementation.
+        const buildOption = plan.options?.find(o => /switch to build agent|start implementing/i.test(o));
+        const approvalAnswer = buildOption ?? plan.options?.[0] ?? "Switch to build agent and start implementing";
+        await window.neko.questionReply(sessionId, plan.requestId, [[approvalAnswer]]);
+        console.log(`[Plan] native approval sent requestId=${plan.requestId} session=${sessionId} answer=${approvalAnswer}`);
       } catch (error) {
         requestInFlightRef.current = false;
         requestObservedBusyRef.current = false;
@@ -3851,20 +3905,19 @@ function App() {
   }, [messages, busy]);
 
   const refreshGithubBranches = React.useCallback(async () => {
-    if (!githubLinkStatus.linkedRepo || githubBranchBusy) return;
-    setGithubBranchBusy(true);
+    if (!githubLinkStatus.linkedRepo || githubBranchBusy || githubBranchRefreshing) return;
+    setGithubBranchRefreshing(true);
     setGithubBranchError("");
     try {
       const names = await window.neko.githubListBranches(githubLinkStatus.linkedRepo);
       const filtered = Array.from(new Set(names.filter((name: string) => name && name !== "origin" && name !== "HEAD" && name !== "origin/HEAD")));
       setGithubBranches(filtered.length ? filtered : [githubLinkStatus.branch || "main"]);
     } catch (error) {
-      setGithubBranchError("Erro ao listar branches.");
       console.warn("[GithubBranches] refresh failed", String((error as Error)?.message ?? error));
     } finally {
-      setGithubBranchBusy(false);
+      setGithubBranchRefreshing(false);
     }
-  }, [githubLinkStatus.linkedRepo, githubLinkStatus.branch, githubBranchBusy]);
+  }, [githubLinkStatus.linkedRepo, githubLinkStatus.branch, githubBranchBusy, githubBranchRefreshing]);
 
   const chooseGithubBranch = React.useCallback(async (branch: string) => {
     if (!branch || githubBranchBusy) return;
@@ -3878,13 +3931,38 @@ function App() {
       if (git.branch) {
         setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
       }
-    } catch (error) {
-      setGithubBranchError(`Erro ao trocar para branch "${branch}".`);
+    } catch (error: any) {
+      setGithubBranchError(error?.message || `Erro ao trocar para branch "${branch}".`);
       console.warn("[GithubBranch] checkout failed", String((error as Error)?.message ?? error));
     } finally {
       setGithubBranchBusy(false);
     }
   }, [githubBranchBusy]);
+
+  const createGithubBranch = React.useCallback(async (name: string) => {
+    const trimmed = (name || "").trim();
+    if (!trimmed || githubBranchBusy) return;
+    setGithubBranchBusy(true);
+    setGithubBranchError("");
+    try {
+      const baseBranch = githubLinkStatus.branch || undefined;
+      await window.neko.githubCreateBranch(trimmed, baseBranch);
+      const git = await window.neko.githubGitStatus();
+      setGithubLinkStatus(git);
+      if (git.branch) {
+        setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
+      }
+      setIsCreatingBranch(false);
+      setNewBranchInput("");
+      setGithubBranchMenuOpen(false);
+      showToast(`Branch "${git.branch || trimmed}" criada com sucesso!`);
+    } catch (error: any) {
+      setGithubBranchError(error?.message || `Erro ao criar branch "${trimmed}".`);
+      console.warn("[GithubBranch] create failed", String((error as Error)?.message ?? error));
+    } finally {
+      setGithubBranchBusy(false);
+    }
+  }, [githubBranchBusy, githubLinkStatus.branch, showToast]);
 
   // ===== Modal functions =====
 
@@ -3960,6 +4038,53 @@ function App() {
     }
   }
 
+  
+  async function createPullRequest() {
+    if (githubPullBusy || !githubLinkStatus.linkedRepo) return;
+    setGithubPullBusy(true);
+    setGithubPullError("");
+    setGithubPullSuccess(false);
+    
+    if (!githubLinkStatus.branch) {
+      setGithubPullError("Não foi possível determinar a sua branch local atual.");
+      setGithubPullBusy(false);
+      return;
+    }
+
+    try {
+      const defaultBranch = await window.neko.githubGetDefaultBranch();
+
+      if (!defaultBranch) {
+        setGithubPullError("Não foi possível determinar a default branch do repositório no GitHub.");
+        setGithubPullBusy(false);
+        return;
+      }
+
+      if (githubLinkStatus.branch === defaultBranch) {
+        setGithubPullError(`Não é possível criar Pull Request: a branch selecionada (${githubLinkStatus.branch}) é a mesma default branch do repositório.`);
+        setGithubPullBusy(false);
+        return;
+      }
+
+      const res = await window.neko.githubCreatePullRequest(
+        githubLinkStatus.linkedRepo,
+        githubLinkStatus.branch,
+        defaultBranch,
+        "Update from NekoAI",
+        "Pull Request criado automaticamente pelo NekoAI."
+      );
+      if (res.ok) {
+        setGithubPullSuccess(true);
+      } else {
+        setGithubPullError(res.error || "Erro ao criar Pull Request.");
+      }
+    } catch (error) {
+      setGithubPullError(String((error as Error)?.message ?? error));
+    } finally {
+      setGithubPullBusy(false);
+    }
+  }
+
   async function commitAndPushGithub() {
     if (!githubCommitMessage.trim() || githubCommitBusy || !githubLinkStatus.linkedRepo) return;
     setGithubCommitBusy(true);
@@ -3991,6 +4116,7 @@ function App() {
     try {
       const result = await window.neko.githubStatus(true);
       setGithubStatus(result || { connected: false, repos: [] });
+      void syncGithubContext();
     } catch (error) {
       console.warn("[Github] refresh failed", String((error as Error)?.message ?? error));
     }
@@ -4017,8 +4143,7 @@ function App() {
     try {
       await window.neko.githubDisconnect();
       setGithubStatus({ connected: false, repos: [] });
-      setGithubLinkStatus({ initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false });
-      setGithubBranches([]);
+      void syncGithubContext();
       setModal("github");
     } catch (error) {
       console.warn("[Github] disconnect failed", String((error as Error)?.message ?? error));
@@ -4315,7 +4440,6 @@ function App() {
   // única forma estrutural do dropdown aparecer por cima do Preview.
   async function setPreviewRouteMenuOpen(open: boolean) {
     setPreviewRouteOpen(open);
-    try { await window.neko.setInternalPreviewOverlay(open); } catch {}
   }
 
   async function openPreviewRouteMenu() {
@@ -4474,11 +4598,9 @@ function App() {
                     </button>
                   )}
                 </> : null}
-                {githubStatus.connected && githubLinkStatus.linkedRepo ? <div className="project-menu-row">
+                {githubStatus.connected && githubLinkStatus.linkedRepo ? <div className="project-menu-row" onClick={e => e.stopPropagation()}>
                   <span className="repo-badge"><GitHubIcon size={13}/>{githubLinkStatus.linkedRepo}</span>
-                  <button className="branch-menu-trigger" disabled={githubBranchBusy || isSwitchingProject} onClick={() => { if (!githubBranchBusy && !isSwitchingProject) { setGithubBranchMenuOpen(v => !v); void refreshGithubBranches(); } }}>
-                    {githubBranchBusy ? <Loader2 size={12} className="spin" /> : <GitBranch size={12}/>}{githubBranchBusy ? "Trocando..." : (githubLinkStatus.branch || "main")}<ChevronDown size={12}/>
-                  </button>
+                  <span className="branch-badge" onClick={e => e.stopPropagation()}><GitBranch size={12}/>{githubLinkStatus.branch || "main"}</span>
                 </div> : null}
                 <button className="project-menu-action" disabled={isSwitchingProject} onClick={() => void openOtherProject()}>
                   <FolderOpen size={14}/> Abrir outro projeto
@@ -4505,12 +4627,7 @@ function App() {
               </div> : null}
             </div> : null}
 
-            <button className="top-action primary-action" onClick={() => void createProject()}>
-              <Plus size={18}/> Novo Projeto
-            </button>
-            <button className="top-action clone-action" onClick={() => { setCloneUrl(""); setCloneBusy(false); setCloneProgress({ scanned: 0, currentUrl: "" }); setCloneAnalysis(null); setCloneError(""); setModal("siteClone"); }}>
-              <Globe2 size={18}/> Clonar Site
-            </button>
+
           </div>
 
           <div className="top-right-actions">
@@ -4590,7 +4707,7 @@ function App() {
               <Key size={16}/>
               <span className="integration-dot"/>
             </button>
-            <button className={`integration-status ${githubStatus.connected ? "online" : "idle"}`} onClick={() => { setGithubError(""); setGithubShowRepos(false); setGithubCommitSuccess(false); setModal("github"); }} title={githubStatus.connected ? `GitHub conectado como ${githubStatus.user?.login || ""}` : "GitHub não conectado"}>
+            <button className={`integration-status ${githubStatus.connected ? "online" : "idle"}`} onClick={() => { setGithubError(""); setGithubShowRepos(false); setGithubCommitSuccess(false); void syncGithubContext(); setModal("github"); }} title={githubStatus.connected ? `GitHub conectado como ${githubStatus.user?.login || ""}` : "GitHub não conectado"}>
               <GitHubIcon size={17}/>
               <span className="integration-dot"/>
             </button>
@@ -4620,30 +4737,104 @@ function App() {
             </button>
             {project ? (
               <button className="top-exit-btn" onClick={() => void exitProject("topbarExit")} disabled={isExiting} title="Sair do projeto e voltar à Home" aria-label="Sair do projeto">
-                <LogOut size={16}/>
-                <span>{isExiting ? "Saindo..." : "Sair"}</span>
+                {isExiting ? <Loader2 size={15} className="spin"/> : <LogOut size={15}/>}
               </button>
             ) : null}
             {project && githubLinkStatus.linkedRepo ? <div className="top-branch-wrap">
-              <button className="top-branch-btn" onClick={() => { if (!githubBranchBusy) { setGithubBranchMenuOpen(v => !v); void refreshGithubBranches(); } }} disabled={githubBranchBusy}>
+              <button
+                className="top-branch-btn"
+                onClick={() => {
+                  if (githubBranchBusy) return;
+                  const next = !githubBranchMenuOpen;
+                  setGithubBranchMenuOpen(next);
+                  if (next) {
+                    void refreshGithubBranches();
+                  }
+                }}
+                disabled={githubBranchBusy}
+                title={`Branch atual: ${githubLinkStatus.branch || "main"}`}
+              >
                 {githubBranchBusy ? <Loader2 size={13} className="spin"/> : <GitBranch size={13}/>}
-                <span>{githubLinkStatus.branch || "main"}</span>
+                <span className="top-branch-name">{githubLinkStatus.branch || "main"}</span>
                 <ChevronDown size={13}/>
               </button>
               {githubBranchMenuOpen ? <div className="top-branch-menu">
-                {Array.from(new Set(githubBranches.length ? githubBranches : [githubLinkStatus.branch || "main"])).map(branch =>
-                  <button
-                    key={branch}
-                    disabled={githubBranchBusy}
-                    className={`top-branch-item ${branch === githubLinkStatus.branch ? "active" : ""}`}
-                    onClick={() => { if (!githubBranchBusy) void chooseGithubBranch(branch); }}
-                  >
-                    {branch === githubLinkStatus.branch ? <Check size={12}/> : <span className="branch-placeholder"/>}
-                    <span>{branch}</span>
-                    {githubBranchBusy && branch !== githubLinkStatus.branch ? <Loader2 size={10} className="spin branch-item-spin"/> : null}
-                  </button>
-                )}
+                <div className="top-branch-list">
+                  {Array.from(new Set(githubBranches.length ? githubBranches : [githubLinkStatus.branch || "main"])).map(branch =>
+                    <button
+                      key={branch}
+                      disabled={githubBranchBusy}
+                      className={`top-branch-item ${branch === githubLinkStatus.branch ? "active" : ""}`}
+                      onClick={() => { if (!githubBranchBusy) void chooseGithubBranch(branch); }}
+                    >
+                      {branch === githubLinkStatus.branch ? <Check size={12}/> : <span className="branch-placeholder"/>}
+                      <span>{branch}</span>
+                      {githubBranchBusy && branch !== githubLinkStatus.branch ? <Loader2 size={10} className="spin branch-item-spin"/> : null}
+                    </button>
+                  )}
+                </div>
                 {githubBranchError ? <div className="branch-picker-error">{githubBranchError}</div> : null}
+                <div className="top-branch-divider" />
+                {!isCreatingBranch ? (
+                  <button
+                    className="top-branch-create-btn"
+                    disabled={githubBranchBusy}
+                    onClick={() => {
+                      setIsCreatingBranch(true);
+                      setNewBranchInput("");
+                      setGithubBranchError("");
+                    }}
+                  >
+                    <Plus size={13} />
+                    <span>Criar nova branch</span>
+                  </button>
+                ) : (
+                  <div className="top-branch-create-panel" onClick={e => e.stopPropagation()}>
+                    <div className="top-branch-create-origin">
+                      Origem: <b>{githubLinkStatus.branch || "main"}</b>
+                    </div>
+                    <input
+                      type="text"
+                      className="top-branch-create-input"
+                      placeholder="Nome da nova branch..."
+                      value={newBranchInput}
+                      autoFocus
+                      disabled={githubBranchBusy}
+                      onChange={e => setNewBranchInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void createGithubBranch(newBranchInput);
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          setIsCreatingBranch(false);
+                          setNewBranchInput("");
+                        }
+                      }}
+                    />
+                    <div className="top-branch-create-actions">
+                      <button
+                        type="button"
+                        className="top-branch-cancel-btn"
+                        disabled={githubBranchBusy}
+                        onClick={() => {
+                          setIsCreatingBranch(false);
+                          setNewBranchInput("");
+                        }}
+                      >
+                        Cancelar
+                      </button>
+                      <button
+                        type="button"
+                        className="top-branch-confirm-btn"
+                        disabled={githubBranchBusy || !newBranchInput.trim()}
+                        onClick={() => void createGithubBranch(newBranchInput)}
+                      >
+                        {githubBranchBusy ? <Loader2 size={12} className="spin"/> : "Criar"}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div> : null}
             </div> : null}
             <div className="top-status"><span className={`status-dot ${status}`} />{status === "online" ? "Neko online" : status === "starting" ? "Iniciando..." : "Sem projeto"}</div>
@@ -4669,20 +4860,22 @@ function App() {
                     <div className="plan-approval-head"><div><b>Plano pronto para revisão</b><span>O Neko analisou a tarefa. Revise um resumo antes de permitir as alterações.</span></div><Sparkles size={16}/></div>
                     <div className="plan-approval-title">Resumo do plano</div>
                     <div className="plan-approval-body">
-                      <CollapsibleMessageBody text={pendingPlan.planText} />
+                      <CollapsibleMessageBody><MarkdownRenderer content={pendingPlan.planText} /></CollapsibleMessageBody>
                     </div>
                     <div className="plan-approval-actions"><button className="plan-reject-btn" onClick={rejectPlan} disabled={planApprovalBusy}>Cancelar</button><button className="plan-approve-btn" onClick={() => void approvePlan()} disabled={planApprovalBusy}>{planApprovalBusy ? "Executando..." : "Aprovar e executar"}</button></div>
                   </div>;
                   if (item.kind === "approvedPlan" && approvedPlan) return <div key={`approved-plan-${approvedPlan.approvedAt}`} className="plan-approved-card">
                     <div className="plan-approved-head"><span><Check size={13}/> PLANO APROVADO</span><span>Build iniciado</span></div>
                     <div className="plan-approval-body">
-                      <CollapsibleMessageBody text={approvedPlan.planText} />
+                      <CollapsibleMessageBody><MarkdownRenderer content={approvedPlan.planText} /></CollapsibleMessageBody>
                     </div>
                   </div>;
                   const index = item.index!; const message = messages[index];
                   return <div key={`message-${index}-${message.createdAt ?? timelineIndex}`} className={`message ${message.role}`}>
                     <div className="message-label">{message.role === "user" ? "Você" : message.role === "assistant" ? "Neko" : message.role}</div>
-                    {message.text&&<CollapsibleMessageBody text={message.text}/>}
+                     {message.text && (message.role === "assistant" || message.role === "user")
+                       ? <CollapsibleMessageBody><MarkdownRenderer content={message.text} /></CollapsibleMessageBody>
+                       : message.text && <CollapsibleMessageBody text={message.text}/>}
                     {message.attachments?.length?<div className="message-attachments">{message.attachments.map((a,i)=>(
                       a.kind==="image"&&a.previewUrl
                         ? <button type="button" className="message-image-thumb" key={`${a.path}:${i}`} onClick={()=>setLightboxImage({url:a.previewUrl!,name:a.name})} title={`Visualizar ${a.name}`} aria-label={`Visualizar ${a.name}`}><img src={a.previewUrl} alt={a.name}/></button>
@@ -4699,7 +4892,7 @@ function App() {
             {pendingQuestion && <AgentDecisionCard
               question={pendingQuestion}
               onAnswer={(value) => void answerQuestion(value)}
-              onDismiss={() => void rejectQuestion(pendingQuestion)}
+              onDismiss={() => void stopDevelopment()}
             />}
             {pendingPermission && (
             <div className="permission-card">
@@ -4888,7 +5081,7 @@ function App() {
 
           <section className="workspace">
             <div className="workspace-toolbar"><div className="workspace-toolbar-left"><div className="workspace-tabs"><button className="collapse-chat-btn" onClick={()=>setChatCollapsed(v=>!v)} aria-label={chatCollapsed?"Abrir chat":"Fechar chat"}>{chatCollapsed?<PanelLeftOpen size={15}/>:<PanelLeftClose size={15}/>}</button><button className={workspaceTab === "preview" ? "active" : ""} onClick={() => setWorkspaceTab("preview")}><Eye size={15}/> Preview</button><button className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}><Code2 size={15}/> Código</button>{previewFramework ? <span className="workspace-framework">{previewFramework}</span> : null}</div></div><div className="workspace-toolbar-center">{renderPreviewRouteSelector()}</div><div className="workspace-tools">{workspaceTab === "preview" && <><button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")}><Monitor size={14}/></button><button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")}><Tablet size={14}/></button><button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")}><Smartphone size={14}/></button></>}<button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={15}/></button><button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; console.log("[Neko/PreviewExternal] click", `url=${String(previewUrl)}`); void window.neko.openPreviewExternal(previewUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={15}/></button></div></div>
-            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewUrl}</span></div>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : <iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview (fallback)" className={previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"} src={previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview de fallback", "Preview"); setPreviewFrameReady(true); }}/>}</div> : <div className="preview-empty"><div className="preview-icon"><Globe2 size={26}/></div><strong>{previewStatus === "error" ? "Não foi possível iniciar o preview" : previewStatus === "starting" ? "Iniciando servidor..." : previewStatus === "installing" ? "Instalando dependências..." : "Seu app aparecerá aqui"}</strong><span>{previewMessage || "Crie ou abra um projeto com um script dev para iniciar o preview."}</span>{previewStatus === "error" && <button className="preview-retry" onClick={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })}><RefreshCw size={15}/> Tentar novamente</button>}</div>}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
+            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} src={previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : null}</div></div> : <div className="preview-empty"><div className="preview-icon"><Globe2 size={26}/></div><strong>{previewStatus === "error" ? "Não foi possível iniciar o preview" : previewStatus === "starting" ? "Iniciando servidor..." : previewStatus === "installing" ? "Instalando dependências..." : "Seu app aparecerá aqui"}</strong><span>{previewMessage || "Crie ou abra um projeto com um script dev para iniciar o preview."}</span>{previewStatus === "error" && <button className="preview-retry" onClick={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })}><RefreshCw size={15}/> Tentar novamente</button>}</div>}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
             <div className={`terminal-panel ${terminalOpen ? "open" : "closed"}`}>
               <div className="terminal-head"><div className="terminal-tabs"><button className={terminalTab === "logs" ? "active" : ""} onClick={() => { setTerminalTab("logs"); setTerminalOpen(true); }}>Logs</button><button className={terminalTab === "console" ? "active" : ""} onClick={() => { setTerminalTab("console"); setTerminalOpen(true); }}>Console</button><button className={terminalTab === "errors" ? "active" : ""} onClick={() => { setTerminalTab("errors"); setTerminalOpen(true); }}>Erros</button></div><button className="terminal-collapse" onClick={() => setTerminalOpen(v => !v)}>{terminalOpen ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}</button></div>
               {terminalOpen && (terminalTab === "console" ? (
@@ -5404,19 +5597,77 @@ function App() {
           </div>
           {githubStatus.needsPermissions ? <div className="github-auth-update-needed"><div><b>Permissões do GitHub precisam de aprovação</b><small>O NekoAI está conectado, mas o GitHub App ainda não tem todas as permissões necessárias para publicar e enviar código.</small></div><button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}><GitHubIcon size={14}/> Verificar permissões</button></div> : null}
           {project && githubLinkStatus.linkedRepo ? (() => {
+            const isAccessible = Boolean(githubStatus.repos?.some(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase()));
             const linkedRepoUrl = githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`;
             return <div className="github-connected-project">
-              <div className="github-connected-project-head"><div><b>Projeto conectado</b><small>{githubLinkStatus.linkedRepo}</small></div><span className={githubLinkStatus.dirty ? "dirty" : "clean"}>{githubLinkStatus.dirty ? "Alterado" : "Sincronizado"}</span></div>
-              <div className="github-project-meta"><span><GitBranch size={12}/> {githubLinkStatus.branch || "main"}</span><span>{githubLinkStatus.dirty ? "Há alterações locais" : "Nenhuma alteração pendente"}</span></div>
-              <textarea className="github-commit-input" value={githubCommitMessage} onChange={e => { setGithubCommitMessage(e.target.value); if (githubCommitError) setGithubCommitError(""); if (githubCommitSuccess) setGithubCommitSuccess(false); }} placeholder="Mensagem do commit" rows={2} disabled={githubCommitBusy}/>
-              {githubCommitError && <div className="auth-error" style={{ marginTop: 8 }}>{githubCommitError}</div>}
-              {githubCommitSuccess && <div className="github-linked-success" style={{ marginTop: 8 }}><Check size={16}/><div><b>Commit e Push realizado com sucesso</b><small>Alterações publicadas no GitHub com sucesso.</small></div></div>}
-              <div className="github-connected-actions">
-                <button className="primary github-commit-btn" disabled={!githubLinkStatus.dirty || !githubCommitMessage.trim() || githubCommitBusy} onClick={() => void commitAndPushGithub()}>{githubCommitBusy ? <><Loader2 size={15} className="spin"/> Enviando...</> : <><Check size={15}/> Commit e Push</>}</button>
-                {linkedRepoUrl ? <button className="secondary github-view-repo-btn" onClick={() => void window.neko.githubOpen(linkedRepoUrl)} title="Abrir repositório no GitHub"><ExternalLinkIcon size={14}/> Ver no GitHub</button> : null}
-                <button className="secondary github-unlink-btn danger-action" onClick={() => void unlinkGithubProject()} disabled={githubBusy} title="Desvincular repositório deste projeto local"><Unlink size={14}/> Desvincular</button>
+              <div className="github-connected-project-head">
+                <div><b>{isAccessible ? "Projeto conectado" : "Repositório remoto detectado"}</b><small>{githubLinkStatus.linkedRepo}</small></div>
+                <span className={isAccessible ? (githubLinkStatus.dirty ? "dirty" : "clean") : "idle"}>
+                  {isAccessible ? (githubLinkStatus.dirty ? "Alterado" : "Sincronizado") : "Sem acesso"}
+                </span>
               </div>
-            </div>;
+              <div className="github-project-meta">
+                <span><GitBranch size={12}/> {githubLinkStatus.branch || "main"}</span>
+                <span>{isAccessible ? (githubLinkStatus.dirty ? "Há alterações locais" : "Nenhuma alteração pendente") : "Repositório não autorizado para esta conta"}</span>
+              </div>
+
+              {!isAccessible ? (
+                <div className="github-auth-update-needed" style={{ margin: "12px 0 16px 0" }}>
+                  <div>
+                    <b>Repositório não autorizado para @{githubStatus.user?.login || "usuário"}</b>
+                    <small>O projeto local possui o remote <b>{githubLinkStatus.linkedRepo}</b>, mas a conta GitHub conectada não possui acesso a ele ou o repositório ainda não foi autorizado no GitHub App.</small>
+                  </div>
+                  <button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}>
+                    <GitHubIcon size={14}/> Autorizar no GitHub
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <textarea className="github-commit-input" value={githubCommitMessage} onChange={e => { setGithubCommitMessage(e.target.value); if (githubCommitError) setGithubCommitError(""); if (githubCommitSuccess) setGithubCommitSuccess(false); }} placeholder="Mensagem do commit" rows={2} disabled={githubCommitBusy}/>
+                  {githubCommitError && <div className="auth-error" style={{ marginTop: 8 }}>{githubCommitError}</div>}
+                  {githubCommitSuccess && <div className="github-linked-success" style={{ marginTop: 8 }}><Check size={16}/><div><b>Commit e Push realizado com sucesso</b><small>Alterações publicadas no GitHub com sucesso.</small></div></div>}
+                  
+                  <label className="github-auto-commit-label" style={{ display: "flex", alignItems: "center", gap: 8, margin: "12px 0 20px 0", fontSize: 13, cursor: "pointer", color: "var(--foreground-muted)", lineHeight: 1 }}>
+                    <input type="checkbox" checked={githubAutoCommit} onChange={e => setGithubAutoCommit(e.target.checked)} style={{ margin: 0, cursor: "pointer", width: 14, height: 14 }}/>
+                    Realizar commit e push automaticamente após a tarefa
+                  </label>
+
+                  {githubPullError && <div className="auth-error" style={{ marginBottom: 12 }}>{githubPullError}</div>}
+                  {githubPullSuccess && <div className="github-linked-success" style={{ marginBottom: 12 }}><Check size={16}/><div><b>Pull Request criado com sucesso</b><small>O Pull Request foi aberto no GitHub com sucesso.</small></div></div>}
+                </>
+              )}
+
+              <div className="github-connected-actions" style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <button
+                  className="primary github-commit-btn"
+                  style={{ flex: 1, height: 32, display: "flex", justifyContent: "center", alignItems: "center", gap: 6 }}
+                  disabled={!isAccessible || !githubLinkStatus.dirty || !githubCommitMessage.trim() || githubCommitBusy}
+                  onClick={() => void commitAndPushGithub()}
+                  title={!isAccessible ? "Repositório não acessível pela conta conectada" : undefined}
+                >
+                  {githubCommitBusy ? <><Loader2 size={15} className="spin"/> Enviando...</> : <><Check size={15}/> Commit e Push</>}
+                </button>
+                <button
+                  className="secondary github-pull-btn"
+                  style={{ flex: 1, height: 32, display: "flex", justifyContent: "center", alignItems: "center", gap: 6 }}
+                  disabled={!isAccessible || githubPullBusy || !githubLinkStatus.linkedRepo}
+                  onClick={() => void createPullRequest()}
+                  title={!isAccessible ? "Repositório não acessível pela conta conectada" : undefined}
+                >
+                  {githubPullBusy ? <><Loader2 size={15} className="spin"/> Criando...</> : <><GitPullRequest size={15}/> Pull</>}
+                </button>
+                <button
+                  className="secondary github-unlink-btn danger-action"
+                  style={{ flex: 1, height: 32, display: "flex", justifyContent: "center", alignItems: "center", gap: 6 }}
+                  onClick={() => void unlinkGithubProject()}
+                  disabled={githubBusy}
+                  title="Desvincular repositório deste projeto local"
+                >
+                  <Unlink size={14}/> Desvincular
+                </button>
+              </div>
+
+              </div>;
           })() : null}
           {project && !githubLinkStatus.linkedRepo ? <>
             <div className="github-local-project-card">
@@ -5433,7 +5684,10 @@ function App() {
             {githubStatus.needsInstallation ? <div className="github-install-needed"><div><b>Instale o NekoAI no GitHub</b><small>Para acessar repositórios privados, o GitHub App precisa estar instalado na sua conta e autorizado para os repositórios que você deseja usar.</small></div><button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}><GitHubIcon size={14}/> Instalar / configurar</button></div> : null}
             <div className="github-repos">{(githubStatus.repos || []).length ? githubStatus.repos!.map(repo => <div className="github-repo-row" key={repo.id}><button className="github-repo-main" onClick={() => project ? void openGithubLink(repo) : prepareGithubClone(repo)}><div><b>{repo.name}</b><small>{repo.fullName}</small></div><span className={repo.private ? "private" : "public"}>{repo.private ? "Privado" : "Público"}</span></button><button className="github-repo-link" onClick={() => project ? void openGithubLink(repo) : prepareGithubClone(repo)} title={project ? "Vincular projeto" : "Clonar para este computador"}>{project ? <Link2 size={14}/> : <Download size={14}/>}</button><button className="github-repo-open" onClick={() => window.neko.githubOpen(repo.htmlUrl)} title="Abrir no GitHub"><ExternalLinkIcon size={14}/></button></div>) : <div className="github-empty">{githubStatus.needsInstallation ? "Nenhum repositório foi concedido ao NekoAI ainda." : "Nenhum repositório encontrado."}</div>}</div>
           </> : null}
-          <button className="secondary github-disconnect" onClick={() => void disconnectGithub()}><Unplug size={14}/> Desconectar</button>
+          <div className="github-modal-footer" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 24, paddingTop: 16 }}>
+            <button className="secondary github-disconnect" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={() => void disconnectGithub()}><Unplug size={14}/> Desconectar</button>
+            {(() => { const url = (project && githubLinkStatus.linkedRepo) ? (githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`) : null; return url ? <button className="secondary github-view-repo-btn" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={() => void window.neko.githubOpen(url)} title="Abrir repositório no GitHub"><ExternalLinkIcon size={14}/> Ver no GitHub</button> : null; })()}
+          </div>
         </div>}
       </>}
 

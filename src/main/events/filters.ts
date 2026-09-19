@@ -1,7 +1,7 @@
 
 const IGNORED_DIRS = new Set([
   ".git", "node_modules", "dist", "build", ".vite", ".cache",
-  ".next", ".nuxt", "coverage", ".turbo", ".neko"
+  ".next", ".nuxt", "coverage", ".turbo", ".neko", ".opencode"
 ]);
 const IGNORED_SUFFIXES = [".lock", ".tmp", ".log"];
 
