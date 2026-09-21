@@ -904,6 +904,7 @@ function App() {
     const parts = project.split(/[/\\]/).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : "Projeto";
   }, [project, recentProjects]);
+  const projectDisplayName = projectName;
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [input, setInput] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -2126,6 +2127,20 @@ function App() {
     return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("mousedown", onClick); };
   }, [chatModeMenuOpen]);
 
+  // Fecha o popover de seleção de modelo ao clicar fora ou pressionar Escape.
+  const modelAnchorRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!modelOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setModelOpen(false); };
+    const onClick = (e: MouseEvent) => {
+      const host = modelAnchorRef.current;
+      if (host && !host.contains(e.target as Node)) setModelOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onClick);
+    return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("mousedown", onClick); };
+  }, [modelOpen]);
+
   // Overlays (modais e dropdowns): quando um overlay está aberto, a visibilidade da view
   // nativa (WebContentsView) é suspensa via setInternalPreviewOverlay para que o overlay DOM
   // pinte perfeitamente sobre a superfície de preview (o iframe underlay permanece renderizado
@@ -2133,8 +2148,9 @@ function App() {
   const isModalOpen = Boolean(modal || isSwitchingProject || lightboxImage);
   const isTopbarDropdownOpen = Boolean(githubBranchMenuOpen || projectMenuOpen || recentProjectsMenuOpen);
   const isInternalDropdownOpen = Boolean(previewRouteOpen);
+  const isComposerDropdownOpen = Boolean(modelOpen || chatModeMenuOpen);
   const isTimelineOverlay = Boolean(timelineOpen && workspaceTab === "preview");
-  const isAnyOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen || isTimelineOverlay);
+  const isAnyOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen || isTimelineOverlay || isComposerDropdownOpen);
 
   React.useEffect(() => {
     if (previewSurface === "webcontents" && workspaceTab === "preview" && previewUrl) {
@@ -3874,6 +3890,8 @@ function App() {
     const host = previewViewHostRef.current;
     const visible = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host);
     let raf = 0;
+    let pumpRaf = 0;
+
     const sync = () => {
       if (!visible || !host || !previewUrl) {
         previewViewSyncKeyRef.current = "";
@@ -3894,13 +3912,65 @@ function App() {
         setPreviewSurface("iframe");
       });
     };
-    const schedule = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(sync); };
+
+    const schedule = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(sync);
+    };
+
+    const runPump = (duration = 350) => {
+      const start = performance.now();
+      cancelAnimationFrame(pumpRaf);
+      const pump = () => {
+        sync();
+        if (performance.now() - start < duration) {
+          pumpRaf = requestAnimationFrame(pump);
+        } else {
+          sync();
+        }
+      };
+      pumpRaf = requestAnimationFrame(pump);
+    };
+
     schedule();
-    const observer = host ? new ResizeObserver(schedule) : null;
-    if (host) observer?.observe(host);
+    runPump(350);
+
+    const observer = new ResizeObserver(() => {
+      schedule();
+    });
+
+    if (host) {
+      observer.observe(host);
+      if (host.parentElement) observer.observe(host.parentElement);
+      const previewBody = host.closest(".preview-body");
+      if (previewBody) observer.observe(previewBody);
+      const workspace = host.closest(".workspace");
+      if (workspace) observer.observe(workspace);
+      const studio = host.closest(".studio");
+      if (studio) observer.observe(studio);
+    }
+
+    const onTransition = () => {
+      runPump(350);
+    };
+
     window.addEventListener("resize", schedule);
-    return () => { cancelAnimationFrame(raf); observer?.disconnect(); window.removeEventListener("resize", schedule); };
-  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen]);
+    window.addEventListener("transitionstart", onTransition);
+    window.addEventListener("transitionrun", onTransition);
+    window.addEventListener("transitionend", schedule);
+    window.addEventListener("transitioncancel", schedule);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      cancelAnimationFrame(pumpRaf);
+      observer.disconnect();
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("transitionstart", onTransition);
+      window.removeEventListener("transitionrun", onTransition);
+      window.removeEventListener("transitionend", schedule);
+      window.removeEventListener("transitioncancel", schedule);
+    };
+  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen]);
 
   // Fallback watchdog for build execution. OpenCode can occasionally leave
   // session.status as busy or events can be dropped.
@@ -6009,7 +6079,7 @@ function App() {
                   :<div className={`attachment-preview-card ${a.kind}`} key={`${a.path}:${i}`}><div className="attachment-preview-media">{a.kind==="image"&&a.previewUrl?<img src={a.previewUrl} alt={a.name}/>:<div className="attachment-doc-preview">{(a.extension||(a.name.split(".").pop()||"FILE")).slice(0,6).toUpperCase()}</div>}</div><div className="attachment-preview-info"><b title={a.name}>{a.name}</b><small>{formatBytes(a.size)}</small></div><button className="attachment-remove" onClick={()=>setAttachments(prev=>prev.filter((_,idx)=>idx!==i))} aria-label={`Remover ${a.name}`}><X size={12}/></button></div>
                 ))}{uploadErrors.map(e=><div className="attachment-preview-card failed" key={e.id}><div className="attachment-preview-media"><div className="attachment-doc-preview error">{e.extension.slice(0,6).toUpperCase()}</div></div><div className="attachment-preview-info"><b>Falha no Upload</b><small title={e.message}>{e.name}</small></div><button className="attachment-remove" onClick={()=>setUploadErrors(prev=>prev.filter(x=>x.id!==e.id))} aria-label="Remover erro"><X size={12}/></button></div>)}</div>}
                 <div className="composer-bar"><button className="plus" aria-label="Adicionar contexto" onClick={() => void handlePickAttachments()} disabled={busy}><Plus size={17}/></button>
-                  <div className="model-anchor">
+                  <div className="model-anchor" ref={modelAnchorRef}>
                     <button className="model-inline" onClick={() => {
                       setModelOpen(v => {
                         const next = !v;
@@ -6859,7 +6929,7 @@ function App() {
           })() : null}
           {project && !githubLinkStatus.linkedRepo ? <>
             <div className="github-local-project-card">
-              <div className="github-local-project-copy"><b>Projeto local</b><small>{projectDisplayName}</small><span>Este projeto ainda não está conectado ao GitHub.</span></div>
+              <div className="github-local-project-copy"><b>Projeto local</b><small>{projectName}</small><span>Este projeto ainda não está conectado ao GitHub.</span></div>
               <button className="primary github-publish-main" onClick={() => prepareGithubPublish()}><GitHubIcon size={14}/> Publicar no GitHub</button>
             </div>
             <button className={`github-link-existing-btn ${githubShowRepos ? "active" : ""}`} onClick={() => setGithubShowRepos(prev => !prev)}>
@@ -6909,7 +6979,7 @@ function App() {
           <button className="close-btn" onClick={() => cancelGithubPublish()} aria-label="Fechar"><X size={17}/></button>
         </div>
         <div className="modal-scroll-body new-project-panel github-publish-panel">
-          <div className="github-clone-source"><FolderOpen size={16}/><div><b>{projectDisplayName}</b><small>{project}</small></div></div>
+          <div className="github-clone-source"><FolderOpen size={16}/><div><b>{projectName}</b><small>{project}</small></div></div>
           <label>Nome do repositório</label><input className="api-input" value={githubPublishRepoName} onChange={e => { setGithubPublishRepoName(e.target.value); if (githubPublishError) setGithubPublishError(""); }} placeholder="meu-projeto" autoFocus/>
           {githubPublishRepoName.trim() && !isValidGithubRepoName(githubPublishRepoName) && (
             <div className="auth-error">
