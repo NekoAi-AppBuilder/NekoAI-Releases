@@ -7,13 +7,15 @@ import {
   ExternalLink, Eye, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
   Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitPullRequest, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
-  Key, ShieldCheck, Laptop, Calendar, BadgeCheck
+  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database
 } from "lucide-react";
 import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
 import { nextChatMode, chatModeLabel, CHAT_MODES, type ChatMode } from "../shared/chat-mode";
 import { getNekoTutorials, type NekoTutorial } from "./tutorials";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
+import { ReleaseNotesRenderer } from "./components/ReleaseNotesRenderer";
+import { TimelineView, type TaskTimeline, type TimelineItem, type TimelineItemType } from "./components/TimelineView";
 
 import { notifyOnce, playNotify, soundEnabled, setSoundEnabled, unlockAudio } from "./sounds";
 import { buildAgentCaptureContext, htmlToText } from "../main/site-capture";
@@ -172,20 +174,29 @@ function formatAgentError(raw: any) {
 
   const lower = `${code} ${message} ${providerType}`.toLowerCase();
   let friendly = "O provedor não conseguiu executar esta solicitação.";
-  if (lower.includes("free usage") || lower.includes("subscribe to go") || lower.includes("quota exceeded") || lower.includes("insufficient quota") || lower.includes("credit balance")) {
-    friendly = "Limite de uso gratuito ou cota do provedor excedida. Atualize seu plano ou utilize outro modelo/provedor.";
+  if (
+    lower.includes("free usage") ||
+    lower.includes("subscribe to go") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("insufficient quota") ||
+    lower.includes("credit balance") ||
+    lower.includes("subscription required") ||
+    lower.includes("usage limit") ||
+    lower.includes("insufficient credits")
+  ) {
+    friendly = "Limite de uso ou cota do provedor excedida. Escolha outro modelo ou configure um provedor/plano compatível.";
   } else if (lower.includes("nekoaborted") || lower.includes("aborted") || lower.includes("cancelled")) {
     friendly = "A execução da tarefa foi cancelada.";
-  } else if (lower.includes("content-blocked") || lower.includes("content blocked")) {
-    friendly = "O provedor recusou esta solicitação por política de conteúdo.";
-  } else if (statusCode === 401 || lower.includes("unauthorized") || lower.includes("authentication")) {
-    friendly = "A autenticação do provedor não é válida ou expirou.";
-  } else if (statusCode === 403 || lower.includes("forbidden")) {
-    friendly = "O provedor não autorizou esta operação.";
+  } else if (statusCode === 401 || lower.includes("unauthorized") || lower.includes("authentication") || lower.includes("invalid api key") || lower.includes("invalid_api_key")) {
+    friendly = "Não foi possível autenticar este provedor. Verifique as credenciais ou a configuração da conta.";
+  } else if (statusCode === 404 || lower.includes("model not found") || lower.includes("model_not_found") || lower.includes("does not exist") || lower.includes("model unavailable") || lower.includes("unknown model")) {
+    friendly = "Este modelo não está disponível neste momento. Escolha outro modelo.";
+  } else if (statusCode === 403 || lower.includes("forbidden") || lower.includes("content-blocked") || lower.includes("content blocked")) {
+    friendly = "O provedor não autorizou esta operação ou a recusou por políticas de segurança.";
   } else if (statusCode === 429 || lower.includes("rate limit") || lower.includes("too many requests")) {
-    friendly = "O provedor atingiu o limite de requisições.";
-  } else if (statusCode >= 500 || lower.includes("timeout") || lower.includes("temporar")) {
-    friendly = "O provedor apresentou uma falha temporária.";
+    friendly = "O provedor atingiu o limite de requisições por minuto. Aguarde alguns instantes e tente novamente.";
+  } else if (statusCode >= 500 || lower.includes("timeout") || lower.includes("temporar") || lower.includes("enotfound") || lower.includes("econnrefused") || lower.includes("connection reset") || lower.includes("network")) {
+    friendly = "Não foi possível conectar ao provedor. Verifique sua conexão e tente novamente.";
   } else if (message) {
     friendly = sanitizeDiagnosticMessage(message);
   }
@@ -284,8 +295,52 @@ function ProviderIconSprite() {
 
 import "./styles.css";
 
-type Model = { providerID: string; providerName: string; modelID: string; name: string; variants?: string[]; enabled: boolean; connected: boolean; attachment?: boolean };
+type Model = {
+  providerID: string;
+  providerName: string;
+  modelID: string;
+  name: string;
+  variants?: string[];
+  enabled: boolean;
+  connected: boolean;
+  attachment?: boolean;
+  cost?: {
+    input?: number;
+    output?: number;
+    cache_read?: number;
+    cache_write?: number;
+    [key: string]: unknown;
+  };
+};
 type Provider = { id: string; name: string; connected: boolean; enabled: boolean; methods: { type: string; label?: string }[]; models: Model[] };
+
+function isModelFree(model: Model | undefined): boolean {
+  if (!model) return false;
+  if (model.cost && typeof model.cost.input === "number" && typeof model.cost.output === "number") {
+    if (model.cost.input === 0 && model.cost.output === 0) return true;
+  }
+  const pid = (model.providerID || "").toLowerCase();
+  if (pid === "opencode" || pid === "opencode-zen") return true;
+  const mid = (model.modelID || "").toLowerCase();
+  const mname = (model.name || "").toLowerCase();
+  if (mid.endsWith(":free") || mid.includes("-free") || mid.includes("_free") || mid.includes("/free") || mid.includes("free")) return true;
+  if (mname.includes("(free)") || mname.includes(" free") || mname.endsWith(" free") || mname.includes("gratuito") || mname.includes("grátis")) return true;
+  return false;
+}
+
+function getProviderPricingLabel(models: Model[] | undefined): "Grátis" | "Pago" | "Gratuito/Pago" {
+  if (!models || models.length === 0) return "Pago";
+  let freeCount = 0;
+  let paidCount = 0;
+  for (const m of models) {
+    if (isModelFree(m)) freeCount++;
+    else paidCount++;
+  }
+  if (freeCount > 0 && paidCount === 0) return "Grátis";
+  if (freeCount === 0 && paidCount > 0) return "Pago";
+  if (freeCount > 0 && paidCount > 0) return "Gratuito/Pago";
+  return "Pago";
+}
 
 // Single vision-capability decision point in the renderer. Mirrors the
 // shared detection used by the main process (catalog capability + local
@@ -594,6 +649,204 @@ function AgentDecisionCard({ question, onAnswer, onDismiss }: {
   );
 }
 
+function isSupabaseMigrationPermission(permName: string): boolean {
+  const name = String(permName || "");
+  return name.includes("apply_migration") || name.includes("execute_sql");
+}
+
+interface MigrationCardProposal {
+  id: string;
+  sessionId: string;
+  messageId?: string;
+  projectRef: string;
+  name: string;
+  originalSql: string;
+  normalizedSql: string;
+  hash: string;
+  risk: "READ" | "SAFE_WRITE" | "DESTRUCTIVE";
+  affectedTables: string[];
+  status: "PENDING" | "APPROVED" | "REJECTED" | "EXPIRED" | "EXECUTING" | "SUCCESS" | "FAILED" | "CANCELLED";
+  createdAt: number;
+  expiresAt: number;
+  summary?: string;
+  error?: string;
+  appliedFilename?: string;
+}
+
+function DatabaseMigrationCard({
+  proposal,
+  onReply,
+  onCopy
+}: {
+  proposal: MigrationCardProposal;
+  onReply: (approved: boolean) => Promise<void>;
+  onCopy: (text: string, target?: HTMLElement | null) => void;
+}) {
+  const [showSql, setShowSql] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  const handleApprove = async () => {
+    if (busy || proposal.status !== "PENDING") return;
+    setBusy(true);
+    try {
+      await onReply(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleReject = async () => {
+    if (busy || proposal.status !== "PENDING") return;
+    setBusy(true);
+    try {
+      await onReply(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const isPending = proposal.status === "PENDING";
+  const isExecuting = proposal.status === "EXECUTING" || proposal.status === "APPROVED";
+  const isSuccess = proposal.status === "SUCCESS";
+  const isFailed = proposal.status === "FAILED";
+  const isRejected = proposal.status === "REJECTED";
+  const isExpired = proposal.status === "EXPIRED" || proposal.status === "CANCELLED";
+
+  const riskLabel = proposal.risk === "DESTRUCTIVE" ? "Alteração Estrutural Crítica" : proposal.risk === "SAFE_WRITE" ? "Alteração Segura" : "Leitura";
+  const riskClass = proposal.risk === "DESTRUCTIVE" ? "risk-destructive" : proposal.risk === "SAFE_WRITE" ? "risk-safe" : "risk-read";
+
+  return (
+    <div className={`database-migration-card ${isSuccess ? "success" : isFailed ? "failed" : isRejected ? "rejected" : isExecuting ? "executing" : ""}`}>
+      <div className="migration-card-head">
+        <div className="migration-card-icon-title">
+          <Database size={16} className="migration-db-icon" />
+          <div>
+            <div className="migration-card-title-row">
+              <b>Alteração no Banco de Dados (Supabase)</b>
+              <span className={`migration-risk-badge ${riskClass}`}>{riskLabel}</span>
+            </div>
+            <small className="migration-card-subtitle">
+              Projeto: <code>{proposal.projectRef}</code> {proposal.name ? `• ${proposal.name}` : ""}
+            </small>
+          </div>
+        </div>
+      </div>
+
+      <div className="migration-card-body">
+        {proposal.summary ? (
+          <div className="migration-summary-text">{proposal.summary}</div>
+        ) : (
+          <div className="migration-summary-text">
+            Esta migração executará alterações no esquema do banco de dados remoto.
+          </div>
+        )}
+
+        {proposal.affectedTables && proposal.affectedTables.length > 0 && (
+          <div className="migration-affected-tables">
+            <span className="migration-tables-label">Tabelas afetadas:</span>
+            <div className="migration-tables-list">
+              {proposal.affectedTables.map(table => (
+                <span key={table} className="migration-table-tag">{table}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="migration-sql-toggle-row">
+          <button
+            type="button"
+            className="migration-sql-toggle-btn"
+            onClick={() => setShowSql(!showSql)}
+          >
+            {showSql ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+            <span>{showSql ? "Ocultar SQL" : "Mostrar SQL"}</span>
+          </button>
+          {showSql && (
+            <button
+              type="button"
+              className="migration-sql-copy-btn"
+              onClick={(e) => onCopy(proposal.originalSql, e.currentTarget)}
+              title="Copiar SQL"
+            >
+              <Copy size={12} /> Copiar SQL
+            </button>
+          )}
+        </div>
+
+        {showSql && (
+          <div className="migration-sql-container">
+            <pre className="migration-sql-pre"><code>{proposal.originalSql}</code></pre>
+          </div>
+        )}
+
+        {isFailed && proposal.error && (
+          <div className="migration-error-box">
+            <AlertTriangle size={14} />
+            <div>
+              <b>Falha na execução da migração:</b>
+              <p>{proposal.error}</p>
+            </div>
+          </div>
+        )}
+
+        {isSuccess && (
+          <div className="migration-success-box">
+            <CheckCircle2 size={15} />
+            <div>
+              <b>Migração executada e confirmada com sucesso!</b>
+              {proposal.appliedFilename && (
+                <small>Arquivo registrado: <code>{proposal.appliedFilename}</code></small>
+              )}
+            </div>
+          </div>
+        )}
+
+        {isRejected && (
+          <div className="migration-rejected-box">
+            <X size={14} />
+            <span>A alteração no banco de dados foi rejeitada pelo usuário.</span>
+          </div>
+        )}
+
+        {isExpired && (
+          <div className="migration-expired-box">
+            <CircleAlert size={14} />
+            <span>Esta proposta de migração expirou ou foi cancelada.</span>
+          </div>
+        )}
+      </div>
+
+      {isPending && (
+        <div className="migration-card-actions">
+          <button
+            type="button"
+            className="migration-btn-reject"
+            onClick={handleReject}
+            disabled={busy}
+          >
+            {busy ? <Loader2 size={13} className="spin" /> : <X size={13} />} Rejeitar
+          </button>
+          <button
+            type="button"
+            className="migration-btn-approve"
+            onClick={handleApprove}
+            disabled={busy}
+          >
+            {busy ? <Loader2 size={13} className="spin" /> : <Check size={13} />} Aprovar e Executar
+          </button>
+        </div>
+      )}
+
+      {isExecuting && (
+        <div className="migration-executing-status">
+          <Loader2 size={14} className="spin" />
+          <span>Executando migração no Supabase...</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 
 function App() {
@@ -644,17 +897,28 @@ function App() {
   const [brokenThumbs, setBrokenThumbs] = React.useState<Set<string>>(() => new Set());
   const [sessionId, setSessionId] = React.useState<string | null>(null);
 
-  const [projectDisplayName, setProjectDisplayName] = React.useState("Projeto");
-  const projectName = projectDisplayName;
+  const projectName = React.useMemo(() => {
+    if (!project) return "Projeto";
+    const recent = recentProjects.find(p => p.path === project);
+    if (recent?.name) return recent.name;
+    const parts = project.split(/[/\\]/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "Projeto";
+  }, [project, recentProjects]);
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [input, setInput] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [activity, setActivity] = React.useState<Activity[]>([]);
   const [workingStatus, setWorkingStatus] = React.useState<string>("");
-  const [pendingPermission, setPendingPermission] = React.useState<PermissionRequest | null>(null);
+  const [timelineOpen, setTimelineOpen] = React.useState<boolean>(false);
+  const [timelineTaskId, setTimelineTaskId] = React.useState<string | null>(null);
+  const [taskTimelines, setTaskTimelines] = React.useState<Map<string, TaskTimeline>>(new Map());
+  const currentTaskTimelineRef = React.useRef<TaskTimeline | null>(null);
+  const [pendingPermissions, setPendingPermissions] = React.useState<PermissionRequest[]>([]);
   const [pendingQuestion, setPendingQuestion] = React.useState<AgentQuestion | null>(null);
   const pendingQuestionRef = React.useRef<AgentQuestion | null>(null);
   const handledQuestionIdsRef = React.useRef<Set<string>>(new Set());
+  const [pendingMigration, setPendingMigration] = React.useState<MigrationCardProposal | null>(null);
+  const [migrationHistory, setMigrationHistory] = React.useState<Map<string, MigrationCardProposal>>(new Map());
   // Lightbox simples para visualizar imagens anexadas em tamanho maior.
   const [lightboxImage, setLightboxImage] = React.useState<{ url: string; name: string } | null>(null);
   // Clonar Site — análise/crawling de uma URL pública.
@@ -695,6 +959,8 @@ function App() {
   const [selectedModel, setSelectedModel] = React.useState<{ providerID: string; modelID: string } | undefined>();
   const [modelOpen, setModelOpen] = React.useState(false);
   const [modelSearch, setModelSearch] = React.useState("");
+  const [chatAccordionOpenProvider, setChatAccordionOpenProvider] = React.useState<string | null>(null);
+  const [expandedManagedProviders, setExpandedManagedProviders] = React.useState<Set<string>>(() => new Set());
   const [modal, setModal] = React.useState<Modal>(null);
   const [providerSearch, setProviderSearch] = React.useState("");
   const [selectedProvider, setSelectedProvider] = React.useState<Provider | null>(null);
@@ -742,6 +1008,7 @@ function App() {
     region?: string | null;
     pendingRuntimeSetup?: boolean;
     recentCreatedNotice?: string | null;
+    usedProjectRefs?: string[];
     error: string | null;
   }>({
     status: "disconnected",
@@ -753,6 +1020,7 @@ function App() {
     projectUrl: null,
     pendingRuntimeSetup: false,
     recentCreatedNotice: null,
+    usedProjectRefs: [],
     error: null,
   });
   const [supabaseBusy, setSupabaseBusy] = React.useState(false);
@@ -1236,8 +1504,18 @@ function App() {
       map.get(m.providerID)!.models.push(m);
     }
     const q = modelSearch.toLowerCase();
-    return Array.from(map.values()).filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
-  }, [models, modelSearch]);
+    const groups = Array.from(map.values()).filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
+
+    // Order: The provider of the currently selected model is ALWAYS first
+    if (selectedModel?.providerID) {
+      const activeIdx = groups.findIndex(g => g.providerID === selectedModel.providerID);
+      if (activeIdx > 0) {
+        const [activeGroup] = groups.splice(activeIdx, 1);
+        groups.unshift(activeGroup);
+      }
+    }
+    return groups;
+  }, [models, modelSearch, selectedModel?.providerID]);
 
   const managedModelGroups = React.useMemo(() => {
     const map = new Map<string, { providerID: string; providerName: string; models: Model[] }>();
@@ -1246,7 +1524,19 @@ function App() {
       map.get(m.providerID)!.models.push(m);
     }
     const q = modelSearch.toLowerCase();
-    return Array.from(map.values()).filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
+    const filtered = Array.from(map.values()).filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
+
+    // Order: Providers with at least one free model appear before providers without free models
+    const freeProviders: typeof filtered = [];
+    const paidProviders: typeof filtered = [];
+    for (const group of filtered) {
+      if (group.models.some(isModelFree)) {
+        freeProviders.push(group);
+      } else {
+        paidProviders.push(group);
+      }
+    }
+    return [...freeProviders, ...paidProviders];
   }, [managedModels, modelSearch]);
 
   const connectedProviders = React.useMemo(() => providers.filter(p => p.connected), [providers]);
@@ -1255,6 +1545,22 @@ function App() {
     const q = providerSearch.toLowerCase();
     return q ? providers.filter(p => p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)) : providers;
   }, [providers, providerSearch]);
+
+  const availableFreeModels = React.useMemo(() => {
+    const q = providerSearch.toLowerCase();
+    const list: Model[] = [];
+    for (const p of filteredProviders) {
+      if (p.connected) continue;
+      for (const m of (p.models || [])) {
+        if (isModelFree(m)) {
+          if (!q || m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q) || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)) {
+            list.push(m);
+          }
+        }
+      }
+    }
+    return list;
+  }, [filteredProviders, providerSearch]);
 
   const POPULAR_PROVIDER_IDS = React.useMemo(() => new Set([
     "openai", "anthropic", "google", "deepseek", "xai", "mistral", "groq", "opencode"
@@ -1274,6 +1580,35 @@ function App() {
     () => filteredProviders.filter(p => !p.connected && !popularProviders.some(pp => pp.id === p.id)),
     [filteredProviders, popularProviders]
   );
+
+  const availableSupabaseProjects = React.useMemo(() => {
+    if (!supabaseState.projects || supabaseState.projects.length === 0) return [];
+    const currentRef = (supabaseState.projectRef || "").trim().toLowerCase();
+    const usedRefs = new Set((supabaseState.usedProjectRefs || []).map(r => (r || "").trim().toLowerCase()));
+    if (currentRef) {
+      usedRefs.add(currentRef);
+    }
+    return supabaseState.projects.filter(p => {
+      const pRef = (p.ref || "").trim().toLowerCase();
+      const pId = (p.id || "").trim().toLowerCase();
+      return !usedRefs.has(pRef) && !usedRefs.has(pId);
+    });
+  }, [supabaseState.projects, supabaseState.projectRef, supabaseState.usedProjectRefs]);
+
+  const unavailableSupabaseProjects = React.useMemo(() => {
+    if (!supabaseState.projects || supabaseState.projects.length === 0) return [];
+    const currentRef = (supabaseState.projectRef || "").trim().toLowerCase();
+    const otherUsedRefs = new Set((supabaseState.usedProjectRefs || []).map(r => (r || "").trim().toLowerCase()));
+    return supabaseState.projects.filter(p => {
+      const pRef = (p.ref || "").trim().toLowerCase();
+      const pId = (p.id || "").trim().toLowerCase();
+      // Não incluir o projeto atualmente conectado ao workspace atual
+      if (currentRef && (pRef === currentRef || pId === currentRef)) {
+        return false;
+      }
+      return otherUsedRefs.has(pRef) || otherUsedRefs.has(pId);
+    });
+  }, [supabaseState.projects, supabaseState.projectRef, supabaseState.usedProjectRefs]);
 
   // --- End computed variables (filteredSlashCommands & filteredContextResults below, after their state declarations) ---
 
@@ -1798,7 +2133,8 @@ function App() {
   const isModalOpen = Boolean(modal || isSwitchingProject || lightboxImage);
   const isTopbarDropdownOpen = Boolean(githubBranchMenuOpen || projectMenuOpen || recentProjectsMenuOpen);
   const isInternalDropdownOpen = Boolean(previewRouteOpen);
-  const isAnyOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen);
+  const isTimelineOverlay = Boolean(timelineOpen && workspaceTab === "preview");
+  const isAnyOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen || isTimelineOverlay);
 
   React.useEffect(() => {
     if (previewSurface === "webcontents" && workspaceTab === "preview" && previewUrl) {
@@ -1840,6 +2176,8 @@ function App() {
   // process. A completed state for the plan task must not conclude anything:
   // the plan approval card owns the flow.
   const planAwaitingRef = React.useRef(false);
+  // Deduplicação de mensagem visual de cancelamento por tarefa/sessão
+  const cancelledTaskIdRef = React.useRef<string | null>(null);
   // Terminal state of the current task. Once "completed", "cancelled" or
   // "failed", delayed SSE events (idle/working/retry/tool/file/command) must
   // NOT re-introduce busy or working status. A new task resets it to "running".
@@ -2129,66 +2467,161 @@ function App() {
     });
   }, [syncGithubContext]);
 
-  React.useEffect(() => {
-    window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
-    return window.neko.onSupabaseStateChange((s: any) => {
-      if (s) setSupabaseState(s);
+  const recordTimelineItem = React.useCallback((entry: Partial<TimelineItem> & { id: string; title: string }) => {
+    const currentTaskId = currentTaskIdRef.current || `task-${Date.now()}`;
+    const now = Date.now();
+
+    setTaskTimelines(prev => {
+      const nextMap = new Map(prev);
+      let timeline = nextMap.get(currentTaskId);
+      if (!timeline) {
+        timeline = {
+          taskId: currentTaskId,
+          sessionId: sessionIdRef.current || undefined,
+          status: "running",
+          startedAt: now,
+          items: []
+        };
+      }
+
+      const existingIndex = timeline.items.findIndex(i => i.id === entry.id);
+      let updatedItems = [...timeline.items];
+
+      if (existingIndex >= 0) {
+        const existing = updatedItems[existingIndex];
+        const completedAt = entry.status === "completed" || entry.status === "error" ? (entry.completedAt ?? now) : existing.completedAt;
+        const startedAt = existing.startedAt || now;
+        const durationMs = completedAt ? Math.max(0, completedAt - startedAt) : existing.durationMs;
+
+        updatedItems[existingIndex] = {
+          ...existing,
+          ...entry,
+          startedAt,
+          completedAt,
+          durationMs
+        };
+      } else {
+        const lastItem = updatedItems[updatedItems.length - 1];
+        if (entry.type === "thinking" && lastItem && lastItem.type === "thinking" && lastItem.status === "running") {
+          const completedAt = entry.status === "completed" || entry.status === "error" ? (entry.completedAt ?? now) : lastItem.completedAt;
+          const durationMs = completedAt ? Math.max(0, completedAt - lastItem.startedAt) : lastItem.durationMs;
+          updatedItems[updatedItems.length - 1] = {
+            ...lastItem,
+            title: entry.title || lastItem.title,
+            detail: entry.detail || lastItem.detail,
+            status: entry.status || lastItem.status,
+            completedAt,
+            durationMs
+          };
+        } else {
+          const startedAt = entry.startedAt || now;
+          const completedAt = entry.status === "completed" || entry.status === "error" ? (entry.completedAt ?? now) : undefined;
+          const durationMs = completedAt ? Math.max(0, completedAt - startedAt) : undefined;
+
+          const newItem: TimelineItem = {
+            id: entry.id,
+            type: entry.type || "status",
+            title: entry.title,
+            detail: entry.detail,
+            status: entry.status || "running",
+            startedAt,
+            completedAt,
+            durationMs,
+            sessionId: entry.sessionId || sessionIdRef.current || undefined,
+            taskId: currentTaskId
+          };
+          updatedItems.push(newItem);
+        }
+      }
+
+      if (updatedItems.length > 60) {
+        updatedItems = updatedItems.slice(-60);
+      }
+
+      const updatedTimeline: TaskTimeline = {
+        ...timeline,
+        items: updatedItems,
+        summaryText: entry.title || timeline.summaryText
+      };
+
+      nextMap.set(currentTaskId, updatedTimeline);
+      currentTaskTimelineRef.current = updatedTimeline;
+      return nextMap;
     });
   }, []);
 
-  React.useEffect(() => {
-    window.neko.vercelGetState().then((s: any) => { if (s) setVercelState(s); }).catch(() => {});
-    const unsubState = window.neko.onVercelStateChange((s: any) => {
-      if (s) setVercelState(s);
+  const completeTaskTimeline = React.useCallback((status: "completed" | "failed" | "cancelled", errorMsg?: string) => {
+    const currentTaskId = currentTaskIdRef.current;
+    if (!currentTaskId) return;
+    const now = Date.now();
+
+    setTaskTimelines(prev => {
+      const nextMap = new Map(prev);
+      const timeline = nextMap.get(currentTaskId) || currentTaskTimelineRef.current;
+      if (!timeline) return prev;
+
+      const finalizedItems = timeline.items.map(item => {
+        if (item.status === "running") {
+          const completedAt = now;
+          const durationMs = Math.max(0, completedAt - item.startedAt);
+          return {
+            ...item,
+            status: status === "completed" ? ("completed" as const) : ("error" as const),
+            completedAt,
+            durationMs
+          };
+        }
+        return item;
+      });
+
+      const totalDuration = timeline.startedAt ? Math.max(0, now - timeline.startedAt) : undefined;
+
+      const updatedTimeline: TaskTimeline = {
+        ...timeline,
+        status,
+        completedAt: now,
+        durationMs: totalDuration,
+        items: finalizedItems,
+        error: errorMsg || timeline.error
+      };
+
+      nextMap.set(currentTaskId, updatedTimeline);
+      if (timeline.taskId && timeline.taskId !== currentTaskId) {
+        nextMap.set(timeline.taskId, updatedTimeline);
+      }
+      currentTaskTimelineRef.current = updatedTimeline;
+      return nextMap;
     });
-    const unsubLog = window.neko.onVercelLog((log: string) => {
-      setVercelLogs(prev => [...prev.slice(-19), log]);
-    });
-    return () => {
-      unsubState();
-      unsubLog();
-    };
   }, []);
 
-  React.useEffect(() => {
-    if (modal === "vercel" && !vercelState.linked && project) {
-      const folderName = project.split(/[/\\]/).filter(Boolean).pop() || "";
-      const suggested = slugifyVercelProjectName(folderName);
-      setVercelProjectName((prev) => (prev ? prev : suggested));
-    }
-  }, [modal, vercelState.linked, project]);
-
-  const addAttachmentResult = React.useCallback((result:any) => {
-    const items=Array.isArray(result?.items)?result.items:[]; const errors=Array.isArray(result?.errors)?result.errors:[];
-    setAttachments(prev=>[...prev,...items].slice(0,10));
-    if(errors.length) setUploadErrors(prev=>[...prev,...errors.map((e:any)=>({id:`upload:${Date.now()}:${Math.random()}`,name:String(e.name??"Arquivo"),message:String(e.message??"Falha no Upload"),extension:String(e.extension??"FILE")}))].slice(-6));
-    composerRef.current?.focus();
-  },[]);
-
-  const handlePickAttachments = React.useCallback(async () => {
-    try { addAttachmentResult(await window.neko.pickAttachments()); }
-    catch(error){ setUploadErrors(prev=>[...prev,{id:`upload:${Date.now()}`,name:"Arquivo",message:String(error),extension:"FILE"}].slice(-6)); }
-  },[addAttachmentResult]);
-
-  const handlePaste = React.useCallback(async (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items=Array.from(event.clipboardData.items||[]); const image=items.find(item=>item.kind==="file"&&item.type.startsWith("image/"));
-    if(!image) return; const file=image.getAsFile(); if(!file) return; event.preventDefault();
-    const reader=new FileReader(); reader.onload=async()=>{
-      try { const result=await window.neko.saveClipboardImage(String(reader.result),file.type);
-        if(result?.item) setAttachments(prev=>[...prev,result.item].slice(0,10));
-        if(result?.error) setUploadErrors(prev=>[...prev,{id:`paste:${Date.now()}`,name:String(result.error.name??"Imagem"),message:String(result.error.message??"Falha no Upload"),extension:String(result.error.extension??"IMG")}].slice(-6));
-      } catch(error){ setUploadErrors(prev=>[...prev,{id:`paste:${Date.now()}`,name:"Imagem",message:String(error),extension:"IMG"}].slice(-6)); }
-    }; reader.readAsDataURL(file);
-  },[]);
-
-  const upsertActivity = React.useCallback((entry: Omit<Activity, "ts"> & { ts?: number }) => {
+  const upsertActivity = React.useCallback((entry: Omit<Activity, "ts"> & { ts?: number; type?: TimelineItemType; completedAt?: number; durationMs?: number }) => {
     const nextEntry: Activity = { ...entry, ts: entry.ts ?? Date.now() };
     setActivity(prev => {
       const index = prev.findIndex(item => item.id === nextEntry.id);
       const next = index === -1 ? [...prev, nextEntry] : prev.map((item, i) => i === index ? { ...item, ...nextEntry, ts: item.ts } : item);
       return next.sort((a, b) => a.ts - b.ts).slice(-12);
     });
-  }, []);
+
+    const itemType: TimelineItemType = entry.type || (
+      entry.icon === "brain" ? "thinking" :
+      entry.icon === "file" ? "edit" :
+      entry.icon === "command" ? "command" :
+      entry.icon === "wait" ? (entry.id.startsWith("permission") ? "permission" : "question") :
+      entry.icon === "check" ? "validation" :
+      entry.icon === "error" ? "error" : "status"
+    );
+
+    recordTimelineItem({
+      id: entry.id,
+      type: itemType,
+      title: entry.title,
+      detail: entry.detail,
+      status: entry.state === "done" ? "completed" : entry.state === "error" ? "error" : "running",
+      startedAt: entry.ts || Date.now(),
+      completedAt: entry.completedAt,
+      durationMs: entry.durationMs
+    });
+  }, [recordTimelineItem]);
 
   const finishActivity = React.useCallback((ids?: string[]) => {
     setActivity(prev => prev.map(item => {
@@ -2197,7 +2630,60 @@ function App() {
       }
       return item;
     }));
+
+    const currentTaskId = currentTaskIdRef.current;
+    if (currentTaskId) {
+      setTaskTimelines(prev => {
+        const timeline = prev.get(currentTaskId);
+        if (!timeline) return prev;
+        const now = Date.now();
+        const updatedItems = timeline.items.map(item => {
+          if ((!ids || ids.includes(item.id)) && item.status === "running") {
+            const completedAt = now;
+            const durationMs = Math.max(0, completedAt - item.startedAt);
+            return { ...item, status: "completed" as const, completedAt, durationMs };
+          }
+          return item;
+        });
+        const nextMap = new Map(prev);
+        nextMap.set(currentTaskId, { ...timeline, items: updatedItems });
+        currentTaskTimelineRef.current = nextMap.get(currentTaskId) || null;
+        return nextMap;
+      });
+    }
   }, []);
+
+  const handleReplyMigration = React.useCallback(async (approved: boolean) => {
+    if (!pendingMigration) return;
+    const proposalId = pendingMigration.id;
+    try {
+      if (!approved) {
+        // [Rejeitar-cleanup]: Limpa imediatamente o estado visual da migration pendente
+        // e remove do migrationHistory para que o card desapareça completamente do chat.
+        // A sessão NÃO é abortada: a rejeição é enviada à tool do OpenCode e o Agent continua.
+        setPendingMigration(null);
+        setMigrationHistory(prev => {
+          const next = new Map(prev);
+          next.delete(proposalId);
+          return next;
+        });
+        finishActivity();
+      } else {
+        taskPhaseRef.current = "running";
+        setBusy(true);
+        setPendingMigration(prev => {
+          if (!prev || prev.id !== proposalId) return prev;
+          return {
+            ...prev,
+            status: "APPROVED"
+          };
+        });
+      }
+      await window.neko.supabaseReplyMigration({ proposalId, approved });
+    } catch (err: any) {
+      console.error("[Neko/MigrationUI] Falha ao responder migração:", err);
+    }
+  }, [pendingMigration, finishActivity]);
 
   const sanitizeUserFacingText = React.useCallback((value: unknown) => {
     let text = String(value ?? "").trim();
@@ -2267,23 +2753,31 @@ function App() {
     const pathText = file ? displayPath(file) : "";
 
     if (["edit", "write", "patch", "apply_patch", "multiedit"].some(name => tool.includes(name))) {
-      return pathText ? `Editando ${pathText}...` : "Editando os arquivos do projeto...";
+      return pathText ? `Editando ${pathText}...` : "Editando arquivos do projeto...";
     }
     if (["read", "cat", "view"].some(name => tool === name || tool.includes(name))) {
-      return pathText ? `Analisando ${pathText}...` : "Analisando os arquivos do projeto...";
+      return pathText ? `Lendo ${pathText}...` : "Lendo arquivos do projeto...";
     }
     if (["grep", "search", "glob", "find", "ls", "list"].some(name => tool.includes(name))) {
-      return "Analisando os arquivos do projeto...";
+      return pathText ? `Procurando em ${pathText}...` : "Procurando arquivos relevantes...";
     }
-    if (["bash", "shell", "terminal", "command", "exec"].some(name => tool.includes(name))) {
-      const command = String(input.command ?? input.cmd ?? "").toLowerCase();
-      if (/\b(test|vitest|jest|playwright|cypress)\b/.test(command)) return "Executando os testes...";
-      if (/\b(build|tsc|vite build|npm run build)\b/.test(command)) return "Verificando a compilação do projeto...";
-      if (/\b(install|npm i|pnpm i|yarn add|bun add)\b/.test(command)) return "Configurando as dependências...";
-      return "Executando uma ação no projeto...";
+    if (["bash", "shell", "terminal", "command", "exec", "run_command"].some(name => tool.includes(name))) {
+      const command = String(input.command ?? input.cmd ?? "").trim();
+      const cmdLower = command.toLowerCase();
+      if (/\b(test|vitest|jest|playwright|cypress)\b/.test(cmdLower)) return "Executando os testes...";
+      if (/\b(build|tsc|vite build|npm run build)\b/.test(cmdLower)) return "Executando npm run build...";
+      if (/\b(install|npm i|pnpm i|yarn add|bun add)\b/.test(cmdLower)) return "Configurando dependências...";
+      if (command) {
+        const shortCmd = command.length > 35 ? command.slice(0, 32) + "..." : command;
+        return `Executando ${shortCmd}...`;
+      }
+      return "Executando comando...";
     }
-    if (tool.includes("task") || tool.includes("agent")) return "Executando uma etapa do projeto...";
-    return "Trabalhando no projeto...";
+    if (tool.includes("question")) return "Aguardando resposta do usuário...";
+    if (tool.includes("plan_exit")) return "Finalizando auditoria de implementação...";
+    if (tool.includes("migration") || tool.includes("sql")) return "Preparando migração do banco...";
+    if (tool.includes("task") || tool.includes("agent")) return "Executando etapa do projeto...";
+    return "Pensando...";
   }, [displayPath]);
 
   const getEffectiveModel = React.useCallback((base: { providerID: string; modelID: string } | undefined) => {
@@ -2302,6 +2796,122 @@ function App() {
     return (lastBreak > 180 ? cut.slice(0, lastBreak + (cut[lastBreak] === "." ? 1 : 0)) : cut).trimEnd() + "…";
   }, []);
 
+  React.useEffect(() => {
+    window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
+    const unsubState = window.neko.onSupabaseStateChange((s: any) => {
+      if (s) setSupabaseState(s);
+    });
+
+    const unsubMigration = window.neko.onSupabaseMigrationEvent?.((event: { type: string; payload: any }) => {
+      console.log("[Neko/MigrationUI] Evento recebido:", event?.type, event?.payload);
+      if (!event || !event.type) return;
+
+      const rawPayload = event.payload;
+      const payload = (rawPayload?.proposal ?? rawPayload) as MigrationCardProposal;
+      if (!payload || !payload.id) return;
+
+      if (event.type === "supabase:migration:asked") {
+        setPendingMigration(payload);
+        setMigrationHistory(prev => new Map(prev).set(payload.id, payload));
+      } else if (event.type === "supabase:migration:executing") {
+        taskPhaseRef.current = "running";
+        setBusy(true);
+        setPendingMigration(prev => (prev?.id === payload.id ? { ...prev, status: "EXECUTING" } : prev));
+        setMigrationHistory(prev => {
+          const currentHist = prev.get(payload.id);
+          // O histórico deve permanecer histórico: não ressuscitar cards terminais ou ausentes
+          if (!currentHist || (currentHist.status === "REJECTED" || currentHist.status === "FAILED" || currentHist.status === "SUCCESS")) {
+            return prev;
+          }
+          return new Map(prev).set(payload.id, { ...payload, status: "EXECUTING" });
+        });
+      } else if (event.type === "supabase:migration:completed") {
+        // [SUCCESS-cleanup]: O card de migração é uma UI temporária de aprovação/execução.
+        // Ao finalizar com sucesso, removemos completamente do chat (pendingMigration e migrationHistory),
+        // preservando intacta a mensagem e o relatório final do Agent.
+        setPendingMigration(null);
+        setMigrationHistory(prev => {
+          const next = new Map(prev);
+          next.delete(payload.id);
+          return next;
+        });
+      } else if (event.type === "supabase:migration:failed") {
+        setPendingMigration(null);
+        setMigrationHistory(prev => new Map(prev).set(payload.id, payload));
+      } else if (event.type === "supabase:migration:replied") {
+        if (payload.status === "REJECTED" || rawPayload?.approved === false) {
+          setPendingMigration(null);
+          setMigrationHistory(prev => {
+            const next = new Map(prev);
+            next.delete(payload.id);
+            return next;
+          });
+        } else {
+          taskPhaseRef.current = "running";
+          setBusy(true);
+          setPendingMigration(prev => (prev?.id === payload.id ? { ...prev, status: "APPROVED" } : prev));
+          setMigrationHistory(prev => new Map(prev).set(payload.id, payload));
+        }
+      } else if (event.type === "supabase:migration:expired" || event.type === "supabase:migration:cancelled") {
+        setPendingMigration(prev => (prev?.id === payload.id ? null : prev));
+        setMigrationHistory(prev => {
+          const next = new Map(prev);
+          next.delete(payload.id);
+          return next;
+        });
+      }
+    });
+
+    return () => {
+      unsubState();
+      unsubMigration?.();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    window.neko.vercelGetState().then((s: any) => { if (s) setVercelState(s); }).catch(() => {});
+    const unsubState = window.neko.onVercelStateChange((s: any) => {
+      if (s) setVercelState(s);
+    });
+    const unsubLog = window.neko.onVercelLog((log: string) => {
+      setVercelLogs(prev => [...prev.slice(-19), log]);
+    });
+    return () => {
+      unsubState();
+      unsubLog();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (modal === "vercel" && !vercelState.linked && project) {
+      const folderName = project.split(/[/\\]/).filter(Boolean).pop() || "";
+      const suggested = slugifyVercelProjectName(folderName);
+      setVercelProjectName((prev) => (prev ? prev : suggested));
+    }
+  }, [modal, vercelState.linked, project]);
+
+  const addAttachmentResult = React.useCallback((result:any) => {
+    const items=Array.isArray(result?.items)?result.items:[]; const errors=Array.isArray(result?.errors)?result.errors:[];
+    setAttachments(prev=>[...prev,...items].slice(0,10));
+    if(errors.length) setUploadErrors(prev=>[...prev,...errors.map((e:any)=>({id:`upload:${Date.now()}:${Math.random()}`,name:String(e.name??"Arquivo"),message:String(e.message??"Falha no Upload"),extension:String(e.extension??"FILE")}))].slice(-6));
+    composerRef.current?.focus();
+  },[]);
+
+  const handlePickAttachments = React.useCallback(async () => {
+    try { addAttachmentResult(await window.neko.pickAttachments()); }
+    catch(error){ setUploadErrors(prev=>[...prev,{id:`upload:${Date.now()}`,name:"Arquivo",message:String(error),extension:"FILE"}].slice(-6)); }
+  },[addAttachmentResult]);
+
+  const handlePaste = React.useCallback(async (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items=Array.from(event.clipboardData.items||[]); const image=items.find(item=>item.kind==="file"&&item.type.startsWith("image/"));
+    if(!image) return; const file=image.getAsFile(); if(!file) return; event.preventDefault();
+    const reader=new FileReader(); reader.onload=async()=>{
+      try { const result=await window.neko.saveClipboardImage(String(reader.result),file.type);
+        if(result?.item) setAttachments(prev=>[...prev,result.item].slice(0,10));
+        if(result?.error) setUploadErrors(prev=>[...prev,{id:`paste:${Date.now()}`,name:String(result.error.name??"Imagem"),message:String(result.error.message??"Falha no Upload"),extension:String(result.error.extension??"IMG")}].slice(-6));
+      } catch(error){ setUploadErrors(prev=>[...prev,{id:`paste:${Date.now()}`,name:"Imagem",message:String(error),extension:"IMG"}].slice(-6)); }
+    }; reader.readAsDataURL(file);
+  },[]);
 
   React.useLayoutEffect(() => {
     const container = messagesRef.current;
@@ -2420,11 +3030,24 @@ function App() {
       const text = rawText ? sanitizeUserFacingText(rawText) : "";
       if (text) {
         const activeTask = activeTaskRef.current;
+        const assignedTaskId = currentTaskIdRef.current || activeTask?.id || undefined;
+        const durationMs = activeTask?.startedAt ? Math.max(0, Date.now() - activeTask.startedAt) : undefined;
         setMessages(prev => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.text === text) return prev;
-          const durationMs = activeTask ? Math.max(0, Date.now() - activeTask.startedAt) : undefined;
-          return [...prev, { role: "assistant", text, taskId: activeTask?.id, durationMs, createdAt: Date.now() }];
+          const lastIndex = prev.length - 1;
+          const last = prev[lastIndex];
+          if (last?.role === "assistant" && last.text === text) {
+            if ((!last.taskId && assignedTaskId) || (last.durationMs === undefined && durationMs !== undefined)) {
+              const updated = [...prev];
+              updated[lastIndex] = {
+                ...last,
+                taskId: last.taskId || assignedTaskId,
+                durationMs: last.durationMs ?? durationMs
+              };
+              return updated;
+            }
+            return prev;
+          }
+          return [...prev, { role: "assistant", text, taskId: assignedTaskId, durationMs, createdAt: Date.now() }];
         });
         if (activeTask) activeTaskRef.current = null;
       }
@@ -2543,9 +3166,13 @@ function App() {
     }
     // Terminal state: from now on, delayed events cannot re-introduce busy.
     taskPhaseRef.current = state;
-    // Aviso sonoro: conclusão REAL da tarefa (não para cancelamento/plan).
+    // Aviso sonoro: conclusão REAL da tarefa ou aviso de cancelamento
     if (state === "completed") {
+      completeTaskTimeline("completed");
       notifyOnce("task-complete", String(currentTaskIdRef.current || "done"));
+    } else if (state === "cancelled") {
+      completeTaskTimeline("cancelled");
+      notifyOnce("task-error", String(currentTaskIdRef.current || "cancelled"));
     }
     retryActiveRef.current = false;
     if (completionTimer.current) { window.clearTimeout(completionTimer.current); completionTimer.current = null; }
@@ -2570,7 +3197,7 @@ function App() {
         void runTaskValidation();
       }
     }
-  }, [finishActivity, syncSessionOutput, runTaskValidation, currentErrorSignature, busy]);
+  }, [finishActivity, completeTaskTimeline, syncSessionOutput, runTaskValidation, currentErrorSignature, busy]);
 
   // Authoritative task states coming from the main-process state machine.
   // The agent cycle (running -> question/approval -> running -> completed)
@@ -2581,6 +3208,12 @@ function App() {
     if (state === "running") {
       if (isTaskTerminal()) return;
       if (taskPhaseRef.current === "running") return;
+      // If there are still pending permissions in the queue, stay in waiting_for_approval
+      // instead of transitioning to running. The backend doesn't know about the queue.
+      if (pendingPermissions.length > 0) {
+        console.log(`[TaskLifecycle] Ignoring backend transition to running - ${pendingPermissions.length} permission(s) still pending`);
+        return;
+      }
       taskPhaseRef.current = "running";
       retryActiveRef.current = false;
       setBusy(true);
@@ -2656,12 +3289,16 @@ function App() {
     }
     if (state === "waiting_for_approval") {
       if (isTaskTerminal()) return;
+      // Se a proposta de migração já foi aprovada/está executando e não há outras permissões pendentes, não reverter para waiting_for_approval
+      if (pendingMigration && (pendingMigration.status === "APPROVED" || pendingMigration.status === "EXECUTING") && pendingPermissions.length === 0) {
+        return;
+      }
       taskPhaseRef.current = "waiting_for_approval";
       setBusy(false);
       setWorkingStatus("Neko está aguardando sua aprovação");
       if (props?.permission?.id) {
         notifyOnce("approval", `per:${String(props.permission.id)}`);
-        setPendingPermission(prev => prev?.id === props.permission.id ? prev : props.permission as PermissionRequest);
+        setPendingPermissions(prev => prev.some(p => p.id === props.permission.id) ? prev : [...prev, props.permission as PermissionRequest]);
       }
       return;
     }
@@ -2674,22 +3311,32 @@ function App() {
       return;
     }
     if (state === "cancelled") {
-      setPendingPermission(null);
+      completeTaskTimeline("cancelled");
+      setPendingPermissions([]);
       setPendingQuestion(null);
       pendingQuestionRef.current = null;
       concludeCurrentTask("cancelled");
       upsertActivity({ id: `stopped:${Date.now()}`, icon: "error", title: "Tarefa cancelada", detail: "A execução atual foi parada pelo usuário. As alterações já feitas foram mantidas.", state: "error" });
+      
+      // Inserção visual deduplicada de cancelamento no chat
+      const taskKey = String(props?.taskId ?? currentTaskIdRef.current ?? sessionIdRef.current ?? Date.now());
+      if (cancelledTaskIdRef.current !== taskKey) {
+        cancelledTaskIdRef.current = taskKey;
+        setMessages(prev => [...prev, { role: "assistant", text: "A execução da tarefa foi cancelada pelo usuário.", createdAt: Date.now() }]);
+      }
+      
       console.log(`[TaskLifecycle] state=cancelled taskId=${props?.taskId ?? "-"}`);
       return;
     }
     if (state === "failed") {
+      completeTaskTimeline("failed", String(props?.reason ?? ""));
       taskPhaseRef.current = "failed";
       retryActiveRef.current = false;
       setBusy(false);
       setWorkingStatus("");
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
-      setPendingPermission(null);
+      setPendingPermissions([]);
       setPendingQuestion(null);
       pendingQuestionRef.current = null;
       finishActivity();
@@ -2697,7 +3344,7 @@ function App() {
       console.log(`[TaskLifecycle] state=failed taskId=${props?.taskId ?? "-"} reason=${String(props?.reason ?? "")}`);
       return;
     }
-  }, [concludeCurrentTask, isTaskTerminal, upsertActivity, finishActivity]);
+  }, [concludeCurrentTask, completeTaskTimeline, isTaskTerminal, upsertActivity, finishActivity, pendingPermissions]);
 
   // Stable references for the event-handler effect. The effect must NEVER
   // re-subscribe because a callback identity changed: several callbacks
@@ -2768,17 +3415,23 @@ function App() {
         // An approval created before this task started belongs to an old task
         // and must never block the current one.
         const startedAtMs = requestStartedAtRef.current;
-        const pending = candidates
+        const pendingList = candidates
           .filter((item: any) => {
             if (!item?.id) return false;
             const itemSession = String(item?.sessionID ?? item?.sessionId ?? "");
             if (itemSession && activeSessionId && itemSession !== activeSessionId) return false;
+            // Suppress generic permission prompt for Supabase migration execution tool as it has its own dedicated card
+            const permName = String(item?.permission ?? "");
+            if (isSupabaseMigrationPermission(permName)) return false;
             const createdMs = normalizeTimestampToMs(item?.time?.created ?? item?.createdAt ?? item?.timestamp);
             return createdMs > 0 && createdMs >= startedAtMs;
-          })
-          .slice(-1)[0] ?? null;
-        if (pending?.id) {
-          setPendingPermission(prev => prev?.id === pending.id ? prev : pending as PermissionRequest);
+          });
+        if (pendingList.length > 0) {
+          setPendingPermissions(prev => {
+            // Add all pending permissions that aren't already in the queue
+            const newPerms = pendingList.filter((item: any) => !prev.some(p => p.id === item.id));
+            return newPerms.length > 0 ? [...prev, ...newPerms as PermissionRequest[]] : prev;
+          });
           if (!isTaskTerminal()) {
             taskPhaseRef.current = "waiting_for_approval";
             setBusy(false);
@@ -2841,35 +3494,74 @@ function App() {
       if (type === "neko.activity") {
         const action = props?.action;
         const filePath = props?.path;
+        const tool = props?.tool;
+        const command = props?.command;
+        const status = props?.status;
+        const stage = props?.stage;
+        const callId = props?.callId;
+        const error = props?.error;
+
         if (action === "file" && filePath && !isNekoInternalPath(filePath)) {
           retryActiveRef.current = false;
-          if (isTaskRunning()) setWorkingStatus(`Criando/editando ${displayPath(filePath)}...`);
-          upsertActivity({ id: `file:${displayPath(filePath)}`, icon: "file", title: "Arquivo atualizado", detail: displayPath(filePath), state: "done" });
+          const cleanPath = displayPath(filePath);
+          const actType = props?.actionType === "created" ? "Criando" : props?.actionType === "deleted" ? "Removendo" : "Editando";
+          const title = `${actType} ${cleanPath}`;
+          if (isTaskRunning()) setWorkingStatus(`${title}...`);
+          upsertActivity({
+            id: callId || `file:${cleanPath}`,
+            type: "edit",
+            icon: "file",
+            title,
+            detail: cleanPath,
+            state: "done"
+          });
           window.neko.tree().then(setTree).catch(() => {});
-          setCodeChangedFile(displayPath(filePath));
-          if (activeFile?.path === displayPath(filePath)) {
+          setCodeChangedFile(cleanPath);
+          if (activeFile?.path === cleanPath) {
             window.neko.readFile(activeFile.path).then(setActiveFile).catch(() => {});
           }
           if (project) {
             touchRecentProject(project, true);
           }
-        } else if (action === "command") {
+        } else if (action === "tool" && tool) {
           retryActiveRef.current = false;
-          if (isTaskRunning()) setWorkingStatus("Verificando as alterações...");
+          const toolDesc = describeToolActivity(tool, { filePath, command, path: filePath });
+          if (isTaskRunning()) setWorkingStatus(toolDesc);
+
+          let itemType: TimelineItemType = "status";
+          const toolLower = String(tool).toLowerCase();
+          if (["edit", "write", "patch", "apply_patch", "multiedit"].some(n => toolLower.includes(n))) {
+            itemType = "edit";
+          } else if (["read", "cat", "view", "grep", "search", "glob", "find", "ls", "list"].some(n => toolLower.includes(n))) {
+            itemType = "read";
+          } else if (["bash", "shell", "terminal", "command", "exec", "run_command"].some(n => toolLower.includes(n))) {
+            itemType = "command";
+          } else if (toolLower.includes("question")) {
+            itemType = "question";
+          } else if (toolLower.includes("plan_exit")) {
+            itemType = "analysis";
+          }
+
           upsertActivity({
-            id: `neko-${Date.now()}`,
-            icon: "status",
-            title: "Neko trabalhando",
-            detail: String(props?.command || "Executando comando"),
-            state: "running"
+            id: callId || `tool:${tool}:${Date.now()}`,
+            type: itemType,
+            icon: itemType === "edit" ? "file" : itemType === "command" ? "command" : "tool",
+            title: toolDesc.replace(/\.\.\.$/, ""),
+            detail: filePath ? displayPath(filePath) : (command || String(tool)),
+            state: status === "error" ? "error" : status === "completed" ? "done" : "running"
           });
-        } else {
+        } else if (action === "command" && command) {
+          retryActiveRef.current = false;
+          const shortCmd = String(command).trim();
+          const title = shortCmd.length > 35 ? `Executando ${shortCmd.slice(0, 32)}...` : `Executando ${shortCmd}`;
+          if (isTaskRunning()) setWorkingStatus(title);
           upsertActivity({
-            id: `neko-${Date.now()}`,
-            icon: "status",
-            title: "Neko trabalhando",
-            detail: String(props?.path || props?.command || props?.tool || "Executando etapa"),
-            state: "running"
+            id: callId || `cmd:${Date.now()}`,
+            type: "command",
+            icon: "command",
+            title,
+            detail: shortCmd,
+            state: "done"
           });
         }
       }
@@ -3020,8 +3712,12 @@ function App() {
       if (type === "permission.asked") {
         if (isTaskTerminal()) return;
         const permission = props as PermissionRequest;
+        const permName = String(permission?.permission ?? "");
+        if (isSupabaseMigrationPermission(permName)) {
+          return;
+        }
         setPermissionStep(step => step + 1);
-        setPendingPermission(permission);
+        setPendingPermissions(prev => prev.some(p => p.id === permission.id) ? prev : [...prev, permission]);
         taskPhaseRef.current = "waiting_for_approval";
         setBusy(false);
         setWorkingStatus("Neko está aguardando sua aprovação");
@@ -3030,16 +3726,27 @@ function App() {
       }
       if (type === "permission.replied") {
         const permission = props as any;
-        if (permission?.id && pendingPermission?.id === permission.id) setPendingPermission(null);
-        // The user answered the approval: the agent continues on the same
-        // session. A rejection is a user decision, never a technical error.
-        if (!isTaskTerminal()) {
-          taskPhaseRef.current = "running";
-          setBusy(true);
-          setWorkingStatus("Continuando o projeto...");
+        if (permission?.id) {
+          setPendingPermissions(prev => {
+            const updated = prev.filter(p => p.id !== permission.id);
+            // Only transition back to running if no more permissions are pending
+            if (!isTaskTerminal() && updated.length === 0) {
+              setTimeout(() => {
+                taskPhaseRef.current = "running";
+                setBusy(true);
+                setWorkingStatus("Continuando o projeto...");
+              }, 0);
+            }
+            return updated;
+          });
         }
       }
       if (type === "session.error" || type === "neko.process.error" || type === "neko.connection.error") {
+        // Se a tarefa foi cancelada pelo usuário, erro tardio decorrente do cancelamento/abort não deve sobrescrever para failed
+        if (taskPhaseRef.current === "cancelled") {
+          console.log(`[Neko/TaskState] session.error ignorado pois a tarefa já foi cancelada pelo usuário (type=${type})`);
+          return;
+        }
         // Terminal FAILED state: delayed events must not revive busy/working.
         taskPhaseRef.current = "failed";
         setBusy(false); setWorkingStatus("");
@@ -3248,6 +3955,56 @@ function App() {
     }, 2500);
     return () => { alive = false; window.clearInterval(timer); };
   }, [busy, sessionId, pendingPlan, isTaskTerminal]);
+
+  // Watchdog for missed permissions in race conditions.
+  // Recovers permissions from child sessions that may have been lost during
+  // backend state transitions. Only runs when task is active and no permissions
+  // are currently pending, to avoid duplicate fetches.
+  React.useEffect(() => {
+    if (!sessionId || isTaskTerminal() || pendingPermissions.length > 0) return;
+    if (taskPhaseRef.current !== "running" && taskPhaseRef.current !== "waiting_for_approval") return;
+
+    let alive = true;
+    const checkMissedPermissions = async () => {
+      if (!alive || pendingPermissions.length > 0 || isTaskTerminal()) return;
+
+      try {
+        const missed = await window.neko.fetchPendingPermissions(sessionId);
+        if (!alive || !Array.isArray(missed) || missed.length === 0) return;
+
+        console.warn(`[Permission Watchdog] Found ${missed.length} missed permission(s)`);
+
+        setPendingPermissions(prev => {
+          // Deduplicate by ID: only add permissions that aren't already in queue and not Supabase migration permissions
+          const existingIds = new Set(prev.map(p => p.id));
+          const newPermissions = missed.filter((p: any) => p?.id && !existingIds.has(p.id) && !isSupabaseMigrationPermission(p?.permission));
+
+          if (newPermissions.length === 0) return prev;
+
+          // Transition to waiting_for_approval if we found new permissions
+          setTimeout(() => {
+            if (taskPhaseRef.current !== "waiting_for_approval" && !isTaskTerminal()) {
+              taskPhaseRef.current = "waiting_for_approval";
+              setBusy(false);
+              setWorkingStatus("Neko está aguardando sua aprovação");
+            }
+          }, 0);
+
+          return [...prev, ...newPermissions];
+        });
+      } catch (error) {
+        console.warn("[Permission Watchdog] Check failed", error);
+      }
+    };
+
+    // Check once after 800ms (after backend transitions settle)
+    const timeoutId = setTimeout(checkMissedPermissions, 800);
+
+    return () => {
+      alive = false;
+      clearTimeout(timeoutId);
+    };
+  }, [sessionId, pendingPermissions.length, busy, isTaskTerminal]);
 
   // "Atualizar Preview": reloads the current page WITHOUT changing the URL.
   // The internal surface uses the native WebContents reload (route/query/hash
@@ -3585,10 +4342,12 @@ function App() {
     setAutocompleteTrigger(null);
 
     // Set up task lifecycle
+    const taskId = `task-${Date.now()}`;
     requestStartedAtRef.current = Date.now();
     requestInFlightRef.current = true;
     requestObservedBusyRef.current = false;
-    currentTaskIdRef.current = null;
+    currentTaskIdRef.current = taskId;
+    setTimelineTaskId(taskId);
     taskPhaseRef.current = "running";
     retryActiveRef.current = false;
     setRepairState("idle");
@@ -3597,11 +4356,43 @@ function App() {
     setCurrentErrorSignature(null);
     previewRuntimeErrorRef.current = null;
     setBusy(true);
-    setWorkingStatus("Neko está trabalhando...");
-    upsertActivity({ id: "user-request", icon: "brain", title: "Neko processando", detail: text.length > 60 ? text.slice(0, 57) + "..." : text, state: "running" });
+    setWorkingStatus("Pensando...");
+
+    // Inicializa timeline com o estado inicial da tarefa
+    const initialTimeline: TaskTimeline = {
+      taskId,
+      sessionId: sessionId || undefined,
+      status: "running",
+      startedAt: Date.now(),
+      items: [
+        {
+          id: `think-${Date.now()}`,
+          type: "thinking",
+          title: "Pensando...",
+          detail: text.length > 60 ? text.slice(0, 57) + "..." : text,
+          status: "running",
+          startedAt: Date.now(),
+          taskId
+        }
+      ],
+      summaryText: "Pensando..."
+    };
+    currentTaskTimelineRef.current = initialTimeline;
+    setTaskTimelines(prev => {
+      const nextMap = new Map(prev);
+      // Mantém no máximo os 20 timelines mais recentes no estado
+      if (nextMap.size > 20) {
+        const firstKey = nextMap.keys().next().value;
+        if (firstKey) nextMap.delete(firstKey);
+      }
+      nextMap.set(taskId, initialTimeline);
+      return nextMap;
+    });
+
+    upsertActivity({ id: "user-request", icon: "brain", title: "Pensando...", detail: text.length > 60 ? text.slice(0, 57) + "..." : text, state: "running" });
 
     // Track active task for duration measurement
-    activeTaskRef.current = { id: `task-${Date.now()}`, startedAt: Date.now(), userIndex };
+    activeTaskRef.current = { id: taskId, startedAt: Date.now(), userIndex };
 
     try {
       const result = await window.neko.prompt(
@@ -3615,8 +4406,22 @@ function App() {
       );
       if (result?.cancelled) return;
       if (result?.taskId) {
-        currentTaskIdRef.current = String(result.taskId);
-        console.log(`[Send] prompt accepted taskId=${result.taskId}`);
+        const backendTaskId = String(result.taskId);
+        currentTaskIdRef.current = backendTaskId;
+        if (activeTaskRef.current) {
+          activeTaskRef.current.id = backendTaskId;
+        }
+        setTimelineTaskId(backendTaskId);
+        setTaskTimelines(prev => {
+          const nextMap = new Map(prev);
+          const current = nextMap.get(taskId) || initialTimeline;
+          const updated = { ...current, taskId: backendTaskId };
+          nextMap.set(taskId, updated);
+          nextMap.set(backendTaskId, updated);
+          currentTaskTimelineRef.current = updated;
+          return nextMap;
+        });
+        console.log(`[Send] prompt accepted taskId=${backendTaskId}`);
       }
     } catch (error) {
       if (taskPhaseRef.current === "cancelled") return;
@@ -3636,6 +4441,7 @@ function App() {
     setPendingPlan(null);
     planAwaitingRef.current = false;
     pendingPlanTaskRef.current = null;
+    setPendingPermissions([]); // Clear any pending permissions on cancellation
     taskPhaseRef.current = "cancelled";
     requestInFlightRef.current = false;
     requestObservedBusyRef.current = false;
@@ -3643,6 +4449,15 @@ function App() {
     setBusy(false);
     setWorkingStatus("");
     finishActivity();
+    upsertActivity({ id: `stopped:${Date.now()}`, icon: "error", title: "Tarefa cancelada", detail: "A execução atual foi parada pelo usuário. As alterações já feitas foram mantidas.", state: "error" });
+    
+    // Inserção visual deduplicada de cancelamento no chat
+    const taskKey = String(currentTaskIdRef.current ?? sessionId ?? Date.now());
+    if (cancelledTaskIdRef.current !== taskKey) {
+      cancelledTaskIdRef.current = taskKey;
+      setMessages(prev => [...prev, { role: "assistant", text: "A execução da tarefa foi cancelada pelo usuário.", createdAt: Date.now() }]);
+    }
+    
     if (concludeCurrentTaskRef.current) {
       concludeCurrentTaskRef.current("cancelled");
     }
@@ -3843,17 +4658,40 @@ function App() {
   }, [sessionId, pendingQuestion, selectedModel, getEffectiveModel, sanitizeUserFacingText]);
 
   const replyPermission = React.useCallback(async (response: "once" | "always" | "reject") => {
-    if (!sessionId || !pendingPermission) return;
-    const permission = pendingPermission;
-    setPendingPermission(null);
+    if (!sessionId || pendingPermissions.length === 0) return;
+    const permission = pendingPermissions[0];
+
+    // Instead of using the root sessionId, use the permission's own sessionID.
+    const targetSessionId = permission.sessionID || sessionId;
 
     try {
-      await window.neko.permissionReply(sessionId, permission.id, response);
-      console.log(`[Permission] replied response=${response} permissionId=${permission.id}`);
+      // 1. FIRST: Send reply to backend and wait for success
+      await window.neko.permissionReply(targetSessionId, permission.id, response);
+      console.log(`[Permission] replied response=${response} permissionId=${permission.id} targetSessionId=${targetSessionId}`);
+
+      // 2. SECOND: Remove from queue by ID (only after successful reply)
+      // Use ID-based removal to avoid race conditions during async operations
+      setPendingPermissions(prev => {
+        const updated = prev.filter(p => p.id !== permission.id);
+
+        // 3. THIRD: Transition to running only if no more permissions are pending
+        if (updated.length === 0 && !isTaskTerminal()) {
+          setTimeout(() => {
+            taskPhaseRef.current = "running";
+            setBusy(true);
+            setWorkingStatus("Continuando o projeto...");
+          }, 0);
+        }
+
+        return updated;
+      });
     } catch (error) {
-      console.warn("[Permission] reply failed", String((error as Error)?.message ?? error));
+      // Permission remains in queue, user can retry
+      console.error("[Permission] reply failed - keeping permission in queue", error);
+      setWorkingStatus("Falha ao enviar resposta - tente novamente");
+      showToast("Erro ao processar autorização. Tente novamente.", undefined);
     }
-  }, [sessionId, pendingPermission]);
+  }, [sessionId, pendingPermissions, isTaskTerminal, showToast]);
 
   const copyMessage = React.useCallback(async (text: string, target?: HTMLElement | null) => {
     try {
@@ -4270,6 +5108,7 @@ function App() {
     setSupabaseBusy(true);
     try {
       await window.neko.supabaseUnlink();
+      setSupabaseView("auto");
     } catch (error) {
       console.warn("[Supabase] unlink failed", String((error as Error)?.message ?? error));
     } finally {
@@ -4302,6 +5141,7 @@ function App() {
     setSupabaseBusy(true);
     try {
       await window.neko.supabaseSelectProject(ref);
+      setSupabaseView("auto");
     } catch (error) {
       setSupabaseError("Erro ao selecionar projeto.");
       console.warn("[Supabase] selectProject failed", String((error as Error)?.message ?? error));
@@ -4402,11 +5242,22 @@ function App() {
     setVercelBusy(true);
     setVercelError(null);
     try {
-      await window.neko.vercelPublish((vercelState.linked && !isChangingProject) ? undefined : vercelProjectName);
+      const targetName = (vercelState.linked && !isChangingProject) ? undefined : vercelProjectName;
+      // 1. Obter autorização / intenção explícita de publicação controlada pelo Main
+      const intentResult = await window.neko.vercelRequestPublishIntent(targetName);
+      if (!intentResult?.intentId) {
+        throw new Error("Não foi possível autorizar a publicação na Vercel.");
+      }
+      // 2. Executar publicação com o identificador de intenção (one-shot)
+      await window.neko.vercelPublish({
+        intentId: intentResult.intentId,
+        customProjectName: targetName,
+      });
       setVercelSwitchMode(false);
     } catch (error) {
-      setVercelError("Erro ao publicar na Vercel.");
-      console.warn("[Vercel] publish failed", String((error as Error)?.message ?? error));
+      const msg = (error as Error)?.message || "Erro ao publicar na Vercel.";
+      setVercelError(msg);
+      console.warn("[Vercel] publish failed", String(msg));
     } finally {
       setVercelBusy(false);
     }
@@ -4469,6 +5320,16 @@ function App() {
     const match = previewRoutes.find(r => r.path === previewCurrentRoute);
     return match ? match.label : (previewCurrentRoute === "/" ? "Home" : previewCurrentRoute.replace(/\//g, " / ") || "Home");
   })();
+
+  const previewEffectiveUrl = React.useMemo(() => {
+    if (!previewUrl) return "";
+    if (!previewCurrentRoute || previewCurrentRoute === "/") return previewUrl;
+    try {
+      return new URL(previewCurrentRoute, previewUrl).toString();
+    } catch {
+      return previewUrl;
+    }
+  }, [previewUrl, previewCurrentRoute]);
 
   // The selector is only shown when the Preview tab has an active server.
   const showPreviewSelector = previewSurface === "webcontents" && Boolean(previewUrl) && workspaceTab === "preview";
@@ -4555,25 +5416,25 @@ function App() {
         project ? (
           <>
           {console.log("[BLACKSCREEN] workspace-render", { project, status, isLicensed: licenseState.isLicensed, isExiting: isExitingRef.current })}
-          <header className={`topbar ${chatCollapsed ? "chat-collapsed" : ""}`}>
-          <div className="brand">
-            <img className="neko-logo-image" src={nekoLogo} alt="NekoAI" />
-          </div>
+        <header className={`topbar ${chatCollapsed ? "chat-collapsed" : ""}`}>
+          <div className="topbar-left">
+            <div className="brand">
+              <img className="neko-logo-image" src={nekoLogo} alt="NekoAI" />
+            </div>
 
-          <div className="top-center-actions">
             {(project || recentProjects.length > 0) ? <div className="project-selector-wrap">
               <button
                 className="project-selector"
                 onClick={() => project ? openProjectSelector() : setRecentProjectsMenuOpen(v => !v)}
                 title={project || "Projetos recentes"}
               >
-                <span className="project-selector-icon"><FolderOpen size={19}/></span>
+                <span className="project-selector-icon"><FolderOpen size={17}/></span>
                 <span className="project-selector-copy">
                   <b>{project ? projectName : "Projetos recentes"}</b>
                   <span>{project ? (githubLinkStatus.linkedRepo || project) : "Selecione um projeto recente"}</span>
                 </span>
                 <span className="project-selector-chevron">
-                  {(projectMenuOpen || recentProjectsMenuOpen) ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}
+                  {(projectMenuOpen || recentProjectsMenuOpen) ? <ChevronUp size={14}/> : <ChevronDown size={14}/>}
                 </span>
               </button>
 
@@ -4627,7 +5488,34 @@ function App() {
               </div> : null}
             </div> : null}
 
+            <button
+              className="collapse-chat-btn"
+              onClick={() => setChatCollapsed(v => !v)}
+              aria-label={chatCollapsed ? "Abrir chat" : "Fechar chat"}
+              title={chatCollapsed ? "Expandir chat" : "Recolher chat"}
+            >
+              {chatCollapsed ? <PanelLeftOpen size={15}/> : <PanelLeftClose size={15}/>}
+            </button>
 
+            {previewFramework ? <span className="workspace-framework">{previewFramework}</span> : null}
+
+            <div className="workspace-tabs">
+              <button className={workspaceTab === "preview" ? "active" : ""} onClick={() => setWorkspaceTab("preview")}><Eye size={14}/> Preview</button>
+              <button className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}><Code2 size={14}/> Código</button>
+            </div>
+          </div>
+
+          <div className="topbar-center">
+            {renderPreviewRouteSelector()}
+            {workspaceTab === "preview" && (
+              <div className="workspace-tools">
+                <button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")} title="Desktop"><Monitor size={14}/></button>
+                <button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")} title="Tablet"><Tablet size={14}/></button>
+                <button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")} title="Mobile"><Smartphone size={14}/></button>
+                <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={14}/></button>
+                <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; console.log("[Neko/PreviewExternal] click", `url=${String(previewUrl)}`); void window.neko.openPreviewExternal(previewUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={14}/></button>
+              </div>
+            )}
           </div>
 
           <div className="top-right-actions">
@@ -4668,6 +5556,7 @@ function App() {
               className={`integration-status ${supabaseState.status === "connected" ? "online" : "idle"}`}
               onClick={() => {
                 console.log("[SupabaseUI] topbar Supabase icon clicked, current state:", supabaseState);
+                void window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
                 setSupabaseError("");
                 setSupabaseView("auto");
                 setModal("supabase");
@@ -4711,8 +5600,18 @@ function App() {
               <GitHubIcon size={17}/>
               <span className="integration-dot"/>
             </button>
+            {updaterState.status === "available" && (
+              <button
+                className="top-update-available-pill"
+                onClick={() => setModal("settings")}
+                title={`Nova versão disponível (v${updaterState.updateInfo?.version || ""}) — Clique para abrir atualizações`}
+                aria-label="Atualização Disponível"
+              >
+                <span>Atualização Disponível!</span>
+              </button>
+            )}
             <button
-              className={`integration-status ${updaterState.status === "available" || updaterState.status === "error" ? "idle" : updaterState.status === "checking" || updaterState.status === "downloading" ? "busy" : "online"}`}
+              className={`integration-status ${updaterState.status === "available" ? "online" : updaterState.status === "error" ? "idle" : updaterState.status === "checking" || updaterState.status === "downloading" ? "busy" : "online"}`}
               onClick={() => {
                 setModal("settings");
               }}
@@ -4733,13 +5632,8 @@ function App() {
               ) : (
                 <Settings2 size={17} />
               )}
-              <span className="integration-dot" />
+              {updaterState.status !== "available" && <span className="integration-dot" />}
             </button>
-            {project ? (
-              <button className="top-exit-btn" onClick={() => void exitProject("topbarExit")} disabled={isExiting} title="Sair do projeto e voltar à Home" aria-label="Sair do projeto">
-                {isExiting ? <Loader2 size={15} className="spin"/> : <LogOut size={15}/>}
-              </button>
-            ) : null}
             {project && githubLinkStatus.linkedRepo ? <div className="top-branch-wrap">
               <button
                 className="top-branch-btn"
@@ -4837,7 +5731,11 @@ function App() {
                 )}
               </div> : null}
             </div> : null}
-            <div className="top-status"><span className={`status-dot ${status}`} />{status === "online" ? "Neko online" : status === "starting" ? "Iniciando..." : "Sem projeto"}</div>
+            {project ? (
+              <button className="top-exit-btn" onClick={() => void exitProject("topbarExit")} disabled={isExiting} title="Sair do projeto e voltar à Home" aria-label="Sair do projeto">
+                {isExiting ? <Loader2 size={15} className="spin"/> : <LogOut size={15}/>}
+              </button>
+            ) : null}
           </div>
         </header>
 
@@ -4851,11 +5749,29 @@ function App() {
                 {!project ? <button className="empty-new-project" onClick={() => void createProject()}><Plus size={17}/> Novo Projeto</button> : null}
               </div>}
               {(() => {
-                const timeline: Array<{ kind: "message" | "pendingPlan" | "approvedPlan"; createdAt: number; index?: number }> = messages.map((message, index) => ({ kind: "message", createdAt: message.createdAt ?? index, index }));
+                const timeline: Array<{ kind: "message" | "pendingPlan" | "approvedPlan" | "migrationHistory"; createdAt: number; index?: number; proposalId?: string }> = messages.map((message, index) => ({ kind: "message", createdAt: message.createdAt ?? index, index }));
                 if (pendingPlan) timeline.push({ kind: "pendingPlan", createdAt: pendingPlan.messageCreatedAt + 0.1 });
                 if (approvedPlan) timeline.push({ kind: "approvedPlan", createdAt: approvedPlan.approvedAt });
+                migrationHistory.forEach((hist, id) => {
+                  if (hist.status !== "PENDING" && id !== pendingMigration?.id) {
+                    timeline.push({ kind: "migrationHistory", createdAt: hist.createdAt, proposalId: id });
+                  }
+                });
                 timeline.sort((a, b) => a.createdAt - b.createdAt);
                 return timeline.map((item, timelineIndex) => {
+                  if (item.kind === "migrationHistory" && item.proposalId) {
+                    const proposal = migrationHistory.get(item.proposalId);
+                    if (proposal) {
+                      return (
+                        <DatabaseMigrationCard
+                          key={`migration-hist-${proposal.id}`}
+                          proposal={proposal}
+                          onReply={handleReplyMigration}
+                          onCopy={copyMessage}
+                        />
+                      );
+                    }
+                  }
                   if (item.kind === "pendingPlan" && pendingPlan) return <div key={`pending-plan-${pendingPlan.messageCreatedAt}`} className="plan-approval-card">
                     <div className="plan-approval-head"><div><b>Plano pronto para revisão</b><span>O Neko analisou a tarefa. Revise um resumo antes de permitir as alterações.</span></div><Sparkles size={16}/></div>
                     <div className="plan-approval-title">Resumo do plano</div>
@@ -4874,38 +5790,101 @@ function App() {
                   return <div key={`message-${index}-${message.createdAt ?? timelineIndex}`} className={`message ${message.role}`}>
                     <div className="message-label">{message.role === "user" ? "Você" : message.role === "assistant" ? "Neko" : message.role}</div>
                      {message.text && (message.role === "assistant" || message.role === "user")
-                       ? <CollapsibleMessageBody><MarkdownRenderer content={message.text} /></CollapsibleMessageBody>
-                       : message.text && <CollapsibleMessageBody text={message.text}/>}
+                       ? <CollapsibleMessageBody maxHeight={180}><MarkdownRenderer content={message.text} /></CollapsibleMessageBody>
+                       : message.text && <CollapsibleMessageBody maxHeight={180} text={message.text}/>}
                     {message.attachments?.length?<div className="message-attachments">{message.attachments.map((a,i)=>(
                       a.kind==="image"&&a.previewUrl
                         ? <button type="button" className="message-image-thumb" key={`${a.path}:${i}`} onClick={()=>setLightboxImage({url:a.previewUrl!,name:a.name})} title={`Visualizar ${a.name}`} aria-label={`Visualizar ${a.name}`}><img src={a.previewUrl} alt={a.name}/></button>
                         : <div className={`message-attachment ${a.kind}`} key={`${a.path}:${i}`}>{a.kind==="image"&&a.previewUrl?<img src={a.previewUrl} alt={a.name}/>:<div className="attachment-ext">{(a.extension||"FILE").slice(0,6)}</div>}<span title={a.name}>{a.name.length>28?`${a.name.slice(0,28)}…`:a.name}</span></div>
                     ))}</div>:null}
-                    {message.role === "assistant" && message.taskId && message.durationMs !== undefined && <div className="message-actions assistant-actions"><button onClick={(e) => void undoAgentTask(index, e.currentTarget)} disabled={busy} title="Desfazer tarefa" aria-label="Desfazer tarefa"><Undo2 size={13}/></button><button onClick={(e) => void copyMessage(message.text, e.currentTarget)} title="Copiar resposta" aria-label="Copiar resposta"><Copy size={13}/></button><span className="message-duration" title="Tempo da tarefa">{formatTaskDuration(message.durationMs)}</span></div>}
+                    {message.role === "assistant" && (
+                      <div className="message-actions assistant-actions">
+                        <div className="message-actions-left">
+                          <button onClick={(e) => void undoAgentTask(index, e.currentTarget)} disabled={busy} title="Desfazer tarefa" aria-label="Desfazer tarefa"><Undo2 size={13}/></button>
+                          <button onClick={(e) => void copyMessage(message.text, e.currentTarget)} title="Copiar resposta" aria-label="Copiar resposta"><Copy size={13}/></button>
+                          {message.durationMs !== undefined && <span className="message-duration" title="Tempo da tarefa">{formatTaskDuration(message.durationMs)}</span>}
+                        </div>
+                        {Boolean(message.taskId) && (
+                          <button
+                            className="message-timeline-btn"
+                            onClick={() => {
+                              setTimelineTaskId(message.taskId!);
+                              setWorkspaceTab("preview");
+                              setTimelineOpen(true);
+                            }}
+                            title="Ver detalhes da execução"
+                            aria-label="Ver detalhes da execução"
+                          >
+                            <span>Ver detalhes ›</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
                     {message.role === "user" && <div className="message-actions user-actions"><button onClick={(e) => void copyMessage(message.text, e.currentTarget)} title="Copiar" aria-label="Copiar"><Copy size={13}/></button><button onClick={() => editUserMessage(index)} disabled={busy} title="Editar" aria-label="Editar"><Pencil size={12}/></button></div>}
                   </div>;
                 });
               })()}
-              {busy && <div className="working"><Loader2 size={15} className="spin"/><span>{workingStatus || "Neko está trabalhando..."}</span></div>}
-              {!busy && (pendingQuestion || pendingPermission) && workingStatus && <div className="working waiting"><CircleAlert size={15}/><span>{workingStatus}</span></div>}
+              {busy && (!pendingMigration || (pendingMigration.status !== "APPROVED" && pendingMigration.status !== "EXECUTING")) && (
+                <div
+                  className="working working-clickable"
+                  onClick={() => {
+                    setTimelineTaskId(currentTaskIdRef.current);
+                    setWorkspaceTab("preview");
+                    setTimelineOpen(true);
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  title="Clique para acompanhar os detalhes da execução"
+                >
+                  <div className="working-left">
+                    <Loader2 size={15} className="spin working-spin"/>
+                    <span className="working-text">{workingStatus || "Pensando..."}</span>
+                  </div>
+                  <div className="working-right-action">
+                    <span>Ver detalhes</span>
+                    <ChevronRight size={13} className="working-details-caret"/>
+                  </div>
+                </div>
+              )}
+              {!busy && (pendingQuestion || pendingPermissions.length > 0 || (pendingMigration && pendingMigration.status === "PENDING")) && workingStatus && <div className="working waiting"><CircleAlert size={15}/><span>{workingStatus}</span></div>}
+              {pendingMigration && (
+                <DatabaseMigrationCard
+                  proposal={pendingMigration}
+                  onReply={handleReplyMigration}
+                  onCopy={copyMessage}
+                />
+              )}
+              {pendingQuestion && <AgentDecisionCard
+                question={pendingQuestion}
+                onAnswer={(value) => void answerQuestion(value)}
+                onDismiss={() => void stopDevelopment()}
+              />}
+              {(() => {
+                const visiblePermissions = pendingPermissions.filter(p => !isSupabaseMigrationPermission(p?.permission));
+                if (visiblePermissions.length === 0) return null;
+                const currentPerm = visiblePermissions[0];
+                return (
+                  <div className="permission-card">
+                    <div className="permission-head"><ShieldAlert size={15}/><div><b>O Neko precisa da sua autorização</b><small>Uma autorização é necessária para continuar esta etapa do projeto.</small></div></div>
+                    <div className="permission-body">
+                      <CollapsibleMessageBody>
+                        <b>Acesso necessário: {currentPerm.permission}</b>
+                        <small className="permission-reason">
+                          {currentPerm.patterns?.length 
+                            ? currentPerm.patterns.map(p => <div key={p}>{p}</div>)
+                            : "O Neko precisa desse acesso para continuar trabalhando."}
+                        </small>
+                      </CollapsibleMessageBody>
+                    </div>
+                    <div className="permission-actions">
+                      <button className="permission-reject" onClick={() => void replyPermission("reject")}>Rejeitar</button>
+                      <button className="permission-once" onClick={() => void replyPermission("once")}>Permitir uma vez</button>
+                      <button className="permission-always" onClick={() => void replyPermission("always")}>Permitir sempre</button>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
-            {pendingQuestion && <AgentDecisionCard
-              question={pendingQuestion}
-              onAnswer={(value) => void answerQuestion(value)}
-              onDismiss={() => void stopDevelopment()}
-            />}
-            {pendingPermission && (
-            <div className="permission-card">
-              <div className="permission-head"><ShieldAlert size={15}/><div><b>O Neko precisa da sua autorização</b><small>Uma autorização é necessária para continuar esta etapa do projeto.</small></div></div>
-              <div className="permission-body">
-                <CollapsibleMessageBody>
-                  <b>Acesso necessário aos arquivos do projeto</b>
-                  <small className="permission-reason">O Neko precisa desse acesso para continuar trabalhando. Nenhum detalhe interno do mecanismo é exibido aqui.</small>
-                </CollapsibleMessageBody>
-              </div>
-              <div className="permission-actions"><button className="permission-reject" onClick={() => void replyPermission("reject")}>Rejeitar</button><button className="permission-once" onClick={() => void replyPermission("once")}>Permitir uma vez</button><button className="permission-always" onClick={() => void replyPermission("always")}>Permitir sempre</button></div>
-            </div>
-          )}
 
           <div className="composer-wrap">
               <div className="composer">
@@ -5031,18 +6010,80 @@ function App() {
                 ))}{uploadErrors.map(e=><div className="attachment-preview-card failed" key={e.id}><div className="attachment-preview-media"><div className="attachment-doc-preview error">{e.extension.slice(0,6).toUpperCase()}</div></div><div className="attachment-preview-info"><b>Falha no Upload</b><small title={e.message}>{e.name}</small></div><button className="attachment-remove" onClick={()=>setUploadErrors(prev=>prev.filter(x=>x.id!==e.id))} aria-label="Remover erro"><X size={12}/></button></div>)}</div>}
                 <div className="composer-bar"><button className="plus" aria-label="Adicionar contexto" onClick={() => void handlePickAttachments()} disabled={busy}><Plus size={17}/></button>
                   <div className="model-anchor">
-                    <button className="model-inline" onClick={() => setModelOpen(v => !v)} disabled={busy}><span className="spark">{selected ? <ProviderIcon id={selected.providerID} size={15}/> : <Sparkles size={15}/>}</span><span>{selected?.name || "Selecionar modelo"}</span><ChevronDown size={14}/></button>
+                    <button className="model-inline" onClick={() => {
+                      setModelOpen(v => {
+                        const next = !v;
+                        if (next && selectedModel?.providerID) {
+                          setChatAccordionOpenProvider(selectedModel.providerID);
+                        }
+                        return next;
+                      });
+                    }} disabled={busy} aria-expanded={modelOpen} aria-label="Selecionar modelo">
+                      <span className="spark">{selected ? <ProviderIcon id={selected.providerID} size={15}/> : <Sparkles size={15}/>}</span>
+                      <span>{selected?.name || "Selecionar modelo"}</span>
+                      <ChevronDown size={14}/>
+                    </button>
                     {modelOpen && <div className="model-popover" role="dialog" aria-label="Selecionar modelo">
                       <div className="model-search"><Search size={15}/><input autoFocus value={modelSearch} onChange={e => setModelSearch(e.target.value)} placeholder="Buscar modelos" aria-label="Buscar modelos" /></div>
                       <div className="model-list" onWheel={e => e.stopPropagation()}>
-                        {modelGroups.length ? modelGroups.map(group => <section className="model-picker-group" key={group.providerID}>
-                          <div className="model-picker-provider"><span className="model-picker-provider-icon"><ProviderIcon id={group.providerID} size={14}/></span><span>{group.providerName}</span><small>{group.models.length} {group.models.length === 1 ? "modelo" : "modelos"}</small></div>
-                          <div className="model-picker-items">
-                            {group.models.map(m => <button key={`${m.providerID}:${m.modelID}`} className={`model-choice ${selectedModel?.providerID === m.providerID && selectedModel?.modelID === m.modelID ? "selected" : ""}`} onClick={() => { modelPickSourceRef.current = "user"; setSelectedModel({ providerID: m.providerID, modelID: m.modelID }); setModelOpen(false); }}>
-                              <span className="model-glyph"><ProviderIcon id={m.providerID} size={15}/></span><span><b>{m.name}</b><small>{m.modelID}</small></span>{selectedModel?.providerID === m.providerID && selectedModel?.modelID === m.modelID && <i><Check size={14}/></i>}
-                            </button>)}
-                          </div>
-                        </section>) : <div className="model-picker-empty">{modelSearch ? "Nenhum modelo encontrado." : "Nenhum provider ativo disponível."}</div>}
+                        {modelGroups.length ? modelGroups.map(group => {
+                          const isSearching = modelSearch.trim().length > 0;
+                          const isSelectedProvider = selectedModel?.providerID === group.providerID;
+                          const isOpen = isSearching || (chatAccordionOpenProvider === group.providerID) || (!chatAccordionOpenProvider && isSelectedProvider);
+
+                          // Find active model in this group
+                          const activeModelInGroup = group.models.find(m => selectedModel?.providerID === group.providerID && selectedModel?.modelID === m.modelID);
+                          const headerTitle = activeModelInGroup ? `${group.providerName} — ${activeModelInGroup.name}` : group.providerName;
+
+                          // Visual projection of models inside this group: active selected model always first, others in original relative order
+                          let displayModels = group.models;
+                          if (isSelectedProvider && activeModelInGroup) {
+                            displayModels = [activeModelInGroup, ...group.models.filter(m => m.modelID !== activeModelInGroup.modelID)];
+                          }
+
+                          return (
+                            <section className={`model-picker-group ${isOpen ? "open" : "collapsed"}`} key={group.providerID}>
+                              <button
+                                type="button"
+                                className="model-picker-accordion-header"
+                                onClick={() => setChatAccordionOpenProvider(prev => prev === group.providerID ? null : group.providerID)}
+                                aria-expanded={isOpen}
+                              >
+                                <span className="model-picker-provider-icon"><ProviderIcon id={group.providerID} size={14}/></span>
+                                <span className="model-picker-header-text" title={headerTitle}>{headerTitle}</span>
+                                <span className="model-picker-header-meta">
+                                  <ChevronDown size={13} className={`accordion-caret ${isOpen ? "rotated" : ""}`}/>
+                                </span>
+                              </button>
+                              {isOpen && (
+                                <div className="model-picker-items">
+                                  {displayModels.map(m => {
+                                    const isItemActive = selectedModel?.providerID === m.providerID && selectedModel?.modelID === m.modelID;
+                                    return (
+                                      <button
+                                        key={`${m.providerID}:${m.modelID}`}
+                                        className={`model-choice ${isItemActive ? "selected" : ""}`}
+                                        onClick={() => {
+                                          modelPickSourceRef.current = "user";
+                                          setSelectedModel({ providerID: m.providerID, modelID: m.modelID });
+                                          setChatAccordionOpenProvider(m.providerID);
+                                          setModelOpen(false);
+                                        }}
+                                      >
+                                        <span className="model-glyph"><ProviderIcon id={m.providerID} size={15}/></span>
+                                        <span className="model-choice-labels">
+                                          <b>{m.name}</b>
+                                          <small>{m.modelID}</small>
+                                        </span>
+                                        {isItemActive && <i><Check size={14}/></i>}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </section>
+                          );
+                        }) : <div className="model-picker-empty">{modelSearch ? "Nenhum modelo encontrado." : "Nenhum provider ativo disponível."}</div>}
                       </div>
                       <button className="manage-models" onClick={() => { setModelOpen(false); setModal("models"); }}><Settings2 size={15}/> Gerenciar modelos</button>
                     </div>}
@@ -5080,8 +6121,7 @@ function App() {
           </section>
 
           <section className="workspace">
-            <div className="workspace-toolbar"><div className="workspace-toolbar-left"><div className="workspace-tabs"><button className="collapse-chat-btn" onClick={()=>setChatCollapsed(v=>!v)} aria-label={chatCollapsed?"Abrir chat":"Fechar chat"}>{chatCollapsed?<PanelLeftOpen size={15}/>:<PanelLeftClose size={15}/>}</button><button className={workspaceTab === "preview" ? "active" : ""} onClick={() => setWorkspaceTab("preview")}><Eye size={15}/> Preview</button><button className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}><Code2 size={15}/> Código</button>{previewFramework ? <span className="workspace-framework">{previewFramework}</span> : null}</div></div><div className="workspace-toolbar-center">{renderPreviewRouteSelector()}</div><div className="workspace-tools">{workspaceTab === "preview" && <><button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")}><Monitor size={14}/></button><button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")}><Tablet size={14}/></button><button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")}><Smartphone size={14}/></button></>}<button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={15}/></button><button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; console.log("[Neko/PreviewExternal] click", `url=${String(previewUrl)}`); void window.neko.openPreviewExternal(previewUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={15}/></button></div></div>
-            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} src={previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : null}</div></div> : <div className="preview-empty"><div className="preview-icon"><Globe2 size={26}/></div><strong>{previewStatus === "error" ? "Não foi possível iniciar o preview" : previewStatus === "starting" ? "Iniciando servidor..." : previewStatus === "installing" ? "Instalando dependências..." : "Seu app aparecerá aqui"}</strong><span>{previewMessage || "Crie ou abra um projeto com um script dev para iniciar o preview."}</span>{previewStatus === "error" && <button className="preview-retry" onClick={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })}><RefreshCw size={15}/> Tentar novamente</button>}</div>}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
+            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : null}</div></div> : <div className="preview-empty"><div className="preview-icon"><Globe2 size={26}/></div><strong>{previewStatus === "error" ? "Não foi possível iniciar o preview" : previewStatus === "starting" ? "Iniciando servidor..." : previewStatus === "installing" ? "Instalando dependências..." : "Seu app aparecerá aqui"}</strong><span>{previewMessage || "Crie ou abra um projeto com um script dev para iniciar o preview."}</span>{previewStatus === "error" && <button className="preview-retry" onClick={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })}><RefreshCw size={15}/> Tentar novamente</button>}</div>)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
             <div className={`terminal-panel ${terminalOpen ? "open" : "closed"}`}>
               <div className="terminal-head"><div className="terminal-tabs"><button className={terminalTab === "logs" ? "active" : ""} onClick={() => { setTerminalTab("logs"); setTerminalOpen(true); }}>Logs</button><button className={terminalTab === "console" ? "active" : ""} onClick={() => { setTerminalTab("console"); setTerminalOpen(true); }}>Console</button><button className={terminalTab === "errors" ? "active" : ""} onClick={() => { setTerminalTab("errors"); setTerminalOpen(true); }}>Erros</button></div><button className="terminal-collapse" onClick={() => setTerminalOpen(v => !v)}>{terminalOpen ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}</button></div>
               {terminalOpen && (terminalTab === "console" ? (
@@ -5512,20 +6552,102 @@ function App() {
         <div className="modal-search-wrap"><Search size={15}/><input className="modal-search" value={modelSearch} onChange={e => setModelSearch(e.target.value)} placeholder="Buscar modelos" autoFocus/></div>
         <div className="modal-scroll-body models-scroll-body">
           {managedModelGroups.length ? managedModelGroups.map(group => {
-            const provider = connectedProviders.find(p => p.id === group.providerID)!;
-            return <section className={`model-provider-card ${provider.enabled ? "" : "disabled"}`} key={group.providerID}>
-              <div className="model-provider-title">
-                <div className="model-provider-identity"><span className="model-provider-icon"><ProviderIcon id={group.providerID} size={19}/></span><span><b>{group.providerName}</b><small>{provider.enabled ? "Provider conectado" : "Provider desativado"}</small></span></div>
-                <div className="model-provider-controls"><span className={`provider-status ${provider.enabled ? "active" : "off"}`}>{provider.enabled ? "Ativo" : "Desativado"}</span>
-                  <button className={`toggle provider-toggle ${provider.enabled ? "on" : ""}`} aria-pressed={provider.enabled} onClick={async () => { try { const result = await window.neko.setProviderEnabled(provider.id, !provider.enabled); setModels(result.models || []); setManagedModels(result.managedModels || result.models || []); setProviders(result.providers || []); } catch (error) { setAuthError(error instanceof Error ? error.message : String(error)); } }}><i/></button>
+            const provider = connectedProviders.find(p => p.id === group.providerID);
+            const isEnabled = provider ? provider.enabled : true;
+            const isSearching = modelSearch.trim().length > 0;
+            const isExpanded = isSearching || expandedManagedProviders.has(group.providerID);
+            const availableCount = group.models.length;
+            const activeCount = group.models.filter((m: Model) => m.enabled).length;
+            const pricingLabel = getProviderPricingLabel(group.models);
+
+            return <section className={`model-provider-card ${isEnabled ? "" : "disabled"} ${isExpanded ? "expanded" : "collapsed"}`} key={group.providerID}>
+              <div
+                className="model-provider-title accordion-title"
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  setExpandedManagedProviders(prev => {
+                    const next = new Set(prev);
+                    if (next.has(group.providerID)) next.delete(group.providerID);
+                    else next.add(group.providerID);
+                    return next;
+                  });
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setExpandedManagedProviders(prev => {
+                      const next = new Set(prev);
+                      if (next.has(group.providerID)) next.delete(group.providerID);
+                      else next.add(group.providerID);
+                      return next;
+                    });
+                  }
+                }}
+              >
+                <div className="model-provider-identity">
+                  <span className="model-provider-icon"><ProviderIcon id={group.providerID} size={19}/></span>
+                  <div className="model-provider-identity-text">
+                    <div className="model-provider-name-row">
+                      <b>{group.providerName}</b>
+                      <span className={`provider-pricing-tag ${pricingLabel === "Grátis" ? "free" : pricingLabel === "Pago" ? "paid" : "mixed"}`}>{pricingLabel}</span>
+                    </div>
+                    <small>{availableCount} {availableCount === 1 ? "modelo disponível" : "modelos disponíveis"} • {activeCount} {activeCount === 1 ? "ativo" : "ativos"}</small>
+                  </div>
+                </div>
+                <div className="model-provider-controls" onClick={e => e.stopPropagation()}>
+                  <span className={`provider-status ${isEnabled ? "active" : "off"}`}>{isEnabled ? "Ativo" : "Desativado"}</span>
+                  {provider ? (
+                    <button
+                      className={`toggle provider-toggle ${isEnabled ? "on" : ""}`}
+                      aria-pressed={isEnabled}
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          const result = await window.neko.setProviderEnabled(provider.id, !isEnabled);
+                          setModels(result.models || []);
+                          setManagedModels(result.managedModels || result.models || []);
+                          setProviders(result.providers || []);
+                        } catch (error) {
+                          setAuthError(error instanceof Error ? error.message : String(error));
+                        }
+                      }}
+                    ><i/></button>
+                  ) : null}
+                  <ChevronDown size={15} className={`accordion-caret ${isExpanded ? "rotated" : ""}`}/>
                 </div>
               </div>
-              <div className="provider-model-divider"><span>{group.models.length} modelos disponíveis</span><span>Modelos ativos: {group.models.filter((m: Model) => m.enabled).length}</span></div>
-              <div className="model-card-list">
-                {group.models.length ? group.models.map(m => <div className="manage-row model-card-row" key={`${m.providerID}:${m.modelID}`}><div><b>{m.name}</b><span>{m.modelID}</span></div>
-                  <button className={`toggle ${m.enabled ? "on" : ""}`} aria-pressed={m.enabled} onClick={async () => { try { const result = await window.neko.setModelEnabled(m.providerID, m.modelID, !m.enabled); setModels(result.models || []); setManagedModels(result.managedModels || result.models || []); setProviders(result.providers || []); } catch {} }}><i/></button>
-                </div>) : <div className="provider-disabled-message">Este provider está desativado. Ative-o para disponibilizar seus modelos.</div>}
-              </div>
+              {isExpanded && (
+                <div className="model-card-list">
+                  {group.models.length ? group.models.map(m => {
+                    const free = isModelFree(m);
+                    return (
+                      <div className="manage-row model-card-row" key={`${m.providerID}:${m.modelID}`}>
+                        <div className="model-card-info">
+                          <div className="model-card-name-line">
+                            <b>{m.name}</b>
+                            <span className={`model-tag ${free ? "free" : "paid"}`}>{free ? "Gratuito" : "Pago"}</span>
+                          </div>
+                          <span>{m.modelID}</span>
+                        </div>
+                        <button
+                          className={`toggle ${m.enabled ? "on" : ""}`}
+                          aria-pressed={m.enabled}
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            try {
+                              const result = await window.neko.setModelEnabled(m.providerID, m.modelID, !m.enabled);
+                              setModels(result.models || []);
+                              setManagedModels(result.managedModels || result.models || []);
+                              setProviders(result.providers || []);
+                            } catch {}
+                          }}
+                        ><i/></button>
+                      </div>
+                    );
+                  }) : <div className="provider-disabled-message">Este provider está desativado. Ative-o para disponibilizar seus modelos.</div>}
+                </div>
+              )}
             </section>;
           }) : <div className="models-empty-state"><CircleAlert size={18}/><div><b>Nenhum provider conectado</b><span>Conecte um provider para gerenciar seus modelos.</span></div></div>}
         </div>
@@ -5542,18 +6664,82 @@ function App() {
         <div className="modal-search-wrap"><Search size={15}/><input className="modal-search" value={providerSearch} onChange={e => setProviderSearch(e.target.value)} placeholder="Buscar provedores" autoFocus/></div>
         {authError && <div className="auth-error provider-global-error">{authError}</div>}
         <div className="modal-scroll-body provider-scroll-body" onWheel={e => { const el = e.currentTarget; if (el.scrollHeight > el.clientHeight) { e.preventDefault(); el.scrollTop += e.deltaY; } }}>
+          {/* 1. Provedores conectados */}
           {connectedProviderList.length ? <section className="provider-section provider-connected-section">
             <div className="provider-section-title"><span>Provedores conectados</span><small>Gerencie suas conexões ativas</small></div>
             <div className="provider-list">
-              {connectedProviderList.map(p => <div className="provider-line connected" key={p.id}>
-                <div className="provider-line-main"><span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span><span><b>{p.name}</b><small>{p.id}</small></span></div>
-                <div className="provider-line-actions">
-                  <span className="provider-connected"><Check size={11}/> Conectado</span>
-                  <button className="provider-disconnect-action" disabled={authBusy} onClick={() => void disconnectProvider(p.id)} title="Desconectar"><Unlink size={14}/></button>
-                </div>
-              </div>)}
+              {connectedProviderList.map(p => {
+                const pricingLabel = getProviderPricingLabel(p.models);
+                return (
+                  <div className="provider-line connected" key={p.id}>
+                    <div className="provider-line-main">
+                      <span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span>
+                      <div className="provider-line-info">
+                        <div className="provider-line-title">
+                          <b>{p.name}</b>
+                          <span className={`provider-pricing-tag ${pricingLabel === "Grátis" ? "free" : pricingLabel === "Pago" ? "paid" : "mixed"}`}>{pricingLabel}</span>
+                        </div>
+                        <small>{p.id}</small>
+                      </div>
+                    </div>
+                    <div className="provider-line-actions">
+                      <span className="provider-connected"><Check size={11}/> Conectado</span>
+                      <button className="provider-disconnect-action" disabled={authBusy} onClick={() => void disconnectProvider(p.id)} title="Desconectar"><Unlink size={14}/></button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </section> : null}
+
+          {/* 2. Modelos gratuitos */}
+          {availableFreeModels.length ? <section className="provider-section provider-free-models-section">
+            <div className="provider-section-title"><span>Modelos gratuitos</span><small>Modelos gratuitos disponíveis para conexão</small></div>
+            <div className="provider-list">
+              {availableFreeModels.map(m => {
+                const parentProvider = providers.find(p => p.id === m.providerID);
+                return (
+                  <div className="provider-line free-model-line" key={`${m.providerID}:${m.modelID}`}>
+                    <button
+                      className="provider-line-main"
+                      onClick={() => {
+                        if (parentProvider) {
+                          setSelectedProvider(parentProvider);
+                          setApiKey("");
+                          setAuthError("");
+                          setModal("providerAuth");
+                        }
+                      }}
+                    >
+                      <span className="provider-line-icon"><ProviderIcon id={m.providerID} size={19}/></span>
+                      <div className="provider-line-info">
+                        <div className="provider-line-title">
+                          <b>{m.name}</b>
+                          <span className="model-tag free">Gratuito</span>
+                        </div>
+                        <small>{m.providerName} • {m.modelID}</small>
+                      </div>
+                    </button>
+                    <div className="provider-line-actions">
+                      <button
+                        className="provider-connect-action"
+                        onClick={() => {
+                          if (parentProvider) {
+                            setSelectedProvider(parentProvider);
+                            setApiKey("");
+                            setAuthError("");
+                            setModal("providerAuth");
+                          }
+                        }}
+                      ><Link2 size={13}/> Conectar</button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section> : null}
+
+          {/* 3. Mais populares */}
           {popularProviders.filter(p => !p.connected && filteredProviders.some(x => x.id === p.id)).length ? <section className="provider-section provider-popular">
             <div className="provider-section-title"><span>Mais populares</span><small>Conecte rapidamente os providers mais usados</small></div>
             <div className="provider-list">
@@ -5563,6 +6749,8 @@ function App() {
               </div>)}
             </div>
           </section> : null}
+
+          {/* 4. Outros providers */}
           <section className="provider-section">
             <div className="provider-section-title"><span>Outros providers</span><small>Todos os providers disponíveis para conexão</small></div>
             <div className="provider-list">
@@ -6277,7 +7465,7 @@ function App() {
               <div className="supabase-project-list-heading">
                 <div>
                   <strong>Escolha um projeto</strong>
-                  <span>{supabaseState.projects.length} disponível(is)</span>
+                  <span>{availableSupabaseProjects.length} disponível(is)</span>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button
@@ -6342,32 +7530,56 @@ function App() {
               )}
 
               <div className="supabase-items-scroll">
-                {supabaseState.projects.length ? (
-                  supabaseState.projects.map(proj => (
+                {availableSupabaseProjects.length > 0 ? (
+                  availableSupabaseProjects.map(proj => (
                     <button
                       type="button"
-                      className={`supabase-item-row ${supabaseState.projectRef === proj.ref ? "active" : ""}`}
+                      className="supabase-item-row"
                       key={proj.ref}
                       onClick={() => void selectSupabaseProject(proj.ref)}
                       disabled={supabaseBusy}
                     >
                       <div className="supabase-item-radio">
-                        <span className={`radio-dot ${supabaseState.projectRef === proj.ref ? "selected" : ""}`}/>
+                        <span className="radio-dot"/>
                       </div>
                       <div className="supabase-item-info">
                         <strong>{proj.name}</strong>
                         <code>{proj.ref}</code>
                         <small>{proj.region} · {proj.status}</small>
                       </div>
-                      {supabaseState.projectRef === proj.ref && (
-                        <span className="supabase-active-badge">Ativo</span>
-                      )}
                     </button>
                   ))
                 ) : (
                   <div className="supabase-empty-list">
-                    Nenhum projeto encontrado. Clique em Novo Projeto para criar.
+                    {unavailableSupabaseProjects.length > 0
+                      ? "Nenhum projeto disponível para este projeto local."
+                      : "Nenhum projeto encontrado. Clique em Novo Projeto para criar."}
                   </div>
+                )}
+
+                {unavailableSupabaseProjects.length > 0 && (
+                  <>
+                    <div className="supabase-section-divider">
+                      <span className="supabase-section-title">Indisponíveis</span>
+                    </div>
+                    {unavailableSupabaseProjects.map(proj => (
+                      <div
+                        className="supabase-item-row unavailable"
+                        key={`unavail-${proj.ref}`}
+                        title="Já vinculado a outro projeto"
+                      >
+                        <div className="supabase-item-radio disabled" />
+                        <div className="supabase-item-info">
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                            <strong>{proj.name}</strong>
+                            <span className="supabase-unavailable-badge">Indisponível</span>
+                          </div>
+                          <code>{proj.ref}</code>
+                          <small>{proj.region ? `${proj.region} · ` : ""}Já vinculado a outro projeto</small>
+                        </div>
+                      </div>
+                    ))}
+                  </>
                 )}
               </div>
 
@@ -7117,7 +8329,7 @@ function App() {
                     {updaterState.updateInfo?.releaseNotes ? (
                       <div className="updater-release-notes">
                         <small><b>Novidades:</b></small>
-                        <p>{typeof updaterState.updateInfo.releaseNotes === "string" ? updaterState.updateInfo.releaseNotes : "Melhorias de estabilidade e novas funcionalidades."}</p>
+                        <ReleaseNotesRenderer notes={updaterState.updateInfo.releaseNotes} />
                       </div>
                     ) : null}
                   </div>

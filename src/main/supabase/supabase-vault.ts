@@ -5,8 +5,17 @@ import fsSync from "node:fs";
 import crypto from "node:crypto";
 import { SupabaseIntegration, SupabaseVault } from "./supabase-types";
 
+export function normalizeVaultProjectPath(projectPath: string): string {
+  if (!projectPath) return "";
+  let resolved = path.resolve(String(projectPath).trim());
+  if (resolved.length > 3 && (resolved.endsWith("\\") || resolved.endsWith("/"))) {
+    resolved = resolved.replace(/[/\\]+$/, "");
+  }
+  return resolved.toLowerCase();
+}
+
 export const projectKey = (projectPath: string): string =>
-  crypto.createHash("sha256").update(projectPath.toLowerCase()).digest("hex");
+  crypto.createHash("sha256").update(normalizeVaultProjectPath(projectPath)).digest("hex");
 
 export class SupabaseVaultManager {
   private vault: SupabaseVault | null = null;
@@ -110,8 +119,18 @@ export class SupabaseVaultManager {
   public async isProjectUsedElsewhere(projectPath: string, projectRef: string): Promise<boolean> {
     const vault = await this.loadVault();
     const currentKey = projectKey(projectPath);
+    const norm = (projectRef || "").trim().toLowerCase();
     return Object.entries(vault.integrations).some(
-      ([k, item]) => k !== currentKey && item.projectRef === projectRef
+      ([k, item]) => k !== currentKey && (item.projectRef || "").trim().toLowerCase() === norm
     );
+  }
+
+  public async getAllUsedProjectRefs(excludeProjectPath?: string): Promise<string[]> {
+    const vault = await this.loadVault();
+    const currentKey = excludeProjectPath ? projectKey(excludeProjectPath) : null;
+    return Object.entries(vault.integrations)
+      .filter(([k]) => !currentKey || k !== currentKey)
+      .map(([_, item]) => item.projectRef)
+      .filter(Boolean);
   }
 }

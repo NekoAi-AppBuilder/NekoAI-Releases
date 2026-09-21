@@ -10,9 +10,12 @@ import { normalizeOpenCodeEvent, clearStatusCache, clearStatusCacheForSession } 
 import { shouldIgnoreEventPath } from "./events/filters";
 import { perfEnabled, perfTaskStart, perfMark, perfCountEvent, perfUploadBytes, perfFlushTask, perfRetryStart, perfRetryEnd } from "./perf";
 import { supabaseManager } from "./supabase/supabase-manager";
+import { migrationManager } from "./supabase/migration-manager";
+import { isReadOnlySql, classifySqlRisk } from "./security/sql-guard";
 import { parseSupabaseError } from "./supabase/supabase-cli";
 import { SupabaseCreateProjectPayload } from "./supabase/supabase-types";
 import { vercelManager, getSupabaseEnvironmentNames } from "./vercel/vercel-manager";
+import { vercelIntentManager } from "./vercel/vercel-intent";
 import { isValidVercelProjectName } from "./vercel/vercel-types";
 import { licenseManager } from "./license/license-manager";
 import { updaterManager } from "./updater";
@@ -24,6 +27,7 @@ import { captureSiteChromium } from "./site-capture";
 import { recentProjectsManager, detectProjectTechnology, checkProjectExistsOnDisk, normalizeProjectPath } from "./recent-projects-manager";
 import { appPreferencesManager, isValidDirectory } from "./app-preferences-manager";
 import { thumbnailService } from "./thumbnail-service";
+import { sessionParentMap, registerSessionParent, resolveRootSessionId as resolveRootFromTree, clearSessionTree } from "./session-tree";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -198,6 +202,7 @@ async function waitForServiceReady(): Promise<void> {
 type ActiveAgentRequest = { requestBody: any; attempts: number; maxAttempts: number; retryTimer?: NodeJS.Timeout; isRetrying?: boolean };
 const activeAgentRequests = new Map<string, ActiveAgentRequest>();
 const forwardedSessionStatus = new Map<string, string>();
+const recentToolInputs = new Map<string, any>();
 const AGENT_RETRY_DELAYS_MS = [2000, 4000, 8000, 15000, 30000, 60000, 120000, 180000];
 
 // Engine-level retry watchdog. OpenCode can alternate session.status between
@@ -212,6 +217,11 @@ const engineRetryStates = new Map<string, EngineRetryState>();
 const retryExhaustedSessions = new Set<string>();
 const sessionModelLabels = new Map<string, string>();
 const attemptedErrorSignatures = new Map<string, { count: number; lastAttempt: number }>();
+
+function isNonRetryableQuotaOrLimitError(message: string): boolean {
+  if (!message || typeof message !== "string") return false;
+  return /free usage exceeded|quota exceeded|insufficient quota|rate limit|credit balance|subscription required|usage limit|insufficient credits/i.test(message);
+}
 
 function logSafeText(value: unknown, limit = 160): string {
   return String(value ?? "")
@@ -247,6 +257,10 @@ process.on("unhandledRejection", (reason: unknown) => {
 // idle of task A from the idle of task B and never conclude the wrong task.
 let promptTaskCounter = 0;
 const sessionTaskIds = new Map<string, string>();
+function resolveRootSessionId(sessionId: string): string {
+  return resolveRootFromTree(sessionId, (sid) => taskRecords.has(sid));
+}
+
 function newTaskCorrelationId(sessionId: string): string {
   const id = `t${(++promptTaskCounter).toString(36)}`;
   sessionTaskIds.set(sessionId, id);
@@ -282,6 +296,8 @@ type TaskRecord = {
   lastActivityAt: number;
   lastAssistantMessageId: string;
   askedQuestionIds: string[];
+  // Registra se um pedido de aprovação de plano (nativo ou prévio) já foi emitido nesta task
+  planApprovalAsked?: boolean;
   // Newest assistant message id the event stream has referred to for this
   // session (message.part.updated / message.updated). Used to detect the
   // message-commit race: an idle can arrive before the message endpoint
@@ -404,13 +420,17 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
 }
 
 function resolveTaskIdForSession(sessionId: string): string {
-  const record = taskRecords.get(sessionId);
-  if (record?.taskId) return record.taskId;
-  let taskId = sessionTaskIds.get(sessionId) ?? "";
-  if (!taskId && sessionTaskIds.size === 1) {
-    taskId = Array.from(sessionTaskIds.values())[0] || "";
+  if (!sessionId) return "";
+  const directRecord = taskRecords.get(sessionId);
+  if (directRecord?.taskId) return directRecord.taskId;
+
+  const rootSessionId = resolveRootSessionId(sessionId);
+  if (rootSessionId) {
+    const rootRecord = taskRecords.get(rootSessionId);
+    if (rootRecord?.taskId) return rootRecord.taskId;
   }
-  return taskId;
+
+  return sessionTaskIds.get(sessionId) ?? (rootSessionId ? sessionTaskIds.get(rootSessionId) : "") ?? "";
 }
 
 function normalizeTimestamp(value: unknown): number {
@@ -432,7 +452,13 @@ async function fetchPendingPermissions(sessionId: string, timeoutMs = 4000): Pro
     const record = taskRecords.get(sessionId);
     const since = normalizeTimestamp(record?.createdAt ?? 0);
     return list
-      .filter((item: any) => item?.sessionID === sessionId)
+      .filter((item: any) => {
+        if (!item?.sessionID) return false;
+        if (item.sessionID === sessionId) return true;
+        // Deterministically check if item.sessionID is a child of this sessionId
+        const rootId = resolveRootSessionId(item.sessionID);
+        return rootId === sessionId;
+      })
       .filter((item: any) => normalizeTimestamp(item?.time?.created ?? 0) >= since)
       .sort((a: any, b: any) => normalizeTimestamp(a?.time?.created ?? 0) - normalizeTimestamp(b?.time?.created ?? 0));
   } catch {
@@ -464,6 +490,36 @@ async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000):
       if (!text) continue;
       const created = normalizeTimestamp(entry?.info?.time?.created ?? entry?.time?.created ?? entry?.createdAt ?? 0);
       return { id: String(entry?.info?.id ?? entry?.id ?? ""), text, created };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLatestToolInput(sessionId: string, toolPattern: string, timeoutMs = 4000): Promise<{ input: any; name?: string; tool?: string } | null> {
+  try {
+    const response = await fetchWithTimeout(
+      `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
+      { headers: opencodeRequestHeaders() },
+      timeoutMs
+    );
+    if (!response.ok) return null;
+    const payload: any = await response.json();
+    const entries: any[] = Array.isArray(payload) ? payload : (payload?.data ?? []);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      const parts = Array.isArray(entry?.parts) ? entry.parts : [];
+      for (let j = parts.length - 1; j >= 0; j--) {
+        const part = parts[j];
+        const toolName = String(part?.tool ?? part?.name ?? "");
+        if (toolName && toolName.includes(toolPattern)) {
+          const input = part?.state?.input ?? part?.input ?? part?.args ?? {};
+          if (input && typeof input === "object" && Object.keys(input).length > 0) {
+            return { input, name: String(input?.name || "migration"), tool: toolName };
+          }
+        }
+      }
     }
     return null;
   } catch {
@@ -937,12 +993,35 @@ async function runIdleDetermination(sessionId: string, taskId: string, isQuestio
       return;
     }
     clearActiveAgentRequest(sessionId);
-    // [plan_exit-fix C] Plan tasks MUST NOT be concluded as "completed" by session.idle alone.
-    // The plan agent must call plan_exit first (which transitions to waiting_for_user/plan-approval-asked).
-    // If session.idle arrives without a prior plan_exit the task stays open — waiting for the native
-    // plan_exit tool call. Only Build tasks auto-complete via session.idle.
+    // [Plan Mode] Se for tarefa de plano, o encerramento NÃO é concluído como "completed".
+    // Precedência Estrita: Native Plan Exit > Textual Plan Fallback.
+    // Se a tarefa já teve aprovação de plano registrada (nativa via question.asked ou prévia),
+    // ou se já está em waiting_for_user, o fallback textual NUNCA pode executar nem sobrescrever.
     if (record.planMode) {
-      console.log(`[TaskLifecycle] session.idle for Plan task — NOT completing: plan_exit not yet received session=${sessionId}`);
+      if (record.planApprovalAsked || (record.state as string) === "waiting_for_user" || (record.state as string) === "waiting_for_approval") {
+        console.log(`[TaskLifecycle] session.idle for Plan task — plan approval already active/asked for task=${taskId} session=${sessionId}`);
+        return;
+      }
+      if (latest?.text && normalizeTimestamp(latest.created) >= normalizeTimestamp(record.createdAt)) {
+        const planText = latest.text.trim();
+        if (planText.length > 0 && record.lastAssistantMessageId !== latest.id) {
+          record.lastAssistantMessageId = latest.id;
+          record.planApprovalAsked = true;
+          const questionId = `q${(++taskQuestionCounter).toString(36)}`;
+          record.askedQuestionIds.push(questionId);
+          setTaskState(sessionId, "waiting_for_user", "plan-approval-asked", {
+            questionId,
+            isPlanApproval: true,
+            isTextualFallback: true,
+            planFileContent: planText,
+            question: "Plano pronto para revisão."
+          });
+          logTask("question", taskId, sessionId, `questionId=${questionId} planFallback=true chars=${planText.length}`);
+          console.log(`[TaskLifecycle] Plan task textual fallback triggered session=${sessionId} chars=${planText.length}`);
+          return;
+        }
+      }
+      console.log(`[TaskLifecycle] session.idle for Plan task — plan_exit or valid text not yet received session=${sessionId}`);
       return;
     }
     setTaskState(sessionId, "completed", "session-idle");
@@ -968,6 +1047,7 @@ function resetTaskRuntime() {
   retryExhaustedSessions.clear();
   taskRecords.clear();
   sessionTaskIds.clear();
+  sessionParentMap.clear();
   taskQuestionCounter = 0;
   idleDeterminationGate.clear();
   for (const timer of idleRecheckTimers.values()) clearTimeout(timer);
@@ -2411,6 +2491,7 @@ async function stopOpenCode() {
   retryExhaustedSessions.clear();
   sessionModelLabels.clear();
   sessionTaskIds.clear();
+  sessionParentMap.clear();
   attemptedErrorSignatures.clear();
   invalidateServiceGate();
   for (const [sessionId, active] of activeAgentRequests) {
@@ -2525,13 +2606,82 @@ async function subscribeEvents(gen?: number) {
           if (eventType === "message.updated" || eventType === "message.part.updated") {
             logSampledMessageEvent(eventType, props, perfSessionId);
           }
+          // Track tool parts from streaming messages (message.part.updated)
+          if (eventType === "message.part.updated") {
+            const part = props?.part;
+            if (part?.type === "tool") {
+              const toolName = String(part?.tool ?? "");
+              const callId = String(part?.callID ?? part?.callId ?? part?.id ?? "");
+              const toolInput = part?.state?.input ?? part?.input ?? {};
+              if (toolInput && typeof toolInput === "object" && Object.keys(toolInput).length > 0) {
+                if (callId) recentToolInputs.set(callId, toolInput);
+                if (perfSessionId && callId) recentToolInputs.set(`${perfSessionId}:${callId}`, toolInput);
+              }
+
+              const isMigrationTool = toolName.includes("apply_migration") || toolName.includes("execute_sql") || (toolName.startsWith("neko_supabase_") && toolName.endsWith("_apply_migration"));
+              if (isMigrationTool && perfSessionId) {
+                const targetProposal = (callId && migrationManager.findProposal(callId)) || migrationManager.getExecutingOrApprovedProposalForSession(perfSessionId);
+                if (targetProposal && (targetProposal.status === "APPROVED" || targetProposal.status === "EXECUTING")) {
+                  const state = part?.state;
+                  const status = state?.status;
+                  if (status === "running" && targetProposal.status === "APPROVED") {
+                    migrationManager.notifyToolExecuting(targetProposal.id);
+                  } else if (status === "completed" || status === "done" || status === "success") {
+                    void migrationManager.notifyToolCompleted(targetProposal.id, true);
+                  } else if (status === "error") {
+                    const errorMsg = String(state?.error?.message ?? state?.error ?? "Erro ao executar ferramenta de migração.");
+                    void migrationManager.notifyToolCompleted(targetProposal.id, false, errorMsg);
+                  }
+                }
+              }
+            }
+          }
           if (eventType.startsWith("tool.execute") || eventType.startsWith("file.") || eventType.startsWith("permission.") || eventType.startsWith("session.") || eventType === "command.executed") {
-            const toolName = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
+            const toolName = String(props?.tool ?? props?.name ?? props?.part?.tool ?? "");
+            const callId = String(props?.callID ?? props?.callId ?? props?.id ?? props?.part?.id ?? "");
             const toolInput = props?.input ?? props?.part?.state?.input ?? {};
+            if (toolInput && typeof toolInput === "object" && Object.keys(toolInput).length > 0) {
+              if (callId) recentToolInputs.set(callId, toolInput);
+              if (perfSessionId && callId) recentToolInputs.set(`${perfSessionId}:${callId}`, toolInput);
+            }
+
+            // Track Supabase migration tool execution lifecycle: ONLY for approved proposals
+            const isMigrationTool = toolName.includes("apply_migration") || toolName.includes("execute_sql") || (toolName.startsWith("neko_supabase_") && toolName.endsWith("_apply_migration"));
+            if (isMigrationTool && perfSessionId) {
+              if (eventType === "tool.execute.before") {
+                const approvedProposal = (callId && migrationManager.findProposal(callId)) || migrationManager.getApprovedProposalForSession(perfSessionId);
+                if (approvedProposal && approvedProposal.status === "APPROVED") {
+                  migrationManager.notifyToolExecuting(approvedProposal.id);
+                }
+              } else if (eventType === "tool.execute.after") {
+                const executingProposal = (callId && migrationManager.findProposal(callId)) || migrationManager.getExecutingOrApprovedProposalForSession(perfSessionId);
+                if (executingProposal && (executingProposal.status === "EXECUTING" || executingProposal.status === "APPROVED")) {
+                  const state = props?.state ?? props?.part?.state;
+                  const isError = state?.status === "error" || props?.error || state?.error;
+                  const errorMsg = isError ? String(props?.error ?? state?.error?.message ?? state?.error ?? "Erro ao executar ferramenta de migração.") : undefined;
+                  void migrationManager.notifyToolCompleted(executingProposal.id, !isError, errorMsg);
+                }
+              }
+            }
+
             const filePath = props?.file?.path ?? props?.filePath ?? props?.path ?? props?.file ?? "";
             const command = toolInput?.command ?? toolInput?.cmd ?? "";
             const status = props?.status?.type ?? props?.status ?? "";
-            const permission = props?.permission ?? props?.permissionID ?? props?.id ?? "";
+            const permission = String(
+              props?.permissionID ??
+              props?.permissionId ??
+              props?.permission ??
+              props?.id ??
+              props?.requestID ??
+              props?.requestId ??
+              event?.permissionID ??
+              event?.permissionId ??
+              event?.permission ??
+              event?.id ??
+              event?.requestID ??
+              event?.requestId ??
+              ""
+            );
             const detail = eventType.startsWith("tool.") ? `tool=${String(toolName).slice(0, 80)}${filePath ? ` path=${String(filePath).slice(-160)}` : ""}${command ? ` cmd=${String(command).slice(0, 160)}` : ""}`
               : eventType.startsWith("file.") ? `path=${String(filePath).slice(-180)}`
               : eventType.startsWith("permission.") ? `permission=${String(permission).slice(0, 100)}`
@@ -2650,17 +2800,21 @@ async function subscribeEvents(gen?: number) {
               retryState.lastRetryAt = Date.now();
               console.warn(`[Neko/Agent] retry do motor session=${sessionId.slice(0, 8)} model=${sessionModelLabels.get(sessionId) ?? "?"} cycles=${retryState.cycles}${retryGap ? ` gap=${retryGap}ms` : ""} reason=${logSafeText(statusMessage || retryState.reason) || "-"}`);
               perfRetryStart(statusMessage || retryState.reason);
-              if (retryState.cycles >= ENGINE_MAX_RETRY_CYCLES) {
-                // Recovery failed: stop the endless retry loop, tell the user
+
+              const currentReason = statusMessage || retryState.reason;
+              const isQuotaExceeded = isNonRetryableQuotaOrLimitError(currentReason);
+
+              if (isQuotaExceeded || retryState.cycles >= ENGINE_MAX_RETRY_CYCLES) {
+                // Quota exceeded or recovery failed: stop the endless retry loop, tell the user
                 // and keep the diagnostics. Never abandon the task silently.
-                const finalReason = logSafeText(retryState.reason, 280);
-                console.error(`[Neko/Agent] recuperação falhou session=${sessionId.slice(0, 8)} model=${sessionModelLabels.get(sessionId) ?? "?"} cycles=${retryState.cycles} reason=${finalReason || "-"}`);
+                const finalReason = logSafeText(currentReason, 280);
+                console.error(`[Neko/Agent] ${isQuotaExceeded ? "limite/quota excedido" : "recuperação falhou"} session=${sessionId.slice(0, 8)} model=${sessionModelLabels.get(sessionId) ?? "?"} cycles=${retryState.cycles} reason=${finalReason || "-"}`);
                 engineRetryStates.delete(sessionId);
                 retryExhaustedSessions.add(sessionId);
                 clearActiveAgentRequest(sessionId);
                 if (taskRecords.has(sessionId)) {
-                  setTaskState(sessionId, "failed", "retry-exhausted");
-                  logTask("failed", resolveTaskIdForSession(sessionId), sessionId);
+                  setTaskState(sessionId, "failed", isQuotaExceeded ? "quota-exceeded" : "retry-exhausted");
+                  logTask("failed", resolveTaskIdForSession(sessionId), sessionId, `reason=${isQuotaExceeded ? "quota-exceeded" : "retry-exhausted"}`);
                 }
                 // Ask the engine to stop its internal retry loop.
                 void fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
@@ -2673,15 +2827,13 @@ async function subscribeEvents(gen?: number) {
                     sessionID: sessionId,
                     error: {
                       data: {
-                        message: finalReason
-                          ? `A execução não avançou após várias tentativas. Motivo: ${finalReason}`
-                          : "A execução não avançou após várias tentativas. Verifique o provedor e o modelo selecionados e tente novamente.",
+                        message: finalReason,
                         isRetryable: false
                       }
                     }
                   }
                 });
-                perfFlushTask(sessionId, "recovery-failed");
+                perfFlushTask(sessionId, isQuotaExceeded ? "quota-exceeded" : "recovery-failed");
               }
             } else if (statusType === "busy") {
               perfRetryEnd();
@@ -2691,12 +2843,16 @@ async function subscribeEvents(gen?: number) {
               // permission): approval state goes back to running.
               // NOTE: waiting_for_user is NOT cleared here because the engine stays
               // busy while awaiting the user's answer to the native question tool.
+              // Also, waiting_for_approval is NOT cleared if a Supabase migration proposal is pending!
               const record = taskRecords.get(sessionId);
               if (record) {
                 record.sawBusy = true;
                 record.lastActivityAt = Date.now();
                 if (record.state === "waiting_for_approval") {
-                  setTaskState(sessionId, "running", "engine-resumed");
+                  const hasPendingMigration = Boolean(migrationManager.getPendingProposalForSession(sessionId));
+                  if (!hasPendingMigration) {
+                    setTaskState(sessionId, "running", "engine-resumed");
+                  }
                 }
               }
             } else if (statusType === "idle" || statusType === "completed" || statusType === "done") {
@@ -2725,6 +2881,15 @@ async function subscribeEvents(gen?: number) {
               const previous = forwardedSessionStatus.get(sessionId);
               if (previous === statusType) continue;
               forwardedSessionStatus.set(sessionId, statusType);
+            }
+          }
+          // Register session parent/child relations
+          if (eventType === "session.created" || eventType === "session.updated") {
+            const info = props?.info ?? props;
+            const childId = String(info?.id ?? props?.sessionID ?? props?.sessionId ?? "");
+            const parentId = String(info?.parentID ?? info?.parentId ?? "");
+            if (childId && parentId && childId !== parentId) {
+              registerSessionParent(childId, parentId);
             }
           }
           // session.updated/diff are internal synchronization chatter. Nothing in
@@ -2762,6 +2927,9 @@ async function subscribeEvents(gen?: number) {
 
             if (record) {
               record.askedQuestionIds.push(questionId);
+              if (isPlanApproval) {
+                record.planApprovalAsked = true;
+              }
             }
             console.log(`[TaskLifecycle] native question.asked session=${questionSessionId} requestId=${requestId} isPlan=${isPlanApproval} text=${questionText.slice(0, 60)}`);
 
@@ -2778,7 +2946,7 @@ async function subscribeEvents(gen?: number) {
                 const rawPath = pathMatch[1].replace(/^["']|["']$/g, "").replace(/\\/g, "/");
                 planFilePath = rawPath;
                 try {
-                  const absPath = safePathWithinProject(currentProject, rawPath);
+                  const absPath = resolveSafePlanFilePath(currentProject, rawPath);
                   planFileContent = await fs.promises.readFile(absPath, "utf8");
                   console.log(`[TaskLifecycle] plan file read ok path=${rawPath} chars=${planFileContent.length}`);
                 } catch (readErr: any) {
@@ -2808,25 +2976,275 @@ async function subscribeEvents(gen?: number) {
               logTask("user-response", resolveTaskIdForSession(questionSessionId), questionSessionId, `event=${eventType}`);
             }
           }
-          // Approval protocol: permission.updated is the engine asking for an
-          // approval. It is normalized to permission.asked for the renderer and
-          // the task machine moves to waiting_for_approval. permission.replied
-          // is the user's decision (approve or reject); the agent continues
+          // Approval protocol: OpenCode emits permission.asked (or permission.updated)
+          // when asking for an approval. The task machine moves to waiting_for_approval.
+          // permission.replied is the user's decision (approve or reject); the agent continues
           // from where it stopped — a rejection is never a technical error.
-          if (eventType === "permission.updated") {
+          if (eventType === "permission.asked" || eventType === "permission.updated") {
             const permissionSessionId = String(props?.sessionID ?? props?.sessionId ?? "");
-            if (permissionSessionId && taskRecords.has(permissionSessionId)) {
-              setTaskState(permissionSessionId, "waiting_for_approval", "permission-asked", { permission: props });
-              logTask("approval-required", resolveTaskIdForSession(permissionSessionId), permissionSessionId, `permission=${String(props?.id ?? "").slice(0, 12)}`);
+            const isDirectRoot = Boolean(permissionSessionId && taskRecords.has(permissionSessionId));
+            const rootSessionId = isDirectRoot ? permissionSessionId : resolveRootSessionId(permissionSessionId);
+            const record = rootSessionId ? taskRecords.get(rootSessionId) : undefined;
+
+            // DIAGNOSTIC LOG: Permission Asked
+            const permissionId = String(props?.id ?? "");
+            const permissionType = String(props?.permission ?? props?.type ?? "");
+            const resolvedTaskId = record?.taskId ?? (permissionSessionId ? resolveTaskIdForSession(permissionSessionId) : "");
+            const relation = isDirectRoot ? "root" : (record ? "child" : "unknown");
+            console.log(`[Neko/Permission] Asked permissionId=${permissionId} type=${permissionType} sessionId=${permissionSessionId} resolvedTaskId=${resolvedTaskId} rootSessionId=${rootSessionId || permissionSessionId} relation=${relation}`);
+
+            // [Supabase Migration Card Interception]
+            // If the permission request is for Supabase apply_migration or execute_sql, route to MigrationManager
+            // and show DatabaseMigrationCard instead of generic permission prompt.
+            const isSupabaseMigration =
+              permissionType.includes("apply_migration") ||
+              permissionType.includes("execute_sql") ||
+              (permissionType.startsWith("neko_supabase_") && permissionType.endsWith("_apply_migration"));
+
+            if (isSupabaseMigration && (permissionSessionId || rootSessionId)) {
+              const targetSession = permissionSessionId || rootSessionId || "";
+              const activeRef = supabaseManager.getState().projectRef || "";
+
+              // Extract SQL candidate safely with strict scoping (callId / permissionId / inline props ONLY)
+              let resolvedInputKey = "none";
+              let sessionCachedInput: any = undefined;
+              if (permissionId && recentToolInputs.has(permissionId)) {
+                sessionCachedInput = recentToolInputs.get(permissionId);
+                resolvedInputKey = `permissionId:${permissionId}`;
+              }
+
+              const propsInput = (props?.input && typeof props.input === "object") ? props.input : undefined;
+              const propsMetadata = (props?.metadata && typeof props.metadata === "object") ? props.metadata : undefined;
+              const propsArgs = (props?.args && typeof props.args === "object") ? props.args : undefined;
+              const propsParams = (props?.params && typeof props.params === "object") ? props.params : undefined;
+
+              const extractSqlFromObject = (obj: any): string => {
+                if (!obj || typeof obj !== "object") return "";
+                const candidates = [
+                  obj.query,
+                  obj.sql,
+                  obj.migration,
+                  obj.args?.query,
+                  obj.args?.sql,
+                  obj.args?.migration,
+                  obj.input?.query,
+                  obj.input?.sql,
+                  obj.input?.migration
+                ];
+                for (const cand of candidates) {
+                  if (typeof cand === "string" && cand.trim().length > 0 && cand.trim() !== "*") {
+                    return cand.trim();
+                  }
+                }
+                return "";
+              };
+
+              const extractNameFromObject = (obj: any): string => {
+                if (!obj || typeof obj !== "object") return "";
+                const candidates = [
+                  obj.name,
+                  obj.args?.name,
+                  obj.input?.name
+                ];
+                for (const cand of candidates) {
+                  if (typeof cand === "string" && cand.trim().length > 0 && cand.trim() !== "*") {
+                    return cand.trim();
+                  }
+                }
+                return "";
+              };
+
+              let rawSqlCandidate =
+                extractSqlFromObject(propsMetadata) ||
+                extractSqlFromObject(propsInput) ||
+                extractSqlFromObject(propsArgs) ||
+                extractSqlFromObject(propsParams) ||
+                extractSqlFromObject(sessionCachedInput);
+
+              if (rawSqlCandidate && resolvedInputKey === "none") {
+                if (extractSqlFromObject(propsMetadata)) resolvedInputKey = "props.metadata";
+                else if (extractSqlFromObject(propsInput)) resolvedInputKey = "props.input";
+                else if (extractSqlFromObject(propsArgs)) resolvedInputKey = "props.args";
+                else if (extractSqlFromObject(propsParams)) resolvedInputKey = "props.params";
+              }
+
+              let rawNameCandidate =
+                extractNameFromObject(propsMetadata) ||
+                extractNameFromObject(propsInput) ||
+                extractNameFromObject(propsArgs) ||
+                extractNameFromObject(sessionCachedInput) ||
+                "migration";
+
+              const resolvedCallId = String(props?.callID ?? props?.callId ?? props?.id ?? "");
+
+              // Async handler to reconcile with message parts if SQL is not yet in cache/props
+              const processProposal = async (initialSql: string, initialName: string) => {
+                let finalSql = initialSql;
+                let finalName = initialName;
+
+                // [Strict Operation Matching]: Determine the exact tool expected for this permission
+                const expectedTool = permissionType.includes("apply_migration") ? "apply_migration" : "execute_sql";
+
+                if (!finalSql) {
+                  // ONLY query message parts that strictly match the current permission's expected tool
+                  const toolInfo = await fetchLatestToolInput(targetSession, expectedTool);
+                  if (toolInfo?.input) {
+                    finalSql = extractSqlFromObject(toolInfo.input);
+                    if (toolInfo.name && toolInfo.name !== "migration") finalName = toolInfo.name;
+                    resolvedInputKey = `fetched:${toolInfo.tool || "tool"}`;
+                  }
+                }
+
+                if (finalSql && activeRef) {
+                  // [READ-ONLY vs MUTATION]: If execute_sql is a SELECT or read-only statement,
+                  // do NOT create a MigrationProposal or ask for approval. Let OpenCode proceed directly.
+                  if (permissionType.includes("execute_sql") && isReadOnlySql(finalSql)) {
+                    console.log(`[Neko/Migration] READ-ONLY query detected for execute_sql (permissionId=${permissionId}). Bypassing migration card.`);
+                    // Auto-release permission as read-only allow if needed or let default permission handler proceed
+                    try {
+                      const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+                      const bodyPayload = { response: "once" };
+                      await fetch(`${opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
+                        method: "POST", headers, body: JSON.stringify(bodyPayload)
+                      }).catch(async () => {
+                        await fetch(`${opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
+                          method: "POST", headers, body: JSON.stringify(bodyPayload)
+                        }).catch(() => {});
+                      });
+                    } catch (readErr) {
+                      console.warn("[Neko/Migration] Error auto-releasing read-only SQL permission:", readErr);
+                    }
+                    return;
+                  }
+
+                  try {
+                    const sqlHash = migrationManager.computeMigrationHash(activeRef, finalSql);
+                    console.log(`[MIGRATION DEBUG] permissionId=${permissionId} sessionId=${targetSession} callId=${resolvedCallId || "none"} toolName=${permissionType} resolvedInputKey=${resolvedInputKey} migrationName=${finalName} sqlHash=${sqlHash}`);
+                    console.log(`[Neko/Migration] permission intercepted session=${targetSession} permission=${permissionId} type=${permissionType}`);
+
+                    // 1. Propose migration FIRST (validates SQL Guard, anti-duplication, creates proposal and emits migration-asked)
+                    const proposalPromise = migrationManager.proposeMigration({
+                      sessionId: targetSession,
+                      permissionId,
+                      callId: resolvedCallId || undefined,
+                      projectRef: activeRef,
+                      name: finalName,
+                      sql: finalSql,
+                      projectRoot: currentProject || undefined
+                    });
+
+                    // 2. Set task state to waiting_for_approval ONLY AFTER proposeMigration succeeds without throwing
+                    if (rootSessionId && record) {
+                      setTaskState(rootSessionId, "waiting_for_approval", "migration-asked", { permission: props });
+                      logTask("approval-required", record.taskId, rootSessionId, `migration=${permissionId.slice(0, 12)}`);
+                    }
+                    console.log(`[Neko/Migration] waiting for approval permissionId=${permissionId}`);
+
+                    // 3. Await user resolution (approve / reject / timeout)
+                    const proposalRes = await proposalPromise;
+                    console.log(`[Neko/Migration] proposal resolved proposalId=${proposalRes.proposalId || "none"} status=${proposalRes.status || "unknown"}`);
+                  } catch (migErr: any) {
+                    console.warn("[MigrationManager] Failed to intercept migration permission:", migErr);
+                    // If proposal creation failed (e.g. invalid SQL or read-only rejected by validator), ensure task is NOT stuck in waiting_for_approval
+                    if (rootSessionId && record) {
+                      setTaskState(rootSessionId, "running", "migration-error");
+                    }
+                    // Auto-reject permission so OpenCode / Agent receives error feedback and is not hung
+                    try {
+                      const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+                      const bodyPayload = { response: "reject" };
+                      await fetch(`${opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
+                        method: "POST", headers, body: JSON.stringify(bodyPayload)
+                      }).catch(async () => {
+                        await fetch(`${opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
+                          method: "POST", headers, body: JSON.stringify(bodyPayload)
+                        }).catch(() => {});
+                      });
+                    } catch {}
+                  }
+                } else {
+                  console.error(`[MIGRATION DEBUG] input unresolved for current operation (sessionId=${targetSession}, permissionId=${permissionId}, permissionType=${permissionType})`);
+                  if (rootSessionId && record) {
+                    setTaskState(rootSessionId, "running", "migration-input-unavailable");
+                  }
+                  // Reject unresolvable migration permission cleanly so the session continues
+                  try {
+                    const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+                    const bodyPayload = { response: "reject" };
+                    await fetch(`${opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
+                      method: "POST", headers, body: JSON.stringify(bodyPayload)
+                    }).catch(async () => {
+                      await fetch(`${opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
+                        method: "POST", headers, body: JSON.stringify(bodyPayload)
+                      }).catch(() => {});
+                    });
+                  } catch {}
+                }
+              };
+
+              void processProposal(rawSqlCandidate, rawNameCandidate);
+
+              // Always suppress generic permission prompt for migration tools
+              continue;
+            }
+
+            if (rootSessionId && record) {
+              setTaskState(rootSessionId, "waiting_for_approval", "permission-asked", { permission: props });
+              logTask("approval-required", record.taskId, rootSessionId, `permission=${String(props?.id ?? "").slice(0, 12)}`);
             }
             event.type = "permission.asked";
           }
           if (eventType === "permission.replied") {
-            const permissionSessionId = String(props?.sessionID ?? props?.sessionId ?? "");
-            if (permissionSessionId && taskRecords.has(permissionSessionId)) {
-              const response = String(props?.response ?? "");
-              setTaskState(permissionSessionId, "running", "permission-replied");
-              logTask("user-approval", resolveTaskIdForSession(permissionSessionId), permissionSessionId, `response=${response || "answered"}`);
+            const permissionSessionId = String(
+              props?.sessionID ??
+              props?.sessionId ??
+              props?.session?.id ??
+              event?.sessionID ??
+              event?.sessionId ??
+              event?.session?.id ??
+              perfSessionId ??
+              ""
+            );
+            const isDirectRoot = Boolean(permissionSessionId && taskRecords.has(permissionSessionId));
+            const rootSessionId = isDirectRoot ? permissionSessionId : resolveRootSessionId(permissionSessionId);
+            const record = rootSessionId ? taskRecords.get(rootSessionId) : undefined;
+
+            // DIAGNOSTIC LOG: Permission Replied (com suporte abrangente a todos os formatos de envelope do OpenCode)
+            const permissionId = String(
+              props?.permissionID ??
+              props?.permissionId ??
+              props?.id ??
+              props?.permission ??
+              props?.requestID ??
+              props?.requestId ??
+              event?.permissionID ??
+              event?.permissionId ??
+              event?.id ??
+              event?.permission ??
+              event?.requestID ??
+              event?.requestId ??
+              ""
+            );
+            const resolvedTaskId = record?.taskId ?? (permissionSessionId ? resolveTaskIdForSession(permissionSessionId) : "");
+            const response = String(
+              props?.response ??
+              props?.reply ??
+              props?.action ??
+              event?.response ??
+              event?.reply ??
+              event?.action ??
+              ""
+            );
+            console.log(`[Neko/Permission] Replied permissionId=${permissionId || "(none)"} sessionId=${permissionSessionId} resolvedTaskId=${resolvedTaskId} response=${response}`);
+
+            // Specific cache cleanup for this permission
+            if (permissionId) recentToolInputs.delete(permissionId);
+            if (permissionSessionId && props?.permission) recentToolInputs.delete(`${permissionSessionId}:${props.permission}`);
+            if (permissionSessionId && props?.type) recentToolInputs.delete(`${permissionSessionId}:${props.type}`);
+
+            if (rootSessionId && record) {
+              setTaskState(rootSessionId, "running", "permission-replied");
+              logTask("user-approval", record.taskId, rootSessionId, `response=${response || "answered"}`);
             }
           }
           const nekoEvent = normalizeOpenCodeEvent(event);
@@ -2872,6 +3290,66 @@ async function subscribeEvents(gen?: number) {
   }
 }
 
+
+function resolveSafePlanFilePath(projectPath: string, rawPath: string): string {
+  const trimmed = String(rawPath ?? "").trim().replace(/^["']|["']$/g, "");
+  if (!trimmed) {
+    throw new Error("Caminho de plano vazio.");
+  }
+
+  // 1. Apenas arquivos com extensão .md são permitidos
+  if (path.extname(trimmed).toLowerCase() !== ".md") {
+    throw new Error("Extensão de arquivo de plano inválida (apenas .md é permitido).");
+  }
+
+  // 2. Normalização do caminho (reconstruindo drive Windows se omitido, ex: Users\andre\...)
+  let targetPath = trimmed;
+  if (process.platform === "win32") {
+    if (/^[\\/]users[\\/]/i.test(targetPath)) {
+      const driveRoot = path.parse(os.homedir()).root || "C:\\";
+      targetPath = path.join(driveRoot, targetPath);
+    } else if (/^users[\\/]/i.test(targetPath)) {
+      const driveRoot = path.parse(os.homedir()).root || "C:\\";
+      targetPath = path.join(driveRoot, targetPath);
+    }
+  }
+
+  const resolved = path.isAbsolute(targetPath)
+    ? path.resolve(targetPath)
+    : path.resolve(projectPath, targetPath);
+
+  // 3. Raízes autorizadas estritamente para arquivos de planos:
+  // - Workspace project plans directory (<projectRoot>/.opencode/plans/)
+  // - User home .local/share/opencode/plans (<userHome>/.local/share/opencode/plans/)
+  // - Windows LocalAppData opencode/plans (%LOCALAPPDATA%/opencode/plans/)
+  const allowedRoots: string[] = [];
+  if (projectPath) {
+    allowedRoots.push(path.resolve(projectPath, ".opencode", "plans"));
+  }
+  const userHome = os.homedir();
+  if (userHome) {
+    allowedRoots.push(path.resolve(userHome, ".local", "share", "opencode", "plans"));
+  }
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData) {
+    allowedRoots.push(path.resolve(localAppData, "opencode", "plans"));
+  }
+
+  const isWindows = process.platform === "win32";
+  const resolvedCompare = isWindows ? resolved.toLowerCase() : resolved;
+
+  const isAllowed = allowedRoots.some(allowedRoot => {
+    const rootCompare = isWindows ? allowedRoot.toLowerCase() : allowedRoot;
+    const prefix = rootCompare.endsWith(path.sep) ? rootCompare : rootCompare + path.sep;
+    return resolvedCompare === rootCompare || resolvedCompare.startsWith(prefix);
+  });
+
+  if (!isAllowed) {
+    throw new Error("Acesso negado: caminho do plano fora dos diretórios autorizados.");
+  }
+
+  return resolved;
+}
 
 function safePathWithinProject(projectPath: string, relativePath: string): string {
   const root = path.resolve(projectPath);
@@ -4301,6 +4779,7 @@ async function getProviders() {
           connected: isConnected,
           catalogEnabled,
           attachment: model?.attachment === true,
+          cost: model?.cost,
         };
       });
 
@@ -5583,6 +6062,7 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
   // A new workspace gets a completely fresh task runtime: no old task,
   // permission, question, retry or listener state can leak across projects.
   resetTaskRuntime();
+  migrationManager.cancelAllPendingProposals();
   logTask("runtime-reset", "-", "-", `target=${path.basename(targetPath)} generation=${transitionGen}`);
 
   // Create WorkspaceContext immediately
@@ -5619,7 +6099,7 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
 
     // 3. Set current project and update Supabase & Vercel
     currentProject = targetPath;
-    void supabaseManager.setProject(targetPath);
+    await supabaseManager.setProject(targetPath);
     void vercelManager.setProject(targetPath);
 
     // 4. Start OpenCode on new project
@@ -6267,6 +6747,12 @@ ipcMain.handle("opencode:permissions", async (_event, sessionId: string) => {
   }
 });
 
+// Fetch pending permissions for a task, including child sessions
+ipcMain.handle("opencode:fetchPendingPermissions", async (_event, sessionId: string) => {
+  if (!sessionId) return [];
+  return fetchPendingPermissions(sessionId);
+});
+
 ipcMain.handle("opencode:permissionReply", async (_event, payload: {
   sessionId: string;
   permissionId: string;
@@ -6409,6 +6895,7 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
     setTaskState(sessionId, "cancelled", "user-stop");
     logTask("cancelled", resolveTaskIdForSession(sessionId), sessionId);
   }
+  migrationManager.cancelAllPendingProposals();
   cancelVisionFallbackFor(sessionId);
   perfFlushTask(sessionId, "aborted");
 
@@ -6858,6 +7345,7 @@ ipcMain.handle("project:stop", async (_event, payload?: { source?: string }) => 
   }
   currentProject = null;
   activeWorkspace = null;
+  migrationManager.cancelAllPendingProposals();
   void supabaseManager.setProject(null);
   void vercelManager.setProject(null);
   await stopOpenCode();
@@ -6953,6 +7441,49 @@ ipcMain.handle("supabase:open-dashboard", async () => {
   return { success: true };
 });
 
+ipcMain.handle("supabase:reply-migration", async (_event, payload: { proposalId: string; approved: boolean }) => {
+  licenseManager.assertAccess("execução de migração do Supabase");
+  if (!payload?.proposalId) {
+    throw new Error("Identificador de proposta de migração inválido.");
+  }
+  const proposal = migrationManager.getProposal(payload.proposalId);
+  const result = await migrationManager.replyProposal(payload.proposalId, payload.approved);
+
+  // If approved, update task state to running so backend task state mirrors approval immediately
+  if (proposal?.sessionId && payload.approved) {
+    const rootSessionId = taskRecords.has(proposal.sessionId) ? proposal.sessionId : resolveRootSessionId(proposal.sessionId);
+    if (rootSessionId && taskRecords.has(rootSessionId)) {
+      setTaskState(rootSessionId, "running", "migration-approved");
+    }
+  }
+
+  // If there was an intercepted OpenCode permission associated with this proposal, reply to it
+  if (proposal?.permissionId && proposal?.sessionId) {
+    try {
+      const response = payload.approved ? "once" : "reject";
+      console.log(`[Neko/Migration] ${payload.approved ? "approved" : "rejected"} proposal=${proposal.id} permission=${proposal.permissionId} releasing original permission response=${response}`);
+      const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+      const bodyPayload = { response };
+      await fetch(`${opencodeUrl}/session/${encodeURIComponent(proposal.sessionId)}/permissions/${encodeURIComponent(proposal.permissionId)}`, {
+        method: "POST", headers, body: JSON.stringify(bodyPayload)
+      }).catch(async () => {
+        await fetch(`${opencodeUrl}/permission/${encodeURIComponent(proposal.permissionId!)}/reply`, {
+          method: "POST", headers, body: JSON.stringify(bodyPayload)
+        }).catch(() => {});
+      });
+    } catch (permErr) {
+      console.warn("[MigrationManager] Error unlocking OpenCode permission after migration reply:", permErr);
+    }
+  }
+
+  return result;
+});
+
+ipcMain.handle("supabase:get-pending-migration", async (_event, sessionId: string) => {
+  if (!sessionId) return null;
+  return migrationManager.getPendingProposalForSession(sessionId);
+});
+
 let vercelPublishInProgress = false;
 
 ipcMain.handle("vercel:get-state", async () => {
@@ -6972,13 +7503,71 @@ ipcMain.handle("vercel:unlink", async () => {
   return await vercelManager.unlinkProject(projectRoot);
 });
 
-ipcMain.handle("vercel:publish", async (_event, customProjectName?: string) => {
+ipcMain.handle("vercel:request-publish-intent", async (_event, customProjectName?: string) => {
+  licenseManager.assertAccess("publicação na Vercel");
+  const projectRoot = assertProjectRootSafe(currentProject, "vercel-request-publish-intent");
+  const vercelUser = vercelManager.getState().username;
+  if (!vercelUser) {
+    throw new Error("Conecte sua conta da Vercel antes de publicar.");
+  }
+
+  const isLinked = fs.existsSync(path.join(projectRoot, ".vercel", "project.json"));
+  if (!isLinked) {
+    const rawName = String(customProjectName || "").trim();
+    if (!rawName) {
+      throw new Error("Informe o nome do projeto na Vercel.");
+    }
+    if (!isValidVercelProjectName(rawName)) {
+      throw new Error(
+        "Nome do projeto inválido. O nome deve ter até 100 caracteres, estar em minúsculas e conter apenas letras, números, '.', '_' e '-' (sem '---')."
+      );
+    }
+  }
+
+  const intent = vercelIntentManager.createIntent({
+    projectPath: projectRoot,
+    projectName: customProjectName,
+    projectGeneration: projectTransitionGeneration,
+    username: vercelUser,
+  });
+
+  return {
+    intentId: intent.intentId,
+    expiresAt: intent.expiresAt,
+    projectPath: intent.projectPath,
+  };
+});
+
+ipcMain.handle("vercel:publish", async (_event, payload?: { intentId?: string; customProjectName?: string } | string) => {
+  const intentId = typeof payload === "object" && payload !== null ? payload.intentId : undefined;
+  const customProjectName = typeof payload === "object" && payload !== null ? payload.customProjectName : (typeof payload === "string" ? payload : undefined);
+
+  if (!intentId) {
+    console.warn("[Vercel/Security] publicação rejeitada: intenção inválida");
+    throw new Error("Publicação na Vercel requer confirmação explícita.");
+  }
+
   licenseManager.assertAccess("publicação na Vercel");
   if (vercelPublishInProgress) {
     throw new Error("Já existe uma publicação na Vercel em andamento.");
   }
   const projectRoot = assertProjectRootSafe(currentProject, "vercel-publish");
   logProjectWorkspace("vercel-publish", projectRoot);
+
+  const currentVercelUser = vercelManager.getState().username;
+
+  // Validate and consume one-shot publish intent
+  const validation = vercelIntentManager.validateAndConsume(
+    intentId,
+    projectRoot,
+    projectTransitionGeneration,
+    currentVercelUser
+  );
+
+  if (!validation.valid) {
+    console.warn(`[Vercel/Security] publicação rejeitada: ${validation.reason}`);
+    throw new Error(validation.userMessage || "Publicação na Vercel requer confirmação explícita.");
+  }
 
   const isLinked = fs.existsSync(path.join(projectRoot, ".vercel", "project.json"));
   let validatedProjectName: string | undefined;
@@ -7130,6 +7719,20 @@ function createWindow() {
       mainWindow.webContents.send("supabase:state-changed", state);
     }
   });
+
+  const forwardMigrationEvent = (eventType: string, payload: any) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("supabase:migration-event", { type: `supabase:migration:${eventType}`, payload });
+    }
+  };
+
+  migrationManager.on("migration-asked", (proposal) => forwardMigrationEvent("asked", proposal));
+  migrationManager.on("migration-replied", (data) => forwardMigrationEvent("replied", data));
+  migrationManager.on("migration-executing", (proposal) => forwardMigrationEvent("executing", proposal));
+  migrationManager.on("migration-completed", (data) => forwardMigrationEvent("completed", data));
+  migrationManager.on("migration-failed", (data) => forwardMigrationEvent("failed", data));
+  migrationManager.on("migration-expired", (proposal) => forwardMigrationEvent("expired", proposal));
+  migrationManager.on("migration-cancelled", (proposal) => forwardMigrationEvent("cancelled", proposal));
 
   vercelManager.on("state-changed", (state) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -7432,6 +8035,7 @@ app.whenReady().then(() => {
   void supabaseManager.initialize();
   void vercelManager.initialize();
   void licenseManager.initialize();
+
 
   licenseManager.setOnStateChange(async (newState, prevState) => {
     console.log(`[Neko/License] Estado alterado de ${prevState.state} para ${newState.state}`);

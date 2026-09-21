@@ -28,6 +28,7 @@ export class SupabaseManager extends EventEmitter {
   private activeProjectPath: string | null = null;
   private isBusy = false;
   private currentAccessToken: string | null = null;
+  private initPromise: Promise<void> | null = null;
 
   constructor(vault?: SupabaseVaultManager, cli?: SupabaseCli) {
     super();
@@ -36,7 +37,12 @@ export class SupabaseManager extends EventEmitter {
   }
 
   public getState(): SupabaseState {
-    return { ...this.state, projects: [...this.state.projects], organizations: [...this.state.organizations] };
+    return {
+      ...this.state,
+      projects: [...this.state.projects],
+      organizations: [...this.state.organizations],
+      usedProjectRefs: this.state.usedProjectRefs ? [...this.state.usedProjectRefs] : [],
+    };
   }
 
   private setState(patch: Partial<SupabaseState>) {
@@ -49,32 +55,50 @@ export class SupabaseManager extends EventEmitter {
   }
 
   public async initialize(): Promise<void> {
-    await this.vault.loadVault();
-    try {
-      const projects = await this.cli.listProjects();
-      const organizations = await this.cli.listOrganizations();
-      this.setState({
-        configured: true,
-        projects,
-        organizations,
-      });
-      if (this.activeProjectPath) {
-        await this.setProject(this.activeProjectPath);
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = (async () => {
+      console.log("[SupabaseInit] start");
+      await this.vault.loadVault();
+      try {
+        const projects = await this.cli.listProjects();
+        console.log("[SupabaseInit] projects loaded", { count: projects.length });
+        const organizations = await this.cli.listOrganizations();
+        console.log("[SupabaseInit] organizations loaded", { count: organizations.length });
+        const usedProjectRefs = await this.vault.getAllUsedProjectRefs(this.activeProjectPath || undefined);
+        this.setState({
+          configured: true,
+          projects,
+          organizations,
+          usedProjectRefs,
+        });
+        if (this.activeProjectPath) {
+          console.log("[SupabaseInit] applying active project", { path: this.activeProjectPath });
+          await this.applyProjectState(this.activeProjectPath);
+        }
+        console.log("[SupabaseInit] complete");
+      } catch (err) {
+        console.warn("[SupabaseInit] error during init:", err);
+        const usedProjectRefs = await this.vault.getAllUsedProjectRefs(this.activeProjectPath || undefined).catch(() => []);
+        this.setState({
+          configured: true,
+          status: "disconnected",
+          projects: [],
+          organizations: [],
+          usedProjectRefs,
+        });
+        if (this.activeProjectPath) {
+          await this.applyProjectState(this.activeProjectPath);
+        }
+        console.log("[SupabaseInit] complete (with error/offline)");
       }
-    } catch {
-      this.setState({
-        configured: true,
-        status: "disconnected",
-        projects: [],
-        organizations: [],
-      });
-    }
+    })();
+    return this.initPromise;
   }
 
-  public async setProject(projectPath: string | null): Promise<void> {
-    this.activeProjectPath = projectPath;
+  private async applyProjectState(projectPath: string | null): Promise<void> {
     const currentProjects = this.state.projects || [];
     const currentOrganizations = this.state.organizations || [];
+    const usedProjectRefs = await this.vault.getAllUsedProjectRefs(projectPath || undefined);
 
     if (!projectPath) {
       this.setState({
@@ -82,15 +106,17 @@ export class SupabaseManager extends EventEmitter {
         configured: true,
         projects: currentProjects,
         organizations: currentOrganizations,
+        usedProjectRefs,
       });
       return;
     }
 
     const integration = await this.vault.getIntegration(projectPath);
     if (integration) {
+      const normRef = (integration.projectRef || "").trim().toLowerCase();
       const hasAccess = currentProjects.length > 0
-        ? currentProjects.some(p => p.ref === integration.projectRef || p.id === integration.projectRef)
-        : false;
+        ? currentProjects.some(p => (p.ref || "").trim().toLowerCase() === normRef || (p.id || "").trim().toLowerCase() === normRef)
+        : true; // Se os projetos ainda não foram listados ou CLI não respondeu, mantém o vínculo salvo no vault
 
       this.setState({
         ...EMPTY_SUPABASE_STATE,
@@ -103,6 +129,7 @@ export class SupabaseManager extends EventEmitter {
         pendingRuntimeSetup: integration.pendingRuntimeSetup || false,
         projects: currentProjects,
         organizations: currentOrganizations,
+        usedProjectRefs,
       });
     } else {
       this.setState({
@@ -111,8 +138,21 @@ export class SupabaseManager extends EventEmitter {
         status: "disconnected",
         projects: currentProjects,
         organizations: currentOrganizations,
+        usedProjectRefs,
       });
     }
+  }
+
+  public async setProject(projectPath: string | null): Promise<void> {
+    this.activeProjectPath = projectPath;
+    await this.vault.loadVault();
+    if (this.initPromise) {
+      console.log("[SupabaseSetProject] waiting initialization");
+      await this.initPromise.catch(() => {});
+    }
+    console.log("[SupabaseSetProject] applying project", { path: projectPath });
+    await this.applyProjectState(projectPath);
+    console.log("[SupabaseSetProject] complete", { path: projectPath });
   }
 
   public async connectWithToken(token: string): Promise<SupabaseState> {
@@ -188,6 +228,7 @@ export class SupabaseManager extends EventEmitter {
     try {
       const projects = await this.cli.listProjects();
       const organizations = await this.cli.listOrganizations();
+      const usedProjectRefs = await this.vault.getAllUsedProjectRefs(this.activeProjectPath || undefined);
 
       let autoConnected = previousState.status === "connected";
       let connectedRef = previousState.projectRef;
@@ -226,6 +267,7 @@ export class SupabaseManager extends EventEmitter {
         region: connectedRegion,
         projects,
         organizations,
+        usedProjectRefs,
         recentCreatedNotice: clearNotice ? null : previousState.recentCreatedNotice,
         error: null,
         structuredError: null,
@@ -257,6 +299,7 @@ export class SupabaseManager extends EventEmitter {
       await this.cli.createProject(payload);
       const projects = await this.cli.listProjects().catch(() => previousState.projects);
       const organizations = await this.cli.listOrganizations().catch(() => previousState.organizations);
+      const usedProjectRefs = await this.vault.getAllUsedProjectRefs(this.activeProjectPath || undefined);
       this.setState({
         ...previousState,
         status: previousState.status === "connected" ? "connected" : "disconnected",
@@ -265,6 +308,7 @@ export class SupabaseManager extends EventEmitter {
         projectUrl: previousState.projectUrl,
         projects,
         organizations,
+        usedProjectRefs,
         recentCreatedNotice:
           "Projeto criado com sucesso! Ele pode demorar até 2 minutos para aparecer na lista. Use o botão atualizar para verificar.",
         error: null,
@@ -318,6 +362,13 @@ export class SupabaseManager extends EventEmitter {
   ): Promise<SupabaseState> {
     if (this.isBusy) throw new Error("Uma operação do Supabase já está em andamento.");
     this.isBusy = true;
+
+    // Guard de Backend: impede associar projeto Supabase se já estiver associado a outro workspace local
+    const isUsedElsewhere = await this.vault.isProjectUsedElsewhere(projectPath, ref);
+    if (isUsedElsewhere) {
+      this.isBusy = false;
+      throw new Error(`Este projeto Supabase já está associado a outro projeto local no NekoAI.`);
+    }
 
     let rollback: (() => Promise<void>) | null = null;
     const previousIntegration = await this.vault.getIntegration(projectPath);
@@ -408,6 +459,8 @@ export class SupabaseManager extends EventEmitter {
         } catch {}
       }
 
+      const usedProjectRefs = await this.vault.getAllUsedProjectRefs(projectPath);
+
       this.setState({
         status: "connected",
         projectRef: ref,
@@ -415,6 +468,7 @@ export class SupabaseManager extends EventEmitter {
         projectUrl: url,
         region: project.region || null,
         pendingRuntimeSetup: setup.pendingRuntimeSetup,
+        usedProjectRefs,
         recentCreatedNotice: null,
         error: null,
       });
@@ -449,6 +503,7 @@ export class SupabaseManager extends EventEmitter {
         status: "disconnected",
         projects: [],
         organizations: [],
+        usedProjectRefs: [],
       });
 
       return this.getState();
@@ -476,6 +531,8 @@ export class SupabaseManager extends EventEmitter {
         await this.vault.removeIntegration(projectPath);
       }
 
+      const usedProjectRefs = await this.vault.getAllUsedProjectRefs(projectPath);
+
       if (this.activeProjectPath === projectPath) {
         this.setState({
           status: "disconnected",
@@ -484,6 +541,7 @@ export class SupabaseManager extends EventEmitter {
           projectUrl: null,
           region: null,
           pendingRuntimeSetup: false,
+          usedProjectRefs,
           error: null,
         });
       }

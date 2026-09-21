@@ -80,11 +80,17 @@ interface Window {
     supabaseSelectProject(ref: string): Promise<any>;
     supabaseDisconnect(): Promise<any>;
     supabaseOpenTokenPage(): Promise<{ success: boolean }>;
+    supabaseOpenDashboard(): Promise<{ success: boolean }>;
+    supabaseReplyMigration(payload: { proposalId: string; approved: boolean }): Promise<any>;
+    supabaseGetPendingMigration(sessionId: string): Promise<any>;
     onSupabaseStateChange(callback: (state: any) => void): () => void;
+    onSupabaseMigrationEvent?(callback: (event: { type: string; payload: any }) => void): () => void;
     vercelGetState(): Promise<any>;
     vercelConnect(): Promise<any>;
     vercelDisconnect(): Promise<any>;
-    vercelPublish(projectName?: string): Promise<any>;
+    vercelUnlink(): Promise<any>;
+    vercelRequestPublishIntent(projectName?: string): Promise<{ intentId: string; expiresAt: number; projectPath: string }>;
+    vercelPublish(payload?: { intentId?: string; customProjectName?: string } | string): Promise<any>;
     vercelOpenDeployment(): Promise<{ success: boolean }>;
     vercelOpenDashboard(): Promise<{ success: boolean }>;
     onVercelStateChange(callback: (state: any) => void): () => void;

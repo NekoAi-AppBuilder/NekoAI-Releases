@@ -124,6 +124,7 @@ This folder is connected to Supabase project \`${projectRef}\` through MCP serve
 - Use the Supabase MCP tools automatically for database and platform operations.
 - Inspect existing tables and migrations before changing the schema.
 - Prefer named migrations for DDL changes so schema history remains auditable.
+- When applying a migration, NekoAI automatically presents a Database Migration Card to the user for explicit review and approval prior to execution.
 - Always enable and review Row Level Security (RLS) for application tables.
 - Never request or write a secret key, service_role key, database password or access token into the project.
 - Ask the user for explicit confirmation before DROP, TRUNCATE, destructive ALTER, mass DELETE/UPDATE, branch reset or any irreversible operation.

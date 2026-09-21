@@ -40,5 +40,7 @@ export function normalizeOpenCodeEvent(event: any) {
   const path = props?.path ?? props?.filePath ?? (typeof props?.file === "string" ? props.file : props?.file?.path);
   if (path && shouldIgnoreEventPath(path)) return null;
 
-  return normalizeActivity(type, props) ?? event;
+  const sessionID = props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? event?.sessionID ?? event?.sessionId;
+  const taskId = props?.taskId ?? event?.taskId;
+  return normalizeActivity(type, { ...props, sessionID, taskId }) ?? event;
 }

@@ -59,6 +59,7 @@ export interface SupabaseState {
   region?: string | null;
   pendingRuntimeSetup?: boolean;
   recentCreatedNotice?: string | null;
+  usedProjectRefs?: string[];
   error: string | null;
   structuredError?: SupabaseStructuredError | null;
 }
@@ -101,5 +102,6 @@ export const EMPTY_SUPABASE_STATE: SupabaseState = {
   projectUrl: null,
   region: null,
   pendingRuntimeSetup: false,
+  usedProjectRefs: [],
   error: null,
 };

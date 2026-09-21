@@ -9,6 +9,7 @@ import {
   isValidVercelProjectName,
 } from "./vercel-types";
 import { VercelVaultManager } from "./vercel-vault";
+import { vercelIntentManager } from "./vercel-intent";
 import {
   VercelCli,
   cleanVercelOutput,
@@ -125,6 +126,9 @@ export class VercelManager extends EventEmitter {
       } else {
         // Different account: verify ownership/access before restoring
         let hasAccess = false;
+        if (!this.cli && this.cliWrapper?.resolveCli) {
+          this.cli = await this.cliWrapper.resolveCli().catch(() => null);
+        }
         if (this.cli && deployment.projectName) {
           try {
             const listRes = await this.cliWrapper.runCli(this.cli, ["project", "ls"], undefined, 15000);
@@ -144,6 +148,10 @@ export class VercelManager extends EventEmitter {
           });
         } else {
           // Account B does not have access to Account A's project
+          // Remove stale .vercel/project.json to avoid 403 on subsequent publish
+          const vercelDir = path.join(projectPath, ".vercel");
+          await fs.rm(vercelDir, { recursive: true, force: true }).catch(() => {});
+          this.deploymentUrls.delete(projectPath);
           this.setState({
             projectName: path.basename(projectPath),
             deploymentUrl: null,
@@ -158,6 +166,7 @@ export class VercelManager extends EventEmitter {
 
   public async setProject(projectPath: string | null): Promise<void> {
     const generation = ++this.projectGeneration;
+    vercelIntentManager.invalidateAll("project changed");
     if (!projectPath) {
       this.setState({
         projectPath: null,
@@ -180,6 +189,9 @@ export class VercelManager extends EventEmitter {
     if (this.state.username && deployment?.username && deployment.username !== this.state.username) {
       // Different account connected! Verify access
       let hasAccess = false;
+      if (!this.cli && this.cliWrapper?.resolveCli) {
+        this.cli = await this.cliWrapper.resolveCli().catch(() => null);
+      }
       if (this.cli && deployment.projectName) {
         try {
           const listRes = await this.cliWrapper.runCli(this.cli, ["project", "ls"], undefined, 15000);
@@ -198,6 +210,11 @@ export class VercelManager extends EventEmitter {
           error: null,
         });
       } else {
+        // Account B does not have access to Account A's project
+        // Remove stale .vercel/project.json so future publish links cleanly
+        const vercelDir = path.join(projectPath, ".vercel");
+        await fs.rm(vercelDir, { recursive: true, force: true }).catch(() => {});
+        this.deploymentUrls.delete(projectPath);
         this.setState({
           projectPath,
           projectName: path.basename(projectPath),
@@ -222,6 +239,7 @@ export class VercelManager extends EventEmitter {
 
   public async unlinkProject(projectPath: string): Promise<VercelState> {
     if (!projectPath) return this.getState();
+    vercelIntentManager.invalidateByPath(projectPath, "project unlinked");
     const vercelDir = path.join(projectPath, ".vercel");
     await fs.rm(vercelDir, { recursive: true, force: true }).catch(() => {});
     await this.vault.removeDeployment(projectPath);
@@ -241,6 +259,7 @@ export class VercelManager extends EventEmitter {
 
   public async disconnect(): Promise<VercelState> {
     console.log("[Neko/Vercel] disconnect requested");
+    vercelIntentManager.invalidateAll("account disconnected");
     this.authAttempt += 1;
     await this.authTask?.catch(() => undefined);
     this.authTask = null;
@@ -376,36 +395,7 @@ export class VercelManager extends EventEmitter {
         if (!projectNameToUse || !isValidVercelProjectName(projectNameToUse)) {
           throw new Error("Nome do projeto Vercel inválido.");
         }
-
-        this.emit("log", `Configurando projeto "${projectNameToUse}" na Vercel...`);
-        try {
-          await this.cliWrapper.runCli(
-            this.cli,
-            ["project", "add", projectNameToUse],
-            projectPath,
-            60000,
-            (line) => this.emit("log", line)
-          );
-        } catch (addErr: any) {
-          const addMsg = String(addErr?.message || "").toLowerCase();
-          if (!addMsg.includes("already exists") && !addMsg.includes("already in use")) {
-            console.warn("[Neko/Vercel] project add note:", addErr?.message);
-          }
-        }
-
-        try {
-          await this.cliWrapper.runCli(
-            this.cli,
-            ["link", "--yes", "--project", projectNameToUse],
-            projectPath,
-            60000,
-            (line) => this.emit("log", line)
-          );
-        } catch (linkErr: any) {
-          throw new Error(formatVercelErrorMessage(linkErr?.message));
-        }
-
-        isLinked = await this.pathExists(projectJsonPath);
+        isLinked = await this.ensureLinked(projectPath, projectNameToUse);
       }
 
       const args = ["deploy", "--prod", "--yes"];
@@ -460,6 +450,50 @@ export class VercelManager extends EventEmitter {
     }
   }
 
+  public async ensureLinked(projectPath: string, projectName: string): Promise<boolean> {
+    const projectJsonPath = path.join(projectPath, ".vercel", "project.json");
+    if (await this.pathExists(projectJsonPath)) return true;
+
+    const projectNameToUse = projectName?.trim();
+    if (!projectNameToUse || !isValidVercelProjectName(projectNameToUse)) {
+      throw new Error("Nome do projeto Vercel inválido.");
+    }
+
+    if (!this.cli) this.cli = await this.cliWrapper.resolveCli();
+    if (!this.cli) {
+      throw new Error("O Vercel CLI não está disponível porque o npm não foi encontrado.");
+    }
+
+    this.emit("log", `Configurando projeto "${projectNameToUse}" na Vercel...`);
+    try {
+      await this.cliWrapper.runCli(
+        this.cli,
+        ["project", "add", projectNameToUse],
+        projectPath,
+        60000,
+        (line) => this.emit("log", line)
+      );
+    } catch (addErr: any) {
+      const addMsg = String(addErr?.message || "").toLowerCase();
+      if (!addMsg.includes("already exists") && !addMsg.includes("already in use")) {
+        console.warn("[Neko/Vercel] project add note:", addErr?.message);
+      }
+    }
+
+    try {
+      await this.cliWrapper.runCli(
+        this.cli,
+        ["link", "--yes", "--project", projectNameToUse],
+        projectPath,
+        60000,
+        (line) => this.emit("log", line)
+      );
+    } catch (linkErr: any) {
+      throw new Error(formatVercelErrorMessage(linkErr?.message));
+    }
+
+    return await this.pathExists(projectJsonPath);
+  }
 
   public async readUsername(): Promise<string | null> {
     if (!this.cli) return null;
