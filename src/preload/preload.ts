@@ -83,8 +83,15 @@ contextBridge.exposeInMainWorld("neko", {
   githubCloneProject: (repoFullName: string, parentPath?: string, projectName?: string) => ipcRenderer.invoke("github:cloneProject", { repoFullName, parentPath, projectName }),
   githubPublishProject: (repoName: string, isPrivate = true) => ipcRenderer.invoke("github:publishProject", { repoName, private: isPrivate }),
   githubCancelPublish: () => ipcRenderer.invoke("github:cancelPublish"),
-    githubAutoCommitTask: (sessionId: string, message: string) => ipcRenderer.invoke("github:autoCommitTask", { sessionId, message }),
-    githubGetDefaultBranch: () => ipcRenderer.invoke("github:getDefaultBranch"),
+  githubAutoCommitTask: (payload?: { projectPath?: string; taskId?: string; message?: string } | string, legacyMessage?: string) => {
+    if (typeof payload === "string") {
+      return ipcRenderer.invoke("github:autoCommitTask", { taskId: payload, message: legacyMessage });
+    }
+    return ipcRenderer.invoke("github:autoCommitTask", payload || {});
+  },
+  githubGetAutoCommit: (projectPath?: string) => ipcRenderer.invoke("github:getAutoCommit", projectPath),
+  githubSetAutoCommit: (projectPath: string, enabled: boolean) => ipcRenderer.invoke("github:setAutoCommit", { projectPath, enabled }),
+  githubGetDefaultBranch: () => ipcRenderer.invoke("github:getDefaultBranch"),
   githubCommitPush: (message: string) => ipcRenderer.invoke("github:commitPush", { message }),
   githubCreatePullRequest: (repoFullName: string, head: string, base: string, title: string, body: string) => ipcRenderer.invoke("github:createPullRequest", { repoFullName, head, base, title, body }),
   githubDiscardChanges: () => ipcRenderer.invoke("github:discardChanges"),
@@ -105,9 +112,13 @@ contextBridge.exposeInMainWorld("neko", {
   onSupabaseStateChange: (callback: (state: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("supabase:state-changed", listener); return () => ipcRenderer.removeListener("supabase:state-changed", listener); },
   onSupabaseMigrationEvent: (callback: (event: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("supabase:migration-event", listener); return () => ipcRenderer.removeListener("supabase:migration-event", listener); },
   vercelGetState: () => ipcRenderer.invoke("vercel:get-state"),
+  vercelDetectProject: (gitRepoOverride?: string) => ipcRenderer.invoke("vercel:detect-project", gitRepoOverride),
   vercelConnect: () => ipcRenderer.invoke("vercel:connect"),
+  vercelCancelLogin: () => ipcRenderer.invoke("vercel:cancel-login"),
   vercelDisconnect: () => ipcRenderer.invoke("vercel:disconnect"),
   vercelUnlink: () => ipcRenderer.invoke("vercel:unlink"),
+  vercelRequestLinkIntent: (detectedProjectId?: string) => ipcRenderer.invoke("vercel:request-link-intent", detectedProjectId),
+  vercelUseDetectedProject: (payload: { intentId: string }) => ipcRenderer.invoke("vercel:use-detected-project", payload),
   vercelRequestPublishIntent: (projectName?: string) => ipcRenderer.invoke("vercel:request-publish-intent", projectName),
   vercelPublish: (payload?: { intentId?: string; customProjectName?: string } | string) => ipcRenderer.invoke("vercel:publish", payload),
   vercelOpenDeployment: () => ipcRenderer.invoke("vercel:open-deployment"),
@@ -132,6 +143,25 @@ contextBridge.exposeInMainWorld("neko", {
     const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
     ipcRenderer.on("updater:state-changed", listener);
     return () => ipcRenderer.removeListener("updater:state-changed", listener);
+  },
+  lovableGetState: () => ipcRenderer.invoke("lovable:get-state"),
+  lovableOpenLogin: () => ipcRenderer.invoke("lovable:open-login"),
+  lovableLinkProject: (projectId?: string) => ipcRenderer.invoke("lovable:link-project", projectId),
+  lovableUnlink: () => ipcRenderer.invoke("lovable:unlink"),
+  lovableTestConnection: () => ipcRenderer.invoke("lovable:test-connection"),
+  onLovableStateChange: (callback: (state: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
+    ipcRenderer.on("lovable:state-changed", listener);
+    return () => ipcRenderer.removeListener("lovable:state-changed", listener);
+  },
+  windowMinimize: () => ipcRenderer.invoke("window:minimize"),
+  windowToggleMaximize: () => ipcRenderer.invoke("window:toggleMaximize"),
+  windowIsMaximized: () => ipcRenderer.invoke("window:isMaximized"),
+  windowClose: () => ipcRenderer.invoke("window:close"),
+  onWindowMaximizedChange: (callback: (isMaximized: boolean) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, isMaximized: boolean) => callback(isMaximized);
+    ipcRenderer.on("window:maximized-change", listener);
+    return () => ipcRenderer.removeListener("window:maximized-change", listener);
   }
 });
 

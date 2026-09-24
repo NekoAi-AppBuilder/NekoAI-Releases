@@ -68,6 +68,9 @@ interface Window {
     githubPublishProject(repoName: string, isPrivate?: boolean): Promise<any>;
     githubCancelPublish?(): Promise<any>;
     githubCommitPush(message: string): Promise<any>;
+    githubAutoCommitTask?(payload?: { projectPath?: string; taskId?: string; message?: string } | string, legacyMessage?: string): Promise<{ ok: boolean; committed?: boolean; pushed?: boolean; status?: any; message?: string; skipped?: boolean; reason?: string }>;
+    githubGetAutoCommit?(projectPath?: string): Promise<boolean>;
+    githubSetAutoCommit?(projectPath: string, enabled: boolean): Promise<{ ok: boolean; enabled: boolean }>;
     githubGetDefaultBranch(): Promise<string | null>;
     githubCreatePullRequest(repoFullName: string, head: string, base: string, title?: string, body?: string): Promise<{ ok: boolean; error?: string; html_url?: string }>;
     onGithubEvent(callback: (event: any) => void): () => void;
@@ -86,9 +89,13 @@ interface Window {
     onSupabaseStateChange(callback: (state: any) => void): () => void;
     onSupabaseMigrationEvent?(callback: (event: { type: string; payload: any }) => void): () => void;
     vercelGetState(): Promise<any>;
+    vercelDetectProject(gitRepoOverride?: string): Promise<any>;
     vercelConnect(): Promise<any>;
+    vercelCancelLogin(): Promise<any>;
     vercelDisconnect(): Promise<any>;
     vercelUnlink(): Promise<any>;
+    vercelRequestLinkIntent(detectedProjectId?: string): Promise<{ intentId: string; expiresAt: number; projectPath: string; projectName?: string }>;
+    vercelUseDetectedProject(payload: { intentId: string }): Promise<any>;
     vercelRequestPublishIntent(projectName?: string): Promise<{ intentId: string; expiresAt: number; projectPath: string }>;
     vercelPublish(payload?: { intentId?: string; customProjectName?: string } | string): Promise<any>;
     vercelOpenDeployment(): Promise<{ success: boolean }>;
@@ -177,6 +184,21 @@ interface Window {
       error: string | null;
       lastCheckedAt: number | null;
     }) => void): () => void;
+    lovableGetState(): Promise<{
+      status: "disconnected" | "detecting" | "authorizing" | "validating" | "connected" | "error";
+      isLovableProject: boolean;
+      detectionReason?: string;
+      detectedProjectId: string | null;
+      projectId: string | null;
+      userEmail: string | null;
+      connectedAt: number | null;
+      error: string | null;
+    }>;
+    lovableOpenLogin(): Promise<void>;
+    lovableLinkProject(projectId?: string): Promise<any>;
+    lovableUnlink(): Promise<any>;
+    lovableTestConnection(): Promise<{ success: boolean; error?: string }>;
+    onLovableStateChange(callback: (state: any) => void): () => void;
   };
 }
 

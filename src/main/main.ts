@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeImage, safeStorage, shell, WebContentsView, webFrameMain, type OpenDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, shell, WebContentsView, webFrameMain, type OpenDialogOptions } from "electron";
 import path from "node:path";
 import http from "node:http";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
@@ -15,11 +15,14 @@ import { isReadOnlySql, classifySqlRisk } from "./security/sql-guard";
 import { parseSupabaseError } from "./supabase/supabase-cli";
 import { SupabaseCreateProjectPayload } from "./supabase/supabase-types";
 import { vercelManager, getSupabaseEnvironmentNames } from "./vercel/vercel-manager";
-import { vercelIntentManager } from "./vercel/vercel-intent";
-import { isValidVercelProjectName } from "./vercel/vercel-types";
+import { vercelIntentManager, vercelLinkIntentManager } from "./vercel/vercel-intent";
+import { isValidVercelProjectName, normalizeGithubRepo } from "./vercel/vercel-types";
 import { licenseManager } from "./license/license-manager";
 import { updaterManager } from "./updater";
+import { lovableCloudManager } from "./lovable/lovable-cloud-manager";
+import { lovableMcpServer, writeLovableOpenCodeConfig, removeLovableOpenCodeConfig } from "./lovable/lovable-mcp-server";
 import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES } from "../shared/vision";
+import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
 import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession } from "./vision-fallback";
 import { discoverPreviewRoutes, routeFromUrl, normalizeRoutePath, isDynamicSegment, type PreviewRoute } from "./preview-routes";
 import { analyzeSite, cancelAllSiteClones, importSiteAssets, type SiteCloneAnalysis, type SiteCloneLimits } from "./site-clone";
@@ -1112,7 +1115,10 @@ function extractAgentError(raw: any) {
 function isRecoverableAgentError(raw: any) {
   const { statusCode, message, retryable } = extractAgentError(raw);
   if (retryable === false) return false;
-  // Erros definitivos de cota, plano, saldo ou cancelamento/abort nunca são recuperáveis
+  // Erros definitivos de incompatibilidade de modelo, cota, plano, saldo ou cancelamento/abort nunca são recuperáveis
+  if (isModelIncompatibilityError(message)) {
+    return false;
+  }
   if (/free usage exceeded|subscribe to go|quota exceeded|insufficient quota|credit balance|usage limit|nekoaborted|\babort(ed)?\b/i.test(message)) {
     return false;
   }
@@ -1279,6 +1285,7 @@ type GitStatus = {
   remote: string | null;
   linkedRepo: string | null;
   dirty: boolean;
+  unpushed?: boolean;
   changedFiles?: GitChangedFile[];
   summary?: GitStatusSummary;
 };
@@ -1326,6 +1333,77 @@ async function getGithubAccessToken(): Promise<string> {
 
   if (!auth?.token) throw new Error("GitHub não está conectado.");
   return auth.token;
+}
+
+type GithubErrorCategory =
+  | "permission_update_needed"
+  | "repo_access_denied"
+  | "auth_expired"
+  | "repo_not_found"
+  | "generic_error";
+
+function categorizeGithubError(error: any): { category: GithubErrorCategory; userMessage: string; rawMessage: string } {
+  const rawMsg = String(error?.message ?? error ?? "").trim();
+  const lower = rawMsg.toLowerCase();
+
+  // 1. Permission Update Needed (GitHub App Installation Permission Update)
+  if (
+    lower.includes("resource not accessible by integration") ||
+    lower.includes("permission updates requested") ||
+    lower.includes("integration permission") ||
+    (lower.includes("403") && lower.includes("integration"))
+  ) {
+    return {
+      category: "permission_update_needed",
+      userMessage: "Permissões do GitHub precisam de aprovação. O NekoAI solicitou novas permissões para o GitHub App, mas esta instalação ainda não aprovou a atualização no GitHub.",
+      rawMessage: rawMsg
+    };
+  }
+
+  // 2. Authentication Expired / Revoked
+  if (
+    lower.includes("401") ||
+    lower.includes("unauthorized") ||
+    lower.includes("autorização do github expirou") ||
+    lower.includes("invalid username or token")
+  ) {
+    return {
+      category: "auth_expired",
+      userMessage: "A autorização do GitHub expirou ou foi revogada. Conecte sua conta do GitHub novamente.",
+      rawMessage: rawMsg
+    };
+  }
+
+  // 3. Repository Access Denied (HTTP 403 specific to repo/user)
+  if (
+    (lower.includes("permission to") && lower.includes("denied")) ||
+    (lower.includes("403") && (lower.includes("forbidden") || lower.includes("access denied")))
+  ) {
+    return {
+      category: "repo_access_denied",
+      userMessage: "Você não possui permissão de acesso a este repositório no GitHub. Verifique as permissões da sua conta ou organização.",
+      rawMessage: rawMsg
+    };
+  }
+
+  // 4. Repository Not Found (HTTP 404)
+  if (
+    lower.includes("repository not found") ||
+    lower.includes("não foi encontrado") ||
+    (lower.includes("404") && !lower.includes("pull request"))
+  ) {
+    return {
+      category: "repo_not_found",
+      userMessage: "Repositório não encontrado ou inacessível para a conta conectada no GitHub.",
+      rawMessage: rawMsg
+    };
+  }
+
+  return {
+    category: "generic_error",
+    userMessage: rawMsg || "Erro de comunicação com o GitHub.",
+    rawMessage: rawMsg
+  };
 }
 
 function formatGitHubGitError(result: { code: number; stdout: string; stderr: string }, action: string) {
@@ -1645,6 +1723,48 @@ async function githubApi(pathname: string, init: RequestInit = {}) {
 }
 
 
+function getGitExecutablePath(): string {
+  // 1) Explicit override via environment variable
+  if (process.env.NEKO_GIT_PATH) {
+    const override = path.resolve(process.env.NEKO_GIT_PATH);
+    if (fs.existsSync(override)) return override;
+    console.warn("[Neko/Git] NEKO_GIT_PATH foi configurado mas não existe:", override);
+  }
+
+  const candidateRelativePaths = process.platform === "win32"
+    ? [
+        path.join("tools", "git", "cmd", "git.exe"),
+        path.join("tools", "git", "mingw64", "bin", "git.exe"),
+        path.join("tools", "git", "git.exe"),
+        path.join("tools", "git.exe")
+      ]
+    : [
+        path.join("tools", "git", "bin", "git"),
+        path.join("tools", "git", "git")
+      ];
+
+  // 2) Source / development build: <project>/tools/git/cmd/git.exe
+  for (const rel of candidateRelativePaths) {
+    const projectTools = path.resolve(__dirname, "..", "..", rel);
+    if (fs.existsSync(projectTools)) return projectTools;
+  }
+
+  // 3) Packaged Electron app: process.resourcesPath/tools/git/cmd/git.exe
+  if (process.resourcesPath) {
+    for (const rel of candidateRelativePaths) {
+      const packagedTools = path.join(process.resourcesPath, rel);
+      if (fs.existsSync(packagedTools)) return packagedTools;
+    }
+  }
+
+  // 4) Development fallback: search system PATH
+  const resolved = resolveExecutableFromPath("git");
+  if (resolved) return resolved;
+
+  // 5) Default fallback
+  return "git";
+}
+
 function runGit(
   projectPath: string,
   args: string[],
@@ -1660,11 +1780,22 @@ function runGit(
     let resolved = false;
     let timer: NodeJS.Timeout | null = null;
 
-    const child = spawn("git", args, {
+    const gitExecutable = getGitExecutablePath();
+    const gitBinDir = path.dirname(gitExecutable);
+    const gitRootDir = path.dirname(gitBinDir);
+    const mingwBin = path.join(gitRootDir, "mingw64", "bin");
+    const usrBin = path.join(gitRootDir, "usr", "bin");
+    const cmdDir = path.join(gitRootDir, "cmd");
+
+    const customPath = fs.existsSync(mingwBin)
+      ? `${cmdDir}${path.delimiter}${mingwBin}${path.delimiter}${usrBin}${path.delimiter}${process.env.PATH || ""}`
+      : process.env.PATH;
+
+    const child = spawn(gitExecutable, args, {
       cwd: projectPath,
       windowsHide: true,
       shell: false,
-      env: { ...process.env, ...extraEnv },
+      env: { ...process.env, PATH: customPath, ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"]
     });
 
@@ -1751,10 +1882,10 @@ async function runGitWithGithubAuth(
     // short-lived askpass helper. It is never placed in Git's command-line
     // arguments, remote URLs, or .git/config.
     if (process.platform === "win32") {
-      const script = "@echo off\r\necho %NEKO_GITHUB_TOKEN%\r\n";
+      const script = `@echo off\r\nset "PROMPT_TEXT=%~1"\r\nif "%PROMPT_TEXT:~0,8%"=="Username" (\r\n  echo x-access-token\r\n) else (\r\n  echo %NEKO_GITHUB_TOKEN%\r\n)\r\n`;
       await fs.promises.writeFile(askpassPath, script, { encoding: "utf8", mode: 0o700 });
     } else {
-      const script = "#!/bin/sh\nprintf '%s\\n' \"$NEKO_GITHUB_TOKEN\"\n";
+      const script = `#!/bin/sh\ncase "$1" in\n  *Username*) echo "x-access-token" ;;\n  *) printf '%s\\n' "$NEKO_GITHUB_TOKEN" ;;\nesac\n`;
       await fs.promises.writeFile(askpassPath, script, { encoding: "utf8", mode: 0o700 });
       await fs.promises.chmod(askpassPath, 0o700);
     }
@@ -1775,6 +1906,7 @@ async function runGitWithGithubAuth(
       GIT_ASKPASS: askpassPath,
       GIT_ASKPASS_REQUIRE: "force",
       GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "never",
       NEKO_GITHUB_TOKEN: token
     }, timeoutMs, signal);
   } finally {
@@ -1857,20 +1989,21 @@ function isProtectedFromDiscard(relPath: string): boolean {
   return GIT_PROTECTED_DISCARD_PATTERNS.some(pattern => pattern.test(base) || pattern.test(normalized));
 }
 
-async function getGitStatus(): Promise<GitStatus> {
+async function getGitStatus(targetProject?: string): Promise<GitStatus> {
   const emptySummary: GitStatusSummary = { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 };
-  if (!currentProject) {
+  const projectPath = targetProject ? assertProjectRootSafe(targetProject, "git-read") : currentProject;
+  if (!projectPath) {
     return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, changedFiles: [], summary: emptySummary };
   }
 
-  const inside = await runGit(currentProject, ["rev-parse", "--is-inside-work-tree"], {}, 10000);
+  const inside = await runGit(projectPath, ["rev-parse", "--is-inside-work-tree"], {}, 10000);
   if (inside.code !== 0 || inside.stdout !== "true") {
     return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, changedFiles: [], summary: emptySummary };
   }
 
-  const branchResult = await runGit(currentProject, ["branch", "--show-current"], {}, 10000);
-  const remoteResult = await runGit(currentProject, ["remote", "get-url", "origin"], {}, 10000);
-  const dirtyResult = await runGit(currentProject, ["status", "--porcelain", "-uall"], {}, 15000);
+  const branchResult = await runGit(projectPath, ["branch", "--show-current"], {}, 10000);
+  const remoteResult = await runGit(projectPath, ["remote", "get-url", "origin"], {}, 10000);
+  const dirtyResult = await runGit(projectPath, ["status", "--porcelain", "-uall"], {}, 15000);
 
   const parsed = parseGitStatusPorcelain(dirtyResult.stdout);
 
@@ -1879,16 +2012,27 @@ async function getGitStatus(): Promise<GitStatus> {
     ? remote
         .replace(/^git@github\.com:/i, "")
         .replace(/^https?:\/\/github\.com\//i, "")
+        .replace(/\/+$/, "")
         .replace(/\.git$/i, "")
         .replace(/\/+$/, "")
     : null;
 
+  const currentBranch = branchResult.code === 0 && branchResult.stdout ? branchResult.stdout : null;
+  let unpushed = false;
+  if (currentBranch && remote) {
+    const aheadCheck = await runGit(projectPath, ["rev-list", "--count", `origin/${currentBranch}..${currentBranch}`], {}, 5000);
+    if (aheadCheck.code === 0 && parseInt(aheadCheck.stdout.trim(), 10) > 0) {
+      unpushed = true;
+    }
+  }
+
   return {
     initialized: true,
-    branch: branchResult.code === 0 && branchResult.stdout ? branchResult.stdout : null,
+    branch: currentBranch,
     remote,
     linkedRepo,
     dirty: parsed.files.length > 0,
+    unpushed,
     changedFiles: parsed.files,
     summary: parsed.summary
   };
@@ -1915,13 +2059,39 @@ async function getGithubStatus() {
     // GitHub App user access tokens do NOT use OAuth scopes. Their effective
     // permissions come from the GitHub App + the user's approved installation.
     // The installation endpoint exposes the permissions actually granted.
+    console.log(`[GitHub Install] Checking installation for user @${user.login}`);
     const installations: any[] = [];
-    for (let page = 1; ; page++) {
-      const installationsResponse = await githubApi(`/user/installations?per_page=100&page=${page}`);
-      const installationsJson: any = await installationsResponse.json();
-      const pageItems = Array.isArray(installationsJson?.installations) ? installationsJson.installations : [];
-      installations.push(...pageItems);
-      if (pageItems.length < 100) break;
+    let installationsFailed = false;
+    let installationsErrorMsg = "";
+
+    try {
+      for (let page = 1; ; page++) {
+        const installationsResponse = await githubApi(`/user/installations?per_page=100&page=${page}`);
+        const installationsJson: any = await installationsResponse.json();
+        const pageItems = Array.isArray(installationsJson?.installations) ? installationsJson.installations : [];
+        installations.push(...pageItems);
+        if (pageItems.length < 100) break;
+      }
+    } catch (err: any) {
+      installationsFailed = true;
+      installationsErrorMsg = err?.message || String(err);
+      console.warn("[GitHub Install] Failed to query /user/installations:", installationsErrorMsg);
+    }
+
+    // If querying installations failed due to network/API error, do NOT mark as missing installation
+    if (installationsFailed) {
+      const defaultInstallUrl = `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`;
+      return {
+        connected: true,
+        user,
+        repos: [],
+        needsInstallation: false,
+        needsReauthorization: false,
+        needsPermissions: false,
+        capabilities: { canReadRepositories: false, canWriteContents: false, canCreateRepository: false },
+        installUrl: defaultInstallUrl,
+        error: `Não foi possível consultar as instalações do GitHub: ${installationsErrorMsg}`
+      };
     }
 
     const appInstallations = installations.filter((installation: any) => {
@@ -1940,6 +2110,8 @@ async function getGithubStatus() {
     };
 
     if (appInstallations.length === 0) {
+      const newInstallUrl = `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`;
+      console.log(`[GitHub Install] Installation missing for ${GITHUB_APP_SLUG} (user @${user.login})`);
       return {
         connected: true,
         user,
@@ -1947,17 +2119,21 @@ async function getGithubStatus() {
         needsInstallation: true,
         needsReauthorization: false,
         capabilities,
-        installUrl: `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`
+        installUrl: newInstallUrl
       };
     }
 
+    const firstInst = appInstallations[0];
+    const installationId = Number(firstInst?.id);
+    console.log(`[GitHub Install] Installation found: id=${installationId || "unknown"}, slug=${firstInst?.app_slug || GITHUB_APP_SLUG}`);
+
     const repoMap = new Map<number, GithubRepo>();
     for (const installation of appInstallations) {
-      const installationId = Number(installation?.id);
-      if (!installationId) continue;
+      const instId = Number(installation?.id);
+      if (!instId) continue;
 
       for (let page = 1; ; page++) {
-        const reposResponse = await githubApi(`/user/installations/${installationId}/repositories?per_page=100&page=${page}`);
+        const reposResponse = await githubApi(`/user/installations/${instId}/repositories?per_page=100&page=${page}`);
         const reposJson: any = await reposResponse.json();
         const repos = Array.isArray(reposJson?.repositories) ? reposJson.repositories : [];
 
@@ -1976,11 +2152,12 @@ async function getGithubStatus() {
       }
     }
 
-    // Missing repository permissions are a configuration/approval issue, not
-    // an OAuth-scope issue. Do not create a reauthorization loop for valid
-    // GitHub App user tokens.
-    const needsPermissions = !capabilities.canWriteContents || !capabilities.canCreateRepository;
+    const primaryInstallUrl = firstInst?.html_url || (firstInst?.id ? `https://github.com/settings/installations/${firstInst.id}` : `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`);
 
+    const hasPullRequestsWrite = permissionsList.some((permissions: any) => String(permissions.pull_requests || "").toLowerCase() === "write");
+    const needsPermissions = !capabilities.canWriteContents || !capabilities.canCreateRepository || !hasPullRequestsWrite;
+
+    console.log(`[GitHub Install] Installation confirmed: ${repoMap.size} repositories accessible`);
     return {
       connected: true,
       user,
@@ -1989,7 +2166,7 @@ async function getGithubStatus() {
       needsReauthorization: false,
       needsPermissions,
       capabilities,
-      installUrl: `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`
+      installUrl: primaryInstallUrl
     };
   } catch (error) {
     return { connected: false, repos: [], error: error instanceof Error ? error.message : String(error) };
@@ -3377,7 +3554,7 @@ const IGNORED = new Set([
 
 async function readTree(projectPath: string, relative = ""): Promise<any[]> {
   const absolute = safePathWithinProject(projectPath, relative);
-  const entries = await fs.promises.readdir(absolute, { withFileTypes: true });
+  const entries = await fs.promises.readdir(absolute, { withFileTypes: true }).catch(() => []);
   const result: any[] = [];
 
   for (const entry of entries.sort((a, b) => {
@@ -3404,8 +3581,91 @@ async function readTree(projectPath: string, relative = ""): Promise<any[]> {
   return result;
 }
 
+const SAFE_IGNORED_ENTRIES_FOR_CLONE = new Set([
+  ".git",
+  ".neko",
+  ".vscode",
+  ".idea",
+  ".ds_store",
+  "thumbs.db",
+  "desktop.ini"
+]);
+
+async function waitForClonedWorkspaceReady(projectPath: string, label = "GitHub Clone"): Promise<boolean> {
+  const maxAttempts = 120; // Up to 60 seconds (120 x 500ms) to allow OS/OneDrive filesystem indexing to settle
+  const delayMs = 500;
+  console.log(`[GitHub Clone FLOW] waiting for physical materialization: ${projectPath}`);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (fs.existsSync(projectPath)) {
+        const pkgJson = path.join(projectPath, "package.json");
+        const indexHtml = path.join(projectPath, "index.html");
+        const srcDir = path.join(projectPath, "src");
+
+        const entries = await fs.promises.readdir(projectPath, { withFileTypes: true }).catch(() => []);
+        const realEntries = entries.filter(e => {
+          const lower = e.name.toLowerCase();
+          return !SAFE_IGNORED_ENTRIES_FOR_CLONE.has(lower);
+        });
+
+        if (fs.existsSync(pkgJson) || fs.existsSync(indexHtml) || fs.existsSync(srcDir) || realEntries.length >= 2) {
+          logPreviewLifecycle("workspace settling completed", { realEntriesCount: realEntries.length, attempt });
+          console.log(`[GitHub Clone FLOW] physical materialization confirmed (attempt ${attempt}/${maxAttempts}, realEntries=${realEntries.length})`);
+          return true;
+        }
+      }
+    } catch (err) {
+      console.warn(`[${label}] Erro na tentativa ${attempt} de settling:`, err);
+    }
+
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+
+  logPreviewLifecycle("workspace settling timeout", { path: projectPath, maxAttempts });
+  console.warn(`[${label}] Tempo limite excedido ao aguardar materialização dos arquivos do projeto no disco.`);
+  throw new Error("O repositório foi clonado, mas os arquivos ainda não estão totalmente sincronizados no disco pelo sistema de arquivos. Tente reabrir o projeto.");
+}
+
+class StaleGenerationError extends Error {
+  constructor(gen: number, current: number) {
+    super(`Workspace scan stale: requested gen=${gen}, current gen=${current}`);
+    this.name = "StaleGenerationError";
+  }
+}
+
+async function readTreeWithSettling(projectPath: string, generation: number): Promise<any[]> {
+  const maxAttempts = 10;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (generation !== projectTransitionGeneration) {
+      logPreviewLifecycle("workspace scan stale", { requestedGeneration: generation, currentGeneration: projectTransitionGeneration });
+      throw new StaleGenerationError(generation, projectTransitionGeneration);
+    }
+    const tree = await readTree(projectPath);
+    if (tree.length > 0) return tree;
+
+    // Check if filesystem contains files or is in middle of clone flush
+    const rawEntries: string[] = await fs.promises.readdir(projectPath).catch((): string[] => []);
+    const visibleEntries = rawEntries.filter(e => !IGNORED.has(e));
+    if (visibleEntries.length > 0) {
+      await new Promise(r => setTimeout(r, 300));
+      continue;
+    }
+    // If rawEntries has .git or is empty right after clone, allow settling
+    if (attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  if (generation !== projectTransitionGeneration) {
+    logPreviewLifecycle("workspace scan stale", { requestedGeneration: generation, currentGeneration: projectTransitionGeneration });
+    throw new StaleGenerationError(generation, projectTransitionGeneration);
+  }
+  return await readTree(projectPath);
+}
+
 type PreviewManagerState = {
   status: "idle" | "detecting" | "installing" | "starting" | "ready" | "error" | "stopped";
+  phase?: string;
   framework: string | null;
   packageManager: string | null;
   port: number | null;
@@ -3583,7 +3843,15 @@ async function resolvePreviewProjectRoot(workspacePath: string, maxDepth = 3): P
       const pkg = await readPackage(current.dir);
       if (pkg) {
         const scripts = pkg.scripts || {};
-        const hasDev = Boolean(scripts.dev || scripts.start || scripts.serve || scripts.preview);
+        let hasDev = Boolean(scripts.dev || scripts.start || scripts.serve || scripts.preview || scripts["dev:client"] || scripts["start:dev"] || scripts["serve:dev"]);
+        if (!hasDev) {
+          for (const scriptCmd of Object.values(scripts)) {
+            if (typeof scriptCmd === "string" && /\b(vite|next|astro|nuxt|remix|react-scripts|webpack|parcel|serve|nodemon|ts-node-dev|tsx)\b/i.test(scriptCmd)) {
+              hasDev = true;
+              break;
+            }
+          }
+        }
         candidates.push({ dir: current.dir, depth: current.depth, hasDev });
       }
     } catch {}
@@ -3607,7 +3875,7 @@ async function detectProject(projectPath: string) {
     return {
       exists: false,
       pkg: null,
-      framework: "Node",
+      framework: "Desconhecido",
       preferredPort: 3000,
       devScript: null,
       packageManager: "npm",
@@ -3616,7 +3884,7 @@ async function detectProject(projectPath: string) {
   }
 
   const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-  let framework = "Node";
+  let framework = "Node.js";
   let preferredPort = 3000;
   let runtimeEntry: string | null = null;
 
@@ -3625,21 +3893,43 @@ async function detectProject(projectPath: string) {
   else if (deps.remix || deps["@remix-run/react"]) { framework = "Remix"; preferredPort = 3000; runtimeEntry = "@remix-run/dev"; }
   else if (deps.nuxt) { framework = "Nuxt"; preferredPort = 3000; runtimeEntry = "nuxt"; }
   else if (deps.svelte || deps["@sveltejs/kit"]) { framework = "Svelte"; preferredPort = 5173; runtimeEntry = deps.vite ? "vite" : "@sveltejs/kit"; }
-  else if (deps.vue) { framework = "Vue"; preferredPort = 5173; runtimeEntry = deps.vite ? "vite" : "vue"; }
+  else if (deps.vue && deps.vite) { framework = "Vue (Vite)"; preferredPort = 5173; runtimeEntry = "vite"; }
+  else if (deps.vue) { framework = "Vue"; preferredPort = 5173; runtimeEntry = "vue"; }
+  else if (deps.react && deps.vite) { framework = "React (Vite)"; preferredPort = 5173; runtimeEntry = "vite"; }
   else if (deps["react-scripts"]) { framework = "Create React App"; preferredPort = 3000; runtimeEntry = "react-scripts"; }
+  else if (deps.react) { framework = "React"; preferredPort = 3000; runtimeEntry = "react"; }
+  else if (deps["@angular/core"]) { framework = "Angular"; preferredPort = 4200; runtimeEntry = "ng"; }
+  else if (deps["solid-js"]) { framework = "SolidJS"; preferredPort = 3000; runtimeEntry = "solid"; }
+  else if (deps.gatsby) { framework = "Gatsby"; preferredPort = 8000; runtimeEntry = "gatsby"; }
+  else if (deps.express || deps.fastify || deps.koa || deps.hono || deps["@nestjs/core"]) { framework = "Node API"; preferredPort = 3000; runtimeEntry = "node"; }
   else if (deps.vite) { framework = "Vite"; preferredPort = 5173; runtimeEntry = "vite"; }
 
   const scripts = pkg.scripts || {};
   let devScript: string | null = null;
+
   if (scripts.dev) devScript = "dev";
   else if (scripts.start) devScript = "start";
   else if (scripts.serve) devScript = "serve";
   else if (scripts.preview) devScript = "preview";
+  else if (scripts["dev:client"]) devScript = "dev:client";
+  else if (scripts["start:dev"]) devScript = "start:dev";
+  else if (scripts["serve:dev"]) devScript = "serve:dev";
+
+  if (!devScript) {
+    for (const [scriptName, scriptCmd] of Object.entries(scripts)) {
+      if (typeof scriptCmd === "string") {
+        const cmdLower = scriptCmd.toLowerCase();
+        if (/\b(vite|next|astro|nuxt|remix|react-scripts|webpack|parcel|serve|nodemon|ts-node-dev|tsx)\b/.test(cmdLower)) {
+          devScript = scriptName;
+          break;
+        }
+      }
+    }
+  }
 
   const files: string[] = await fs.promises.readdir(projectPath).catch((): string[] => []);
   let packageManager = "npm";
 
-  // Check packageManager field first (e.g. "pnpm@8.0.0", "yarn@3.0.0", "bun@1.0.0")
   if (typeof pkg.packageManager === "string") {
     const pmLower = pkg.packageManager.toLowerCase();
     if (pmLower.startsWith("pnpm")) packageManager = "pnpm";
@@ -3656,11 +3946,10 @@ async function detectProject(projectPath: string) {
     packageManager = "npm";
   }
 
-  // Infer runtime entry from dev script command if not found from deps
   if (!runtimeEntry && devScript && typeof scripts[devScript] === "string") {
     const cmd = scripts[devScript].trim();
     const firstWord = cmd.split(/\s+/)[0]?.toLowerCase();
-    if (["vite", "next", "astro", "nuxt", "remix", "react-scripts"].includes(firstWord)) {
+    if (["vite", "next", "astro", "nuxt", "remix", "react-scripts", "webpack", "ng", "gatsby"].includes(firstWord)) {
       runtimeEntry = firstWord;
     }
   }
@@ -3907,6 +4196,49 @@ async function detectProjectRuntime(workspacePath: string): Promise<ProjectRunti
   };
 }
 
+async function detectProjectRuntimeWithSettling(workspacePath: string, generation: number): Promise<ProjectRuntimeDescriptor> {
+  const root = path.resolve(workspacePath);
+  await waitForClonedProjectStructure(root, generation);
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    if (generation !== projectTransitionGeneration) break;
+    const runtime = await detectProjectRuntime(root);
+    if (runtime.type !== "UNSUPPORTED") return runtime;
+
+    const rawEntries: string[] = await fs.promises.readdir(root).catch((): string[] => []);
+    const hasPkg = rawEntries.includes("package.json");
+    const hasHtml = rawEntries.some(e => typeof e === "string" && e.toLowerCase().endsWith(".html"));
+    const hasSrc = rawEntries.includes("src");
+    const hasGit = rawEntries.includes(".git");
+    if (hasPkg || hasHtml || hasSrc || hasGit || rawEntries.length > 0) {
+      await new Promise(r => setTimeout(r, 150 * attempt));
+      continue;
+    }
+    if (attempt < 5) {
+      await new Promise(r => setTimeout(r, 150 * attempt));
+    }
+  }
+  return await detectProjectRuntime(root);
+}
+
+async function waitForClonedProjectStructure(workspacePath: string, generation: number): Promise<void> {
+  const neutralFiles = new Set([".git", ".gitkeep", "desktop.ini", "thumbs.db", ".ds_store"]);
+  const maxAttempts = 10;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (generation !== projectTransitionGeneration) break;
+    try {
+      const entries = await fs.promises.readdir(workspacePath);
+      const realEntries = entries.filter(e => !neutralFiles.has(e.toLowerCase()));
+      if (realEntries.length > 0) {
+        logPreviewLifecycle("workspace settling completed", { realEntriesCount: realEntries.length, attempt });
+        return;
+      }
+    } catch {}
+    if (attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+}
+
 async function hasDependencies(projectPath: string) {
   try {
     const stat = await fs.promises.stat(path.join(projectPath, "node_modules"));
@@ -3988,8 +4320,9 @@ async function removeNodeModules(projectPath: string): Promise<void> {
   console.log(`[Preview/Cleanup] completed (final attempt finished)`);
 }
 
-async function verifyRuntimeDependency(projectPath: string, info: any) {
+async function verifyRuntimeDependency(projectPath: string, info: any, packageManagerName?: string) {
   console.log(`[Preview/Install] validation started`);
+  const pm = packageManagerName || info.packageManager || "npm";
   const entry = info.runtimeEntry || (info.framework === "Vite" ? "vite" : null);
   
   // 1. Basic node_modules check
@@ -3997,11 +4330,23 @@ async function verifyRuntimeDependency(projectPath: string, info: any) {
   const nmExists = await fs.promises.stat(nmPath).then(s => s.isDirectory()).catch(() => false);
   if (!nmExists) {
     console.warn(`[Preview/Install] validation failed: diretório node_modules não existe.`);
+    logPreviewLifecycle("dependency validation", {
+      packageManager: pm,
+      nodeModulesExists: false,
+      viteResolvable: false,
+      runtimeValid: false
+    });
     throw new Error("Diretório node_modules não existe.");
   }
 
   if (!entry) {
     console.log(`[Preview/Install] validation passed (basic node_modules verified)`);
+    logPreviewLifecycle("dependency validation", {
+      packageManager: pm,
+      nodeModulesExists: true,
+      viteResolvable: true,
+      runtimeValid: true
+    });
     return;
   }
 
@@ -4010,18 +4355,75 @@ async function verifyRuntimeDependency(projectPath: string, info: any) {
   const pkgDirExists = await fs.promises.stat(pkgDir).then(s => s.isDirectory()).catch(() => false);
   if (!pkgDirExists) {
     console.warn(`[Preview/Install] validation failed: Pacote runtime '${entry}' não encontrado em node_modules.`);
+    logPreviewLifecycle("dependency validation", {
+      packageManager: pm,
+      nodeModulesExists: true,
+      viteResolvable: false,
+      runtimeValid: false
+    });
     throw new Error(`Pacote runtime '${entry}' não encontrado em node_modules.`);
   }
 
-  // 3. Deep runtime import validation via Node process
-  const script = `import(${JSON.stringify(entry)}).then(()=>process.exit(0)).catch((error)=>{console.error(error);process.exit(1)})`;
+  // 3. Deep runtime validation via Node process (testing both CommonJS createRequire and ESM import)
+  const script = `import { createRequire } from 'module';
+const require = createRequire(process.cwd() + '/package.json');
+try {
+  require.resolve(${JSON.stringify(entry)});
+} catch (e) {
+  console.error('CJS resolution failed for ' + ${JSON.stringify(entry)} + ':', e?.message || e);
+  process.exit(1);
+}
+import(${JSON.stringify(entry)}).then(() => {
+  process.exit(0);
+}).catch((err) => {
+  console.error('ESM import failed for ' + ${JSON.stringify(entry)} + ':', err?.message || err);
+  process.exit(1);
+});`;
   try {
-    await runCommand(process.platform === "win32" ? "node.exe" : "node", ["--input-type=module", "-e", script], projectPath, "Dependency-Check");
+    await runNodeCommand(projectPath, ["--input-type=module", "-e", script], "Dependency-Check");
     console.log(`[Preview/Install] validation passed`);
+    logPreviewLifecycle("dependency validation", {
+      packageManager: pm,
+      nodeModulesExists: true,
+      viteResolvable: true,
+      runtimeValid: true
+    });
   } catch (err: any) {
-    console.warn(`[Preview/Install] validation failed: erro ao importar '${entry}':`, err?.message || err);
+    console.warn(`[Preview/Install] validation failed: erro ao resolver '${entry}':`, err?.message || err);
+    logPreviewLifecycle("dependency validation", {
+      packageManager: pm,
+      nodeModulesExists: true,
+      viteResolvable: false,
+      runtimeValid: false
+    });
     throw new Error(`Validação de integridade do runtime '${entry}' falhou.`);
   }
+}
+
+async function runNodeCommand(cwd: string, args: string[], label: string) {
+  return new Promise<void>((resolve, reject) => {
+    const isWindows = process.platform === "win32";
+    const executable = isWindows ? "node.exe" : "node";
+    console.log(`[Neko/Preview/${label}] Executando diretamente (sem cmd.exe): ${executable} ${args[0]} -e <script>`);
+    const child = spawn(executable, args, { cwd, windowsHide: true, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", chunk => {
+      const text = chunk.toString();
+      stdout += text;
+      console.log(`[Neko/Preview/${label}]`, text);
+    });
+    child.stderr?.on("data", chunk => {
+      const text = chunk.toString();
+      stderr += text;
+      console.error(`[Neko/Preview/${label}]`, text);
+    });
+    child.on("error", reject);
+    child.on("exit", code => {
+      if (code === 0) resolve();
+      else reject(Object.assign(new Error(`${label} terminou com código ${code}.`), { code, stdout, stderr }));
+    });
+  });
 }
 
 function quoteWindowsArg(value: string) {
@@ -4103,43 +4505,111 @@ async function installDependencies(projectPath: string, packageManager: string) 
   console.log(`[Preview/Install] completed pm=${packageManager}`);
 }
 
-async function installDependenciesWithFallback(projectPath: string, preferredManager: string, info: any) {
-  // Step 1: Attempt installation with preferred package manager
+async function waitForFilesystemSettling(projectPath: string, info: any): Promise<void> {
+  const entry = info?.runtimeEntry || (info?.framework === "Vite" ? "vite" : null);
+  const nmPath = path.join(projectPath, "node_modules");
+  const targetCheck = entry ? path.join(nmPath, entry) : nmPath;
+
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    try {
+      const exists = await fs.promises.stat(targetCheck).then(() => true).catch(() => false);
+      if (exists) {
+        logPreviewLifecycle("filesystem settled after install", { targetCheck, attempt });
+        return;
+      }
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+}
+
+async function installDependenciesWithFallback(projectPath: string, preferredManager: string, info: any, targetGen?: number, sessionId?: number) {
+  if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
+  if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+
   let primaryPassed = false;
+  let primaryErrorMsg = "";
+
+  // Step 1: Attempt installation with preferred package manager (e.g. Bun)
   try {
+    emitPreview("preview.installing", {
+      status: "installing",
+      phase: "installing_dependencies",
+      packageManager: preferredManager,
+      framework: info.framework,
+      message: `Instalando dependências com ${preferredManager}...`
+    });
     await installDependencies(projectPath, preferredManager);
-    await verifyRuntimeDependency(projectPath, info);
+    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
+    if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+
+    await waitForFilesystemSettling(projectPath, info);
+    await verifyRuntimeDependency(projectPath, info, preferredManager);
     primaryPassed = true;
     return preferredManager;
   } catch (primaryErr: any) {
-    console.warn(`[Preview/Install] Falha na instalação/validação com ${preferredManager}:`, primaryErr?.message || primaryErr);
+    primaryErrorMsg = String(primaryErr?.message || primaryErr);
+    console.warn(`[Preview/Install] Falha na instalação/validação com ${preferredManager}:`, primaryErrorMsg);
   }
 
   if (primaryPassed) return preferredManager;
 
   // If preferred manager was already npm and failed, we reached terminal failure
   if (preferredManager === "npm") {
-    console.error(`[Preview] terminal failure: npm install failed`);
-    throw new Error("Falha ao instalar dependências. A instalação foi tentada com npm, mas o node_modules permaneceu inválido.");
+    console.error(`[Preview] terminal failure: npm install failed. Details: ${primaryErrorMsg}`);
+    logPreviewLifecycle("error", {
+      stage: "dependencies",
+      message: primaryErrorMsg,
+      packageManager: "npm",
+      recoveryAttempt: 1,
+      previewSession: sessionId
+    });
+    throw new Error(`Falha ao instalar dependências. A instalação foi tentada com npm, mas o node_modules permaneceu inválido. Detalhes: ${primaryErrorMsg}`);
   }
 
-  // Step 2: Single bounded fallback to npm
-  console.log(`[Preview/Fallback] npm started`);
+  // Step 2: Single bounded fallback to npm (dependencyRecoveryAttempt = 1)
+  console.log(`[Preview/Fallback] npm started (reason: ${preferredManager} failed installation/runtime validation)`);
+  logPreviewLifecycle("recovery:clean-start", { packageManager: "npm", reason: primaryErrorMsg, recoveryAttempt: 1 });
   emitPreview("preview.installing", {
     status: "installing",
+    phase: "installing_dependencies",
     packageManager: "npm",
-    message: "Ajustando as dependências com npm para iniciar o preview..."
+    framework: info.framework,
+    message: `Não foi possível iniciar com ${preferredManager}. Preparando o ambiente com npm...`
   });
 
   try {
     await removeNodeModules(projectPath);
+    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
+    if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+
+    emitPreview("preview.installing", {
+      status: "installing",
+      phase: "installing_dependencies",
+      packageManager: "npm",
+      framework: info.framework,
+      message: "Instalando dependências com npm..."
+    });
     await installDependencies(projectPath, "npm");
-    await verifyRuntimeDependency(projectPath, info);
-    console.log(`[Preview/Fallback] npm completed`);
+    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
+    if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+
+    await waitForFilesystemSettling(projectPath, info);
+    await verifyRuntimeDependency(projectPath, info, "npm");
+    logPreviewLifecycle("recovery:clean-complete", { packageManager: "npm", recoveryAttempt: 1 });
+    console.log(`[Preview/Fallback] npm completed successfully`);
     return "npm";
   } catch (fallbackErr: any) {
-    console.error(`[Preview] terminal failure: fallback to npm also failed:`, fallbackErr?.message || fallbackErr);
-    throw new Error("Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido.");
+    const fallbackErrorMsg = String(fallbackErr?.message || fallbackErr);
+    console.error(`[Preview] terminal failure: fallback to npm also failed:`, fallbackErrorMsg);
+    logPreviewLifecycle("error", {
+      stage: "dependencies",
+      message: fallbackErrorMsg,
+      preferredManager,
+      fallbackManager: "npm",
+      recoveryAttempt: 1,
+      previewSession: sessionId
+    });
+    throw new Error(`Falha ao instalar dependências. A instalação foi tentada com ${preferredManager} e npm, mas o node_modules permaneceu inválido (${fallbackErrorMsg}).`);
   }
 }
 
@@ -4172,10 +4642,16 @@ async function isHttpAlive(url: string, timeoutMs = 700): Promise<boolean> {
   }
 }
 
-async function waitForHttp(url: string, timeout = 45000, processRef?: ChildProcess) {
+async function waitForHttp(url: string, timeout = 90000, processRef?: ChildProcess, sessionId?: number, targetGen?: number) {
   const start = Date.now();
   let lastError = "";
   while (Date.now() - start < timeout) {
+    if (sessionId !== undefined && sessionId !== activePreviewSessionId) {
+      throw new Error("Sessão de preview foi alterada.");
+    }
+    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) {
+      throw new Error("Troca de projeto cancelou o aguardo HTTP.");
+    }
     if (processRef && processRef.exitCode !== null) {
       throw new Error("O servidor encerrou antes de ficar disponível.");
     }
@@ -4195,12 +4671,83 @@ function previewArgs(framework: string, port: number, devScript = "dev") {
   const scriptName = devScript || "dev";
   if (framework === "Next.js" || framework === "Nuxt") return ["run", scriptName, "--", "--hostname", "127.0.0.1", "--port", String(port)];
   if (framework === "Astro") return ["run", scriptName, "--", "--host", "127.0.0.1", "--port", String(port)];
-  if (framework === "Vite" || framework === "Vue" || framework === "Svelte") return ["run", scriptName, "--", "--host", "127.0.0.1", "--port", String(port)];
   if (framework === "Create React App") return ["run", scriptName];
   return ["run", scriptName, "--", "--host", "127.0.0.1", "--port", String(port)];
 }
 
+let emptyWorkspaceWatcher: fs.FSWatcher | null = null;
+let emptyWorkspaceWatchTimer: NodeJS.Timeout | null = null;
+let emptyWorkspaceTimeoutTimer: NodeJS.Timeout | null = null;
+
+function cancelEmptyWorkspaceWatch() {
+  if (emptyWorkspaceWatchTimer) {
+    clearTimeout(emptyWorkspaceWatchTimer);
+    emptyWorkspaceWatchTimer = null;
+  }
+  if (emptyWorkspaceTimeoutTimer) {
+    clearTimeout(emptyWorkspaceTimeoutTimer);
+    emptyWorkspaceTimeoutTimer = null;
+  }
+  if (emptyWorkspaceWatcher) {
+    try {
+      emptyWorkspaceWatcher.close();
+    } catch {}
+    emptyWorkspaceWatcher = null;
+  }
+}
+
+function watchEmptyWorkspace(workspacePath: string, targetGen: number, session: number) {
+  cancelEmptyWorkspaceWatch();
+  const signalFiles = /^(?:package\.json|index\.html|vite\.config\.[jt]s|next\.config\.[jt]s|nuxt\.config\.[jt]s|astro\.config\.[jt]s|svelte\.config\.[jt]s|App\.tsx|app\.tsx|main\.tsx|main\.ts|index\.js|index\.ts|requirements\.txt|app\.py|main\.py)$/i;
+  const ignoreDirs = /(?:^|[\\/])(?:node_modules|\.git|\.next|\.vite)(?:[\\/]|$)/i;
+
+  logPreviewLifecycle("empty workspace watch started", { workspace: workspacePath, generation: targetGen });
+
+  try {
+    emptyWorkspaceWatcher = fs.watch(workspacePath, { recursive: true }, (_event, filename) => {
+      if (targetGen !== projectTransitionGeneration || session !== activePreviewSessionId) {
+        cancelEmptyWorkspaceWatch();
+        return;
+      }
+      if (!filename || ignoreDirs.test(filename.toString())) return;
+      const baseName = path.basename(filename.toString());
+      if (!signalFiles.test(baseName)) return;
+
+      if (emptyWorkspaceWatchTimer) clearTimeout(emptyWorkspaceWatchTimer);
+      emptyWorkspaceWatchTimer = setTimeout(() => {
+        emptyWorkspaceWatchTimer = null;
+        if (targetGen !== projectTransitionGeneration || session !== activePreviewSessionId) {
+          cancelEmptyWorkspaceWatch();
+          return;
+        }
+        cancelEmptyWorkspaceWatch();
+        console.log(`[Preview] Signal file detected (${baseName}) in workspace. Re-running startPreview...`);
+        logPreviewLifecycle("empty workspace signal detected", { file: baseName, workspace: workspacePath });
+        void startPreview(workspacePath, targetGen, true).catch(err => {
+          console.warn("[Neko/Preview] Re-running startPreview on signal detected error:", err);
+        });
+      }, 500);
+    });
+
+    emptyWorkspaceTimeoutTimer = setTimeout(() => {
+      emptyWorkspaceTimeoutTimer = null;
+      if (targetGen !== projectTransitionGeneration || session !== activePreviewSessionId) {
+        cancelEmptyWorkspaceWatch();
+        return;
+      }
+      cancelEmptyWorkspaceWatch();
+      logPreviewLifecycle("error", { stage: "runtime", message: "unsupported project structure timeout" });
+      emitPreview("preview.unsupported", { status: "idle", phase: "unsupported", framework: "Desconhecido", message: "Crie ou abra um projeto que nós cuidamos das dependências e preview" });
+    }, 30000);
+  } catch (err) {
+    console.warn("[Preview] Não foi possível monitorar a pasta do projeto:", err);
+    logPreviewLifecycle("error", { stage: "runtime", message: "unsupported project structure" });
+    emitPreview("preview.unsupported", { status: "idle", phase: "unsupported", framework: "Desconhecido", message: "Crie ou abra um projeto que nós cuidamos das dependências e preview" });
+  }
+}
+
 async function stopPreviewProcessOnly(): Promise<void> {
+  cancelEmptyWorkspaceWatch();
   if (previewStaticServer) {
     try {
       const server = previewStaticServer;
@@ -4361,21 +4908,24 @@ async function launchPreviewProcess(projectPath: string, info: any, packageManag
   return { processRef, exitPromise, getOutput: () => output };
 }
 
-async function startStaticPreviewInternal(projectRoot: string, info: ProjectRuntimeDescriptor, sessionId: number): Promise<PreviewManagerState> {
-  if (sessionId !== activePreviewSessionId) return previewState;
+async function startStaticPreviewInternal(projectRoot: string, info: ProjectRuntimeDescriptor, sessionId: number, targetGen: number): Promise<PreviewManagerState> {
+  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
 
   emitPreview("preview.detected", {
     status: "detecting",
+    phase: "analyzing",
     framework: "HTML / Estático",
     packageManager: "none",
     message: "Projeto HTML/Estático detectado."
   });
 
-  if (sessionId !== activePreviewSessionId) return previewState;
+  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
 
   const port = await findFreePort(3000);
   emitPreview("preview.starting", {
     status: "starting",
+    phase: "starting_server",
+    framework: "HTML / Estático",
     packageManager: "none",
     port,
     message: `Iniciando servidor estático na porta ${port}...`
@@ -4383,7 +4933,7 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
 
   try {
     const server = await startStaticHttpServer(projectRoot, port);
-    if (sessionId !== activePreviewSessionId) {
+    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
       server.close();
       return previewState;
     }
@@ -4394,6 +4944,7 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
         previewPort = null;
         emitPreview("preview.exit", {
           status: "stopped",
+          phase: "stopped",
           port: null,
           url: null,
           message: "Servidor estático encerrado."
@@ -4404,9 +4955,18 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
     previewStaticServer = server;
     previewPort = port;
     const url = `http://127.0.0.1:${port}`;
+    emitPreview("preview.waiting", {
+      status: "starting",
+      phase: "waiting_for_server",
+      framework: "HTML / Estático",
+      packageManager: "none",
+      port,
+      url,
+      message: "Aguardando o servidor responder..."
+    });
     await waitForHttp(url, 5000);
 
-    if (sessionId !== activePreviewSessionId) {
+    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
       server.close();
       if (previewStaticServer === server) previewStaticServer = null;
       return previewState;
@@ -4414,6 +4974,7 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
 
     const ready: PreviewManagerState = {
       status: "ready",
+      phase: "ready",
       framework: "HTML / Estático",
       packageManager: "none",
       port,
@@ -4428,68 +4989,90 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
       activeWorkspace.previewPort = port;
       activeWorkspace.previewUrl = url;
     }
+    logPreviewLifecycle("health check passed", { url });
+    logPreviewLifecycle("ready", { url, framework: "HTML / Estático" });
     console.log(`[Preview] static ready session=${sessionId} url=${url}`);
     mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
     void captureProjectPreviewThumbnail(projectRoot, url);
     return ready;
   } catch (error: any) {
     await stopPreviewProcessOnly();
-    emitPreview("preview.error", { status: "error", message: String(error?.message ?? error), port: null, url: null });
+    emitPreview("preview.error", { status: "error", phase: "error", message: String(error?.message ?? error), port: null, url: null });
     return previewState;
   }
 }
 
-async function startPreviewInternal(projectRoot: string, info: any, sessionId: number): Promise<PreviewManagerState> {
-  if (sessionId !== activePreviewSessionId) return previewState;
+function logPreviewLifecycle(phase: string, details: Record<string, any> = {}) {
+  const sanitized: Record<string, any> = {};
+  for (const [key, val] of Object.entries(details)) {
+    if (/token|secret|password|auth|key/i.test(key)) continue;
+    sanitized[key] = val;
+  }
+  const meta = Object.keys(sanitized).length ? " " + JSON.stringify(sanitized) : "";
+  console.log(`[PreviewLifecycle] ${phase}${meta}`);
+}
+
+async function startPreviewInternal(projectRoot: string, info: any, sessionId: number, targetGen: number): Promise<PreviewManagerState> {
+  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
 
   let packageManager = (info as any).packageManager ?? "npm";
+
   emitPreview("preview.detected", {
     status: "detecting",
+    phase: "checking_dependencies",
     framework: info.framework,
     packageManager,
-    message: `Projeto ${info.framework} detectado.`
+    message: "Verificando dependências..."
   });
 
   if (!info.devScript) {
-    emitPreview("preview.unsupported", { status: "idle", message: "O projeto não possui um script dev ou start no package.json." });
+    logPreviewLifecycle("error", { stage: "detect", message: "no dev script found in package.json" });
+    emitPreview("preview.unsupported", { status: "idle", phase: "unsupported", framework: info.framework, message: "Crie ou abra um projeto que nós cuidamos das dependências e preview" });
     return previewState;
   }
 
   // 1. Initial dependency check and installation
+  logPreviewLifecycle("dependencies checking", { packageManager, framework: info.framework });
   const hasNM = await hasDependencies(projectRoot);
   let needsInstall = !hasNM;
 
   if (hasNM) {
     try {
-      await verifyRuntimeDependency(projectRoot, info);
+      await verifyRuntimeDependency(projectRoot, info, packageManager);
+      logPreviewLifecycle("dependencies ready", { installed: true, packageManager });
     } catch (checkErr: any) {
       console.warn("[Neko/Preview] Integridade de dependências falhou:", checkErr?.message);
+      logPreviewLifecycle("dependencies checking failed", { reason: checkErr?.message });
       needsInstall = true;
     }
   }
 
   if (needsInstall) {
-    if (sessionId !== activePreviewSessionId) return previewState;
-    emitPreview("preview.installing", { status: "installing", packageManager, message: `Instalando dependências com ${packageManager}...` });
+    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+    logPreviewLifecycle("dependencies installing", { packageManager });
     try {
-      packageManager = await installDependenciesWithFallback(projectRoot, packageManager, info);
+      packageManager = await installDependenciesWithFallback(projectRoot, packageManager, info, targetGen, sessionId);
+      logPreviewLifecycle("dependencies ready", { packageManager });
     } catch (error: any) {
-      if (sessionId !== activePreviewSessionId) return previewState;
+      if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
       const errorMsg = String(error?.message ?? error);
-      emitPreview("preview.error", { status: "error", message: errorMsg, port: null, url: null });
+      logPreviewLifecycle("error", { stage: "dependencies", message: errorMsg });
+      emitPreview("preview.error", { status: "error", phase: "error", message: errorMsg, port: null, url: null });
       return previewState;
     }
   }
 
-  if (sessionId !== activePreviewSessionId) return previewState;
+  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
 
   const port = await findFreePort(info.preferredPort);
-  emitPreview("preview.starting", { status: "starting", packageManager, port, message: `Iniciando ${info.framework} na porta ${port}...` });
+  logPreviewLifecycle("server starting", { framework: info.framework, port, packageManager });
+
+  emitPreview("preview.starting", { status: "starting", phase: "starting_server", framework: info.framework, packageManager, port, message: "Iniciando o Preview..." });
 
   let launch: Awaited<ReturnType<typeof launchPreviewProcess>> | null = null;
   try {
     launch = await launchPreviewProcess(projectRoot, info, packageManager, port);
-    if (sessionId !== activePreviewSessionId) {
+    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
       try {
         if (process.platform === "win32" && launch.processRef.pid) {
           spawn("taskkill.exe", ["/PID", String(launch.processRef.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -4506,14 +5089,18 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       if (previewProcess === processRef) {
         previewProcess = null;
         previewPort = null;
-        emitPreview("preview.exit", { status: code === 0 ? "stopped" : "error", port: null, url: null, message: code === 0 ? "Servidor encerrado." : `Servidor encerrou (código ${code}, ${signal ?? "sem sinal"}).` });
+        logPreviewLifecycle("server exited", { code, signal });
+        emitPreview("preview.exit", { status: code === 0 ? "stopped" : "error", phase: code === 0 ? "stopped" : "error", port: null, url: null, message: code === 0 ? "Servidor encerrado." : `Servidor encerrou inesperadamente (código ${code}, ${signal ?? "sem sinal"}).` });
       }
     });
 
     const url = `http://127.0.0.1:${port}`;
+    emitPreview("preview.waiting", { status: "starting", phase: "waiting_for_server", framework: info.framework, packageManager, port, url, message: "Aguardando o servidor responder..." });
+    logPreviewLifecycle("server waiting", { url, port });
+
     try {
-      await waitForHttp(url, 45000, processRef);
-      if (sessionId !== activePreviewSessionId) {
+      await waitForHttp(url, 90000, processRef, sessionId, targetGen);
+      if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
         try {
           if (process.platform === "win32" && processRef.pid) {
             spawn("taskkill.exe", ["/PID", String(processRef.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -4524,7 +5111,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
         return previewState;
       }
       previewPort = port;
-      const ready = { status: "ready" as const, framework: info.framework, packageManager, port, url, message: "Preview pronto.", internalSession: sessionId };
+      const ready = { status: "ready" as const, phase: "ready", framework: info.framework, packageManager, port, url, message: "Preview pronto.", internalSession: sessionId };
       previewState = ready;
       previewRuntimeDescriptor = info;
       if (activeWorkspace) {
@@ -4532,7 +5119,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
         activeWorkspace.previewPort = port;
         activeWorkspace.previewUrl = url;
       }
-      console.log(`[Preview] ready session=${sessionId} url=${url}`);
+      logPreviewLifecycle("server ready", { url, framework: info.framework });
       mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
       void captureProjectPreviewThumbnail(projectRoot, url);
       return ready;
@@ -4545,21 +5132,37 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       if (packageManager !== "npm" && (dependencyResolutionFailure(output) || dependencyResolutionFailure(message) || (processRef.exitCode !== null && processRef.exitCode !== 0))) {
         await stopPreviewProcessOnly();
         console.log(`[Preview/Fallback] npm started`);
+        logPreviewLifecycle("recovery:clean-start", { packageManager: "npm", reason: "runtime fallback" });
         emitPreview("preview.installing", {
           status: "installing",
+          phase: "installing_dependencies",
           packageManager: "npm",
-          message: "O Neko encontrou um problema nas dependências. Reparando com npm e tentando novamente..."
+          framework: info.framework,
+          message: `Não foi possível iniciar com ${packageManager}. Preparando o ambiente com npm...`
         });
         try {
           await removeNodeModules(projectRoot);
+          if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+
+          emitPreview("preview.installing", {
+            status: "installing",
+            phase: "installing_dependencies",
+            packageManager: "npm",
+            framework: info.framework,
+            message: "Instalando dependências com npm..."
+          });
           await installDependencies(projectRoot, "npm");
-          await verifyRuntimeDependency(projectRoot, info);
+          logPreviewLifecycle("dependencies checking", { packageManager: "npm" });
+          await verifyRuntimeDependency(projectRoot, info, "npm");
+          logPreviewLifecycle("dependencies ready", { packageManager: "npm" });
+          logPreviewLifecycle("recovery:clean-complete", { packageManager: "npm" });
           console.log(`[Preview/Fallback] npm completed`);
           packageManager = "npm";
           const retryPort = await findFreePort(info.preferredPort);
-          emitPreview("preview.starting", { status: "starting", packageManager: "npm", port: retryPort, message: `Tentando iniciar ${info.framework} novamente...` });
+          logPreviewLifecycle("server starting", { framework: info.framework, port: retryPort, packageManager: "npm" });
+          emitPreview("preview.starting", { status: "starting", phase: "starting_server", packageManager: "npm", framework: info.framework, port: retryPort, message: "Iniciando o Preview..." });
           const retry = await launchPreviewProcess(projectRoot, info, "npm", retryPort);
-          if (sessionId !== activePreviewSessionId) {
+          if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
             try {
               if (process.platform === "win32" && retry.processRef.pid) {
                 spawn("taskkill.exe", ["/PID", String(retry.processRef.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -4575,12 +5178,14 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
             if (previewProcess === retryProcess) {
               previewProcess = null;
               previewPort = null;
-              emitPreview("preview.exit", { status: code === 0 ? "stopped" : "error", port: null, url: null, message: code === 0 ? "Servidor encerrado." : `Servidor encerrou (código ${code}, ${signal ?? "sem sinal"}).` });
+              emitPreview("preview.exit", { status: code === 0 ? "stopped" : "error", phase: code === 0 ? "stopped" : "error", port: null, url: null, message: code === 0 ? "Servidor encerrado." : `Servidor encerrou (código ${code}, ${signal ?? "sem sinal"}).` });
             }
           });
           const retryUrl = `http://127.0.0.1:${retryPort}`;
-          await waitForHttp(retryUrl, 45000, retryProcess);
-          if (sessionId !== activePreviewSessionId) {
+          emitPreview("preview.waiting", { status: "starting", phase: "waiting_for_server", framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Aguardando o servidor responder..." });
+          logPreviewLifecycle("server waiting", { url: retryUrl, port: retryPort });
+          await waitForHttp(retryUrl, 90000, retryProcess, sessionId, targetGen);
+          if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
             try {
               if (process.platform === "win32" && retryProcess.pid) {
                 spawn("taskkill.exe", ["/PID", String(retryProcess.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -4591,17 +5196,20 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
             return previewState;
           }
           previewPort = retryPort;
-          const ready = { status: "ready" as const, framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Preview pronto.", internalSession: sessionId };
+          const ready = { status: "ready" as const, phase: "ready", framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Preview pronto.", internalSession: sessionId };
           previewState = ready;
           previewRuntimeDescriptor = info;
+          logPreviewLifecycle("server ready", { url: retryUrl, framework: info.framework });
           mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
           captureProjectPreviewThumbnail(projectRoot, retryUrl);
           return ready;
         } catch (fallbackError: any) {
           console.error(`[Preview] terminal failure: npm recovery failed:`, fallbackError?.message || fallbackError);
           await stopPreviewProcessOnly();
+          logPreviewLifecycle("error", { stage: "dependencies", message: String(fallbackError?.message || fallbackError) });
           emitPreview("preview.error", {
             status: "error",
+            phase: "error",
             message: "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido.",
             port: null,
             url: null
@@ -4611,11 +5219,14 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       }
 
       await stopPreviewProcessOnly();
+      const sanitizedErrorMsg = dependencyResolutionFailure(output)
+        ? "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido."
+        : message;
+      logPreviewLifecycle("error", { stage: "server", message: sanitizedErrorMsg });
       emitPreview("preview.error", {
         status: "error",
-        message: dependencyResolutionFailure(output)
-          ? "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido."
-          : message,
+        phase: "error",
+        message: sanitizedErrorMsg,
         port: null,
         url: null
       });
@@ -4623,16 +5234,19 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
     }
   } catch (error: any) {
     await stopPreviewProcessOnly();
-    emitPreview("preview.error", { status: "error", message: String(error?.message ?? error), port: null, url: null });
+    const sanitizedErrorMsg = String(error?.message ?? error);
+    logPreviewLifecycle("error", { stage: "server", message: sanitizedErrorMsg });
+    emitPreview("preview.error", { status: "error", phase: "error", message: sanitizedErrorMsg, port: null, url: null });
     return previewState;
   }
 }
 
-async function startPreview(projectPath: string, _sourceGen?: number, forceRestart = false): Promise<PreviewManagerState> {
+async function startPreview(projectPath: string, sourceGen?: number, forceRestart = false): Promise<PreviewManagerState> {
   if (isInsideNekoApplication(projectPath)) {
     throw new Error("Não é permitido utilizar o diretório do NekoAI como workspace do projeto.");
   }
   const workspace = path.resolve(projectPath);
+  const targetGen = sourceGen ?? projectTransitionGeneration;
 
   // 1. Se já está rodando e saudável no mesmo projeto, NÃO matar! Reutilizar e reemitir ready!
   const hasActiveRunner = (previewProcess && previewProcess.exitCode === null) || Boolean(previewStaticServer);
@@ -4655,27 +5269,34 @@ async function startPreview(projectPath: string, _sourceGen?: number, forceResta
 
   const session = ++previewSessionCounter;
   activePreviewSessionId = session;
-  console.log(`[Preview] start session=${session} path=${workspace}${forceRestart ? " (forceRestart)" : ""}`);
+  console.log(`[Preview] start session=${session} path=${workspace} gen=${targetGen}${forceRestart ? " (forceRestart)" : ""}`);
 
   previewProjectPath = workspace;
   previewStartPromise = (async () => {
-    emitPreview("preview.detecting", { status: "detecting", message: "Analisando estrutura do projeto..." });
-    const runtime = await detectProjectRuntime(workspace);
-    if (session !== activePreviewSessionId) return previewState;
+    logPreviewLifecycle("settling filesystem", { workspace, generation: targetGen });
+    emitPreview("preview.detecting", { status: "detecting", phase: "analyzing", message: "Analisando estrutura do projeto...", framework: null, packageManager: null });
+    
+    const runtime = await detectProjectRuntimeWithSettling(workspace, targetGen);
+    if (session !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+
+    logPreviewLifecycle("runtime detected", { type: runtime.type, framework: runtime.framework, projectRoot: runtime.projectRoot });
 
     if (runtime.type === "UNSUPPORTED") {
-      emitPreview("preview.unsupported", { status: "idle", message: "Aguardando criação da estrutura do projeto..." });
+      logPreviewLifecycle("runtime unresolved - entering transient watch", { workspace, generation: targetGen });
+      emitPreview("preview.detecting", { status: "detecting", phase: "analyzing", message: "Aguardando estrutura do projeto...", framework: null, packageManager: null });
+      watchEmptyWorkspace(workspace, targetGen, session);
       return previewState;
     }
 
     await stopPreviewProcessOnly();
+    if (session !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
     console.log("[Neko/Preview] project runtime resolved", { workspace, runtimeType: runtime.type, projectRoot: runtime.projectRoot, session });
 
     if (runtime.type === "STATIC_HTML") {
-      return startStaticPreviewInternal(runtime.projectRoot, runtime, session);
+      return startStaticPreviewInternal(runtime.projectRoot, runtime, session, targetGen);
     }
 
-    return startPreviewInternal(runtime.projectRoot, runtime, session);
+    return startPreviewInternal(runtime.projectRoot, runtime, session, targetGen);
   })().finally(() => {
     previewStartPromise = null;
   });
@@ -4760,28 +5381,43 @@ async function getProviders() {
       const isConnected = connected.has(providerID) || provider.connected === true;
       const providerEnabled = providerSettings[providerID] !== false;
 
-      const providerModelList = Object.entries(providerModels as Record<string, any>).map(([modelID, model]: [string, any]) => {
-        const key = `${providerID}:${modelID}`;
-        const catalogEnabled = model?.enabled !== false;
-        const userEnabled = disabledSettings[key] !== false;
-        // Capability cache: vision decisions read this without any extra
-        // providers:list request. Catalog metadata may be untrustworthy, so
-        // getModelCapabilities applies the NekoAI overrides on top.
-        providerCatalogCache.set(key, { attachment: model?.attachment === true });
+      let eligibleCount = 0;
+      let filteredCount = 0;
+      const providerModelList: any[] = [];
 
-        return {
+      for (const [modelID, model] of Object.entries(providerModels as Record<string, any>)) {
+        const key = `${providerID}:${modelID}`;
+        const catalogEnabled = (model as any)?.enabled !== false;
+        const userEnabled = disabledSettings[key] !== false;
+
+        // Capability cache: vision decisions read this without any extra providers:list request
+        providerCatalogCache.set(key, { attachment: (model as any)?.attachment === true });
+
+        // Central eligibility filter: Only models eligible for Chat/Agent/Plan/Build are exposed to NekoAI
+        const eligible = isModelEligibleForNeko(model as any, providerID);
+        if (!eligible) {
+          filteredCount++;
+          continue;
+        }
+
+        eligibleCount++;
+        providerModelList.push({
           providerID,
           providerName,
           modelID,
-          name: model?.name ?? modelID,
-          variants: model?.variants && typeof model.variants === "object" ? Object.keys(model.variants) : [],
+          name: (model as any)?.name ?? modelID,
+          variants: (model as any)?.variants && typeof (model as any).variants === "object" ? Object.keys((model as any).variants) : [],
           enabled: providerEnabled && catalogEnabled && userEnabled,
           connected: isConnected,
           catalogEnabled,
-          attachment: model?.attachment === true,
-          cost: model?.cost,
-        };
-      });
+          attachment: (model as any)?.attachment === true,
+          cost: (model as any)?.cost,
+        });
+      }
+
+      if (filteredCount > 0) {
+        console.log(`[Providers/Filter] provider=${providerID} elegíveis=${eligibleCount} ocultados=${filteredCount} (áudio/embed/incompatíveis)`);
+      }
 
       models.push(...providerModelList);
       return {
@@ -5154,16 +5790,19 @@ ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
     // expose their current branches as well, and prune stale remote tracking branches.
     let remoteSyncSuccess = false;
     if (remoteUrl) {
-      try {
-        const token = await getGithubAccessToken();
-        const fetched = await runGitWithGithubAuth(projectPath, ["fetch", "--prune", "origin"], token, 20000);
-        if (fetched.code === 0) {
-          remoteSyncSuccess = true;
-        } else {
-          console.warn("[Neko/GitHub] Não foi possível atualizar branches remotas:", fetched.stderr || fetched.stdout);
+      const auth = readGithubAuth();
+      if (auth?.token) {
+        try {
+          const token = await getGithubAccessToken();
+          const fetched = await runGitWithGithubAuth(projectPath, ["fetch", "--prune", "origin"], token, 20000);
+          if (fetched.code === 0) {
+            remoteSyncSuccess = true;
+          } else {
+            console.warn("[Neko/GitHub] Não foi possível atualizar branches remotas:", fetched.stderr || fetched.stdout);
+          }
+        } catch (error) {
+          console.warn("[Neko/GitHub] Falha na autenticação ao atualizar branches:", error);
         }
-      } catch (error) {
-        console.warn("[Neko/GitHub] Falha na autenticação ao atualizar branches:", error);
       }
     }
 
@@ -5185,17 +5824,7 @@ ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
     if (local.code === 0) {
       const localBranches = local.stdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
       for (const name of localBranches) {
-        // If remote repository is connected and sync succeeded, prune stale unreferenced local branches
-        // that were deleted upstream and are not the currently active branch.
-        if (remoteUrl && remoteSyncSuccess && !remoteRefs.has(name) && name !== status.branch) {
-          try {
-            await runGit(projectPath, ["branch", "-D", name], {}, 10000);
-          } catch (e) {
-            console.warn(`[Neko/GitHub] Não foi possível podar branch local obsoleta ${name}:`, e);
-          }
-        } else if (!remoteUrl || !remoteSyncSuccess || remoteRefs.has(name) || name === status.branch) {
-          names.add(name);
-        }
+        names.add(name);
       }
     }
 
@@ -5291,6 +5920,74 @@ ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
   });
 });
 
+ipcMain.handle("github:createBranch", async (_event, payload: { name: string; baseBranch?: string }) => {
+  licenseManager.assertAccess("criação de branches no Git");
+  if (!currentProject) throw new Error("Abra um projeto antes de criar uma nova branch.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+
+  if (activeAgentRequests.size > 0) {
+    throw new Error("Uma tarefa do assistente está em execução no momento. Aguarde a conclusão da tarefa antes de criar uma branch.");
+  }
+
+  const name = String(payload?.name || "").trim();
+  if (!/^[A-Za-z0-9._/-]+$/.test(name) || name.startsWith("/") || name.endsWith("/") || name.includes("..") || name.length > 100) {
+    throw new Error("Nome de branch inválido.");
+  }
+
+  const baseBranch = payload?.baseBranch ? String(payload.baseBranch).trim() : undefined;
+  if (baseBranch && (!/^[A-Za-z0-9._/-]+$/.test(baseBranch) || baseBranch.startsWith("/") || baseBranch.endsWith("/"))) {
+    throw new Error("Branch base inválida.");
+  }
+
+  return withProjectGitLock(projectPath, async () => {
+    const status = await getGitStatus();
+    if (!status.initialized) throw new Error("O projeto ainda não possui um repositório Git.");
+    if (status.branch === name) return { ok: true, status };
+    if (status.dirty) throw new Error("Existem alterações locais não salvas. Faça commit ou descarte as alterações antes de criar uma nova branch.");
+
+    const gitArgs = baseBranch ? ["checkout", "-b", name, baseBranch] : ["checkout", "-b", name];
+    const checkout = await runGit(projectPath, gitArgs, {}, 20000);
+    if (checkout.code !== 0) throw new Error(formatGitHubGitError(checkout, `criar a branch "${name}"`));
+
+    invalidateProjectCheckpoints(projectPath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: "", reason: "branch.create", branch: name }
+    });
+
+    return { ok: true, status: await getGitStatus() };
+  });
+});
+
+ipcMain.handle("github:getDefaultBranch", async () => {
+  if (!currentProject) return "main";
+  try {
+    const projectPath = assertProjectRootSafe(currentProject, "git-read");
+    const status = await getGitStatus(projectPath);
+    if (!status.initialized) return "main";
+
+    const symRef = await runGit(projectPath, ["symbolic-ref", "refs/remotes/origin/HEAD"], {}, 5000);
+    if (symRef.code === 0 && symRef.stdout) {
+      const match = symRef.stdout.trim().replace(/^refs\/remotes\/origin\//, "");
+      if (match && match !== "HEAD") return match;
+    }
+
+    if (status.linkedRepo) {
+      const auth = readGithubAuth();
+      if (auth?.token) {
+        try {
+          const res = await githubApi(`/repos/${status.linkedRepo}`).then(r => r.json()).catch(() => null);
+          if (res?.default_branch) return String(res.default_branch);
+        } catch {}
+      }
+    }
+
+    return status.branch || "main";
+  } catch {
+    return "main";
+  }
+});
+
 ipcMain.handle("github:chooseCloneDestination", async () => {
   let defaultPath: string | undefined = undefined;
   const lastDir = await appPreferencesManager.getLastProjectDirectory();
@@ -5321,72 +6018,134 @@ ipcMain.handle("github:openFolder", async (_event, folderPath: string) => {
 });
 
 ipcMain.handle("github:cloneProject", async (_event, payload: { repoFullName: string; parentPath?: string; projectName?: string }) => {
+  console.log("[GitHub Clone] [Main] Handler chamado com payload:", { repoFullName: payload?.repoFullName, parentPath: payload?.parentPath, projectName: payload?.projectName });
   licenseManager.assertAccess("clonagem de projetos GitHub");
   const repoFullName = String(payload?.repoFullName || "").trim();
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
+    console.warn("[GitHub Clone] [Main] Repositório do GitHub inválido:", repoFullName);
     throw new Error("Repositório do GitHub inválido.");
   }
 
   const token = await getGithubAccessToken();
+  console.log("[GitHub Clone] [Main] Token obtido do getGithubAccessToken:", token ? "Presente" : "Ausente");
 
   const parent = String(payload?.parentPath || "").trim();
-  if (!parent) throw new Error("Escolha uma pasta para salvar o projeto.");
+  if (!parent) {
+    console.warn("[GitHub Clone] [Main] Pasta pai não informada pelo cliente.");
+    throw new Error("Escolha uma pasta para salvar o projeto.");
+  }
   const safeParent = assertProjectRootSafe(parent, "git-clone-parent");
-  const parentStat = await fs.promises.stat(safeParent).catch(() => null);
+  console.log("[GitHub Clone] [Main] Parent verificado seguro:", safeParent);
+
+  const parentStat = await fs.promises.stat(safeParent).catch((err) => {
+    console.warn("[GitHub Clone] [Main] Erro ao verificar stat do safeParent:", err?.message || err);
+    return null;
+  });
   if (!parentStat?.isDirectory()) throw new Error("A pasta escolhida não existe ou não é válida.");
+
   const repoName = repoFullName.split("/").pop() || "projeto";
   const projectName = String(payload?.projectName || repoName).trim();
   if (!/^[^\\/:*?"<>|]+$/.test(projectName) || projectName === "." || projectName === "..") {
+    console.warn("[GitHub Clone] [Main] Nome de projeto inválido:", projectName);
     throw new Error("Escolha um nome de projeto válido.");
   }
   const target = path.join(safeParent, projectName);
+  console.log("[GitHub Clone] [Main] Target final calculado:", target);
 
   try {
     await fs.promises.access(target, fs.constants.F_OK);
-    throw new Error(`A pasta "${projectName}" já existe em "${parent}". Escolha outra pasta.`);
+    const entries = await fs.promises.readdir(target).catch(() => []);
+    if (entries.length === 0) {
+      console.log("[GitHub Clone] [Main] Pasta destino existe mas está vazia. Removendo pasta vazia para permitir o clone:", target);
+      await fs.promises.rm(target, { recursive: true, force: true }).catch(() => {});
+    } else {
+      console.warn("[GitHub Clone] [Main] Pasta destino já existe e contém arquivos:", target);
+      throw new Error(`A pasta "${projectName}" já existe em "${parent}" e não está vazia. Escolha outro nome ou selecione outra pasta.`);
+    }
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
   }
 
   const cloneUrl = `https://github.com/${repoFullName}.git`;
+  console.log("[GitHub Clone] [Main] Executando git clone via runGitWithGithubAuth...", { safeParent, cloneUrl, projectName });
   const clone = await runGitWithGithubAuth(safeParent, ["clone", cloneUrl, projectName], token);
 
+  console.log("[GitHub Clone] [Main] Resultado git clone:", { code: clone.code, stdout: clone.stdout, stderr: clone.stderr });
+
   if (clone.code !== 0) {
-    // Git may leave a partial destination after an interrupted/failed clone.
-    // It is safe to remove it because we verified it did not exist beforehand.
+    console.warn("[GitHub Clone] [Main] Git clone falhou. Removendo diretório parcial se criado:", target);
     await fs.promises.rm(target, { recursive: true, force: true }).catch(() => {});
     throw new Error(formatGitHubGitError(clone, `clonar ${repoFullName}`));
   }
 
+  console.log("[GitHub Clone] [Main] Verificando work tree com rev-parse...");
   const inside = await runGit(target, ["rev-parse", "--is-inside-work-tree"]);
   if (inside.code !== 0 || inside.stdout !== "true") {
+    console.warn("[GitHub Clone] [Main] Diretório clonado não é um worktree Git válido:", inside);
     await fs.promises.rm(target, { recursive: true, force: true }).catch(() => {});
     throw new Error("O GitHub informou que o clone terminou, mas o projeto local não contém um repositório Git válido.");
   }
 
+  console.log("[GitHub Clone] [Main] Verificando remote origin...");
   const remote = await runGit(target, ["remote", "get-url", "origin"]);
-  if (remote.code !== 0 || remote.stdout !== cloneUrl) {
-    const setRemote = await runGit(target, ["remote", "set-url", "origin", cloneUrl]);
+  if (remote.code !== 0) {
+    console.log("[GitHub Clone] [Main] Configurando remote origin...");
+    const setRemote = await runGit(target, ["remote", "add", "origin", cloneUrl]);
     if (setRemote.code !== 0) {
+      console.warn("[GitHub Clone] [Main] Falha ao configurar remote origin:", setRemote);
       await fs.promises.rm(target, { recursive: true, force: true }).catch(() => {});
       throw new Error("O clone foi concluído, mas não foi possível configurar o remote origin com segurança.");
     }
   }
 
-  // No ZIP fallback here: Clone means a real Git clone with .git, history,
-  // refs and remote preserved. Import-from-ZIP remains a separate future flow.
-  return { canceled: false, path: target, repoFullName, archive: false };
+  console.log(`[GitHub Clone] [Main] Aguardando materialização dos arquivos no disco...`);
+  await waitForClonedWorkspaceReady(target);
+  console.log("[GitHub Clone FLOW] clone completed", { path: target, repoFullName });
+
+  console.log("[GitHub Clone FLOW] workspace activation started", { path: target });
+  const workspaceResult = await switchWorkspaceInternal({ projectPath: target, source: "GitHubClone" }, "GitHubClone");
+  console.log("[GitHub Clone FLOW] preview pipeline started", { path: target });
+
+  console.log("[GitHub Clone FLOW] returning clone result to renderer", { path: target, repoFullName });
+  console.log(`[GitHub Clone] [Main] Clone concluído com sucesso. repository=${repoFullName} destination=${target}`);
+
+  return { canceled: false, path: target, repoFullName, archive: false, workspaceResult };
 });
 
-ipcMain.handle("github:commitPush", async (_event, payload: { message: string }) => {
-  licenseManager.assertAccess("envio de commits para o GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
-  const message = String(payload?.message || "").trim();
-  if (!message) throw new Error("Digite uma mensagem para o commit.");
+interface CommitPushResult {
+  ok: boolean;
+  committed: boolean;
+  pushed: boolean;
+  status: GitStatus;
+  message: string;
+}
 
-  return withProjectGitLock(projectPath, async () => {
-    const status = await getGitStatus();
+const autoCommittedTaskIds = new Set<string>();
+
+function sanitizeAutoCommitMessage(rawMessage?: string): string {
+  if (!rawMessage || typeof rawMessage !== "string") {
+    return "NekoAI: tarefa concluída";
+  }
+  let clean = rawMessage.replace(/[\r\n\t]+/g, " ").trim();
+  clean = clean.replace(/\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[a-zA-Z0-9_]{10,}\b/gi, "[REDACTED]");
+  clean = clean.replace(/\b[A-Za-z0-9+/]{40,}\b/g, "[REDACTED]");
+  if (!clean) return "NekoAI: tarefa concluída";
+  let prefixed = clean.startsWith("NekoAI:") ? clean : `NekoAI: ${clean}`;
+  if (prefixed.length > 100) prefixed = prefixed.slice(0, 97) + "...";
+  return prefixed;
+}
+
+async function performGithubCommitPush(
+  projectPath: string,
+  message: string,
+  options: { isAuto?: boolean } = {}
+): Promise<CommitPushResult> {
+  const safePath = assertProjectRootSafe(projectPath, "git-write");
+  const cleanMessage = options.isAuto ? sanitizeAutoCommitMessage(message) : String(message || "").trim();
+  if (!cleanMessage) throw new Error("Digite uma mensagem para o commit.");
+
+  return withProjectGitLock(safePath, async () => {
+    const status = await getGitStatus(safePath);
     if (!status.initialized || !status.remote || !status.linkedRepo) {
       throw new Error("Este projeto ainda não está conectado a um repositório GitHub.");
     }
@@ -5394,67 +6153,262 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string })
     const branch = status.branch || "main";
 
     // Ensure .gitignore exists and is populated
-    await ensureGitignore(projectPath);
+    await ensureGitignore(safePath);
 
     // Configure user.name and user.email if not set
-    const name = await runGit(projectPath, ["config", "user.name"], {}, 5000);
+    const name = await runGit(safePath, ["config", "user.name"], {}, 5000);
     if (name.code !== 0 || !name.stdout) {
       const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
       const fallbackName = String((auth as any)?.name || (auth as any)?.login || "NekoAI User");
-      const setName = await runGit(projectPath, ["config", "user.name", fallbackName], {}, 10000);
+      const setName = await runGit(safePath, ["config", "user.name", fallbackName], {}, 10000);
       if (setName.code !== 0) throw new Error("Não foi possível configurar o autor do commit.");
     }
 
-    const email = await runGit(projectPath, ["config", "user.email"], {}, 5000);
+    const email = await runGit(safePath, ["config", "user.email"], {}, 5000);
     if (email.code !== 0 || !email.stdout) {
       const auth = await githubApi("/user").then(r => r.json()).catch(() => ({} as any));
       const id = typeof (auth as any)?.id === "number" ? (auth as any).id : null;
       const login = String((auth as any)?.login || "nekoai");
       const fallbackEmail = id ? `${id}+${login}@users.noreply.github.com` : `${login}@users.noreply.github.com`;
-      const setEmail = await runGit(projectPath, ["config", "user.email", fallbackEmail], {}, 10000);
+      const setEmail = await runGit(safePath, ["config", "user.email", fallbackEmail], {}, 10000);
       if (setEmail.code !== 0) throw new Error("Não foi possível configurar o e-mail do commit.");
     }
 
     // Check if HEAD has commits
-    const headCheck = await runGit(projectPath, ["rev-parse", "--verify", "HEAD"], {}, 5000);
+    const headCheck = await runGit(safePath, ["rev-parse", "--verify", "HEAD"], {}, 5000);
     const hasExistingCommits = headCheck.code === 0;
 
     // If no branch is currently active and no commits exist, ensure branch is main
     if (!hasExistingCommits) {
-      await runGit(projectPath, ["branch", "-M", branch], {}, 5000);
+      await runGit(safePath, ["branch", "-M", branch], {}, 5000);
     }
 
-    const add = await runGit(projectPath, ["add", "-A"], {}, 20000);
+    const add = await runGit(safePath, ["add", "-A"], {}, 20000);
     if (add.code !== 0) throw new Error(formatGitHubGitError(add, "preparar arquivos para o commit"));
 
-    const commit = await runGit(projectPath, ["commit", "-m", message], {}, 20000);
+    const commit = await runGit(safePath, ["commit", "-m", cleanMessage], {}, 20000);
     if (commit.code !== 0) {
       const raw = `${commit.stderr} ${commit.stdout}`.toLowerCase();
       if (raw.includes("nothing to commit")) {
         if (hasExistingCommits) {
-          const push = await runGitWithGithubAuth(projectPath, ["push", "origin", branch], token, 35000);
+          const push = await runGitWithGithubAuth(safePath, ["push", "origin", branch], token, 35000);
           if (push.code !== 0) {
-            const pushTrack = await runGitWithGithubAuth(projectPath, ["push", "-u", "origin", branch], token, 35000);
+            const pushTrack = await runGitWithGithubAuth(safePath, ["push", "-u", "origin", branch], token, 35000);
             if (pushTrack.code !== 0) throw new Error(formatGitHubGitError(pushTrack, `enviar o commit para a branch "${branch}"`));
           }
-          return { ok: true, committed: false, pushed: true, status: await getGitStatus(), message: "Alterações enviadas para o GitHub." };
+          return { ok: true, committed: false, pushed: true, status: await getGitStatus(safePath), message: "Alterações enviadas para o GitHub." };
         }
-        return { ok: true, committed: false, pushed: false, status: await getGitStatus(), message: "Não há alterações para enviar." };
+        return { ok: true, committed: false, pushed: false, status: await getGitStatus(safePath), message: "Não há alterações para enviar." };
       }
       throw new Error(formatGitHubGitError(commit, "criar o commit"));
     }
 
     // Push with upstream fallback
-    let push = await runGitWithGithubAuth(projectPath, ["push", "-u", "origin", branch], token, 35000);
+    let push = await runGitWithGithubAuth(safePath, ["push", "-u", "origin", branch], token, 35000);
     if (push.code !== 0) {
-      push = await runGitWithGithubAuth(projectPath, ["push", "origin", branch], token, 35000);
+      push = await runGitWithGithubAuth(safePath, ["push", "origin", branch], token, 35000);
       if (push.code !== 0) {
         throw new Error(formatGitHubGitError(push, `enviar o commit para a branch "${branch}"`));
       }
     }
 
-    return { ok: true, committed: true, pushed: true, status: await getGitStatus(), message: "Commit criado e enviado para o GitHub." };
+    return {
+      ok: true,
+      committed: true,
+      pushed: true,
+      status: await getGitStatus(safePath),
+      message: options.isAuto ? "Alterações enviadas automaticamente para o GitHub." : "Commit criado e enviado para o GitHub."
+    };
   });
+}
+
+ipcMain.handle("github:commitPush", async (_event, payload: { message: string }) => {
+  licenseManager.assertAccess("envio de commits para o GitHub");
+  if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  const message = String(payload?.message || "").trim();
+  return await performGithubCommitPush(projectPath, message, { isAuto: false });
+});
+
+ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: string; taskId?: string; message?: string }) => {
+  licenseManager.assertAccess("envio de commits para o GitHub");
+  const targetPath = payload?.projectPath || currentProject;
+  if (!targetPath) {
+    return { ok: false, skipped: true, reason: "no-project", message: "Nenhum projeto ativo para o Auto Commit." };
+  }
+  const projectPath = assertProjectRootSafe(targetPath, "git-write");
+
+  // 1. Checa se o Auto Commit está habilitado para este workspace
+  const isEnabled = await appPreferencesManager.getProjectAutoCommit(projectPath);
+  if (!isEnabled) {
+    return { ok: true, skipped: true, reason: "disabled", message: "Auto Commit desativado para este projeto." };
+  }
+
+  // 2. Proteção de idempotência por task
+  const taskId = String(payload?.taskId || "").trim();
+  if (taskId) {
+    if (autoCommittedTaskIds.has(taskId)) {
+      console.log(`[Neko/AutoCommit] Ignorando tarefa já commitada: taskId=${taskId}`);
+      return { ok: true, skipped: true, reason: "already-committed", message: "Esta tarefa já foi enviada ao GitHub." };
+    }
+    autoCommittedTaskIds.add(taskId);
+  }
+
+  // 3. Verifica se o projeto está conectado ao GitHub
+  const gitStatus = await getGitStatus(projectPath);
+  if (!gitStatus.initialized || !gitStatus.remote || !gitStatus.linkedRepo) {
+    return { ok: false, skipped: true, reason: "not-linked", message: "Este projeto não está conectado a um repositório GitHub." };
+  }
+
+  // 4. Se não houver alterações pendentes, não tenta commit nem push desnecessário
+  if (!gitStatus.dirty) {
+    return { ok: true, committed: false, pushed: false, status: gitStatus, message: "Nenhuma alteração nova para enviar ao GitHub." };
+  }
+
+  // 5. Executa commit e push sob lock
+  const commitMessage = payload?.message || "NekoAI: tarefa concluída";
+  return await performGithubCommitPush(projectPath, commitMessage, { isAuto: true });
+});
+
+ipcMain.handle("github:getAutoCommit", async (_event, projectPath?: string) => {
+  const target = projectPath || currentProject;
+  if (!target) return false;
+  try {
+    const safe = assertProjectRootSafe(target, "preference-read");
+    return await appPreferencesManager.getProjectAutoCommit(safe);
+  } catch {
+    return false;
+  }
+});
+
+ipcMain.handle("github:setAutoCommit", async (_event, payload: { projectPath?: string; enabled: boolean }) => {
+  const target = payload?.projectPath || currentProject;
+  if (!target) return { ok: false, enabled: false };
+  try {
+    const safe = assertProjectRootSafe(target, "preference-write");
+    await appPreferencesManager.setProjectAutoCommit(safe, Boolean(payload?.enabled));
+    return { ok: true, enabled: Boolean(payload?.enabled) };
+  } catch {
+    return { ok: false, enabled: false };
+  }
+});
+
+ipcMain.handle("github:createPullRequest", async (_event, payload: { repoFullName: string; head: string; base: string; title?: string; body?: string }) => {
+  licenseManager.assertAccess("criação de Pull Requests no GitHub");
+  const repoFullName = String(payload?.repoFullName || "").trim();
+  const head = String(payload?.head || "").trim();
+  const base = String(payload?.base || "").trim();
+  const title = String(payload?.title || "Update from NekoAI").trim();
+  const body = String(payload?.body || "Pull Request criado via NekoAI.").trim();
+
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
+    return { ok: false, error: "Repositório do GitHub inválido." };
+  }
+  if (!head || !base) {
+    return { ok: false, error: "Branch de origem (head) e branch de destino (base) são obrigatórias." };
+  }
+  if (head === base) {
+    return { ok: false, error: `A branch de origem "${head}" é a mesma branch de destino "${base}".` };
+  }
+
+  let token = "";
+  try {
+    token = await getGithubAccessToken();
+  } catch (err: any) {
+    return { ok: false, error: err?.message || "GitHub não está conectado." };
+  }
+
+  const response = await fetchWithTimeout(`https://api.github.com/repos/${repoFullName}/pulls`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      title,
+      head,
+      base,
+      body
+    })
+  }, 25000);
+
+  const resJson: any = await response.json().catch(() => ({}));
+  if (response.ok && resJson?.html_url) {
+    return {
+      ok: true,
+      html_url: String(resJson.html_url),
+      number: typeof resJson.number === "number" ? resJson.number : undefined
+    };
+  }
+
+  let msg = `Não foi possível criar o Pull Request (HTTP ${response.status}).`;
+  if (resJson?.message) {
+    msg = resJson.message;
+    if (Array.isArray(resJson?.errors) && resJson.errors[0]?.message) {
+      msg = `${msg}: ${resJson.errors[0].message}`;
+    }
+  }
+
+  const diagnostic = categorizeGithubError(msg);
+  return {
+    ok: false,
+    errorCategory: diagnostic.category,
+    error: diagnostic.userMessage,
+    rawError: msg
+  };
+});
+
+ipcMain.handle("github:checkRepoAccess", async (_event, repoFullName: string) => {
+  const name = String(repoFullName || "").trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name)) {
+    return { accessible: false, status: 400, reason: "invalid-repo" };
+  }
+
+  const auth = readGithubAuth();
+  if (!auth?.token) {
+    return { accessible: false, status: 401, reason: "not-connected" };
+  }
+
+  try {
+    const response = await fetchWithTimeout(`https://api.github.com/repos/${name}`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${auth.token}`,
+        "X-GitHub-Api-Version": "2022-11-28"
+      }
+    }, 15000);
+
+    if (response.ok) {
+      const json: any = await response.json().catch(() => ({}));
+      return {
+        accessible: true,
+        status: 200,
+        private: Boolean(json.private),
+        permissions: json.permissions || null
+      };
+    }
+
+    if (response.status === 404) {
+      return { accessible: false, status: 404, reason: "not-found" };
+    }
+    if (response.status === 403) {
+      const bodyText = await response.text().catch(() => "");
+      const isPermissionUpdate = bodyText.toLowerCase().includes("resource not accessible by integration");
+      return { accessible: false, status: 403, reason: isPermissionUpdate ? "permission-update-needed" : "forbidden" };
+    }
+    if (response.status === 401) {
+      return { accessible: false, status: 401, reason: "unauthorized" };
+    }
+
+    return { accessible: false, status: response.status, reason: `http-${response.status}` };
+  } catch (error: any) {
+    if (error?.name === "AbortError" || error?.message?.includes("timed out")) {
+      throw new Error("Tempo limite excedido ao verificar acesso ao repositório no GitHub.");
+    }
+    throw error;
+  }
 });
 
 ipcMain.handle("github:publishProject", async (_event, payload: { repoName: string; private?: boolean }) => {
@@ -5602,7 +6556,10 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
         throw new Error(formatGitHubGitError(push, `publicar os arquivos na branch "${defaultBranch}"`));
       }
 
-      return {
+      const updatedGithubStatus = await getGithubStatus();
+      mainWindow?.webContents.send("github:event", { type: "github.connected", properties: updatedGithubStatus });
+
+      const publishResult = {
         ok: true,
         repo: {
           id: createdRepo.id,
@@ -5612,8 +6569,11 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
           htmlUrl: createdRepo.html_url,
           defaultBranch
         },
-        status: await getGitStatus()
+        status: await getGitStatus(),
+        githubStatus: updatedGithubStatus
       };
+      void vercelManager.detectLinkedProject();
+      return publishResult;
     } finally {
       if (activePublishAbortController === abortController) {
         activePublishAbortController = null;
@@ -5693,16 +6653,6 @@ ipcMain.handle("github:discardChanges", async () => {
     return await getGitStatus();
   });
 });
-
-const SAFE_IGNORED_ENTRIES_FOR_CLONE = new Set([
-  ".git",
-  ".neko",
-  ".vscode",
-  ".idea",
-  ".ds_store",
-  "thumbs.db",
-  "desktop.ini"
-]);
 
 async function inspectFolderForClone(folderPath: string): Promise<{ isEmptyOrSafe: boolean; fileCount: number; nonSafeEntries: string[] }> {
   try {
@@ -5871,6 +6821,9 @@ ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: str
     });
 
     const finalStatus = await getGitStatus();
+    const updatedGithubStatus = await getGithubStatus();
+    mainWindow?.webContents.send("github:event", { type: "github.connected", properties: updatedGithubStatus });
+    void vercelManager.detectLinkedProject();
 
     return {
       ok: true,
@@ -5878,10 +6831,15 @@ ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: str
       cloned: true,
       branch: finalStatus.branch || defaultBranch,
       status: finalStatus,
+      githubStatus: updatedGithubStatus,
       message: "Repositório clonado com sucesso."
     };
   });
 });
+
+
+
+
 
 ipcMain.handle("projects:getRecent", async () => {
   return await recentProjectsManager.getRecentProjectsWithStatus();
@@ -6097,10 +7055,17 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
       throw new Error("Troca de projeto interrompida por nova seleção.");
     }
 
-    // 3. Set current project and update Supabase & Vercel
+    // 3. Set current project and update Supabase & Vercel & Lovable
     currentProject = targetPath;
     await supabaseManager.setProject(targetPath);
     void vercelManager.setProject(targetPath);
+    const lovableState = await lovableCloudManager.setProject(targetPath);
+    if (lovableState.status === "connected" && lovableState.projectId) {
+      await lovableMcpServer.start().catch(err => console.warn("[Neko/LovableMCP] Erro ao iniciar MCP:", err));
+      await writeLovableOpenCodeConfig(targetPath, lovableMcpServer.getUrl(), lovableMcpServer.getSecretToken()).catch(err => console.warn("[Neko/LovableMCP] Erro ao escrever config:", err));
+    } else {
+      await removeLovableOpenCodeConfig(targetPath).catch(() => {});
+    }
 
     // 4. Start OpenCode on new project
     const health = await startOpenCodeInternal(targetPath, transitionGen);
@@ -6120,27 +7085,21 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
     }
 
     // 6. Read tree, git status, supabase and vercel state
-    const tree = await readTree(targetPath);
+    logPreviewLifecycle("workspace scan started", { targetPath, generation: transitionGen });
+    const tree = await readTreeWithSettling(targetPath, transitionGen);
+    logPreviewLifecycle("workspace scan completed", { nodes: tree.length, generation: transitionGen });
     const gitStatus = await getGitStatus();
     const supabaseState = supabaseManager.getState();
     const vercelState = vercelManager.getState();
 
-    // 7. Start preview in background
-    void startPreview(targetPath, transitionGen).then(preview => {
-      if (transitionGen !== projectTransitionGeneration) return;
-      if (preview.status === "ready") {
-        mainWindow?.webContents.send("preview:event", {
-          type: "preview.ready",
-          properties: preview
-        });
-      }
-    }).catch(error => {
-      console.warn("[Neko/Preview] background start failed:", error);
+    // 7. Start preview asynchronously in background (WORKSPACE READY != PREVIEW READY)
+    void startPreview(targetPath, transitionGen).catch(error => {
+      console.warn("[Neko/Preview] startPreview failed during background initialization:", error);
     });
 
     newWorkspace.status = "ready";
     logService("transition-ready", `target=${targetPath} gen=${transitionGen}`);
-    console.log("[BLACKSCREEN] switchWorkspace:transition-ready", { targetPath, sessionData: !!(session as any).data, treeNodes: tree.length, supabaseStatus: supabaseState?.status, vercelStatus: vercelState?.connection });
+    console.log("[BLACKSCREEN] switchWorkspace:transition-ready", { targetPath, sessionData: !!(session as any).data, treeNodes: tree.length, supabaseStatus: supabaseState?.status, vercelStatus: vercelState?.connection, previewStatus: previewState?.status });
 
     // Registra projeto recente universalmente na conclusão do workspace
     void recentProjectsManager.touchRecentProject(targetPath).then(async () => {
@@ -6157,6 +7116,8 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
       console.warn("[Neko/Preferences] Erro ao salvar última pasta do projeto:", err);
     });
 
+    const autoCommit = await appPreferencesManager.getProjectAutoCommit(targetPath);
+
     const result = {
       path: targetPath,
       opencodeUrl,
@@ -6165,8 +7126,10 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
       tree,
       preview: previewState,
       gitStatus,
+      autoCommit,
       supabaseState,
-      vercelState
+      vercelState,
+      lovableState: lovableCloudManager.getState()
     };
     console.log("[BLACKSCREEN] switchWorkspace:returning-result", { path: result.path, hasSession: !!result.session, hasTree: !!result.tree, hasSupabase: !!result.supabaseState, hasVercel: !!result.vercelState, supabaseKeys: result.supabaseState ? Object.keys(result.supabaseState) : null });
     return result;
@@ -6703,6 +7666,14 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
   if (!response.ok) {
     const body = await response.text().catch(() => "");
     console.log(`[Neko/Agent] prompt_async response task=${taskCorrelationId} session=${payload.sessionId} model=${promptModelLabel} status=${response.status} ok=false durationMs=${promptAckDurationMs} bodyChars=${body.length}`);
+
+    if (isModelIncompatibilityError(body)) {
+      clearActiveAgentRequest(payload.sessionId);
+      setTaskState(payload.sessionId, "failed", "prompt-rejected");
+      logTask("failed", taskCorrelationId, payload.sessionId, `incompatible-model=${promptModelLabel}`);
+      throw new Error(`O modelo ${promptModelLabel} não oferece suporte a conversas ou criação de software. O NekoAI desativou este modelo da lista.`);
+    }
+
     const failed = { error: { data: { statusCode: response.status, message: body.slice(0, 500), isRetryable: response.status >= 500 || response.status === 429 } } };
     if (isRecoverableAgentError(failed) && scheduleAgentRetry(payload.sessionId, failed)) {
       setTaskState(payload.sessionId, "running", "prompt-retrying");
@@ -7348,6 +8319,7 @@ ipcMain.handle("project:stop", async (_event, payload?: { source?: string }) => 
   migrationManager.cancelAllPendingProposals();
   void supabaseManager.setProject(null);
   void vercelManager.setProject(null);
+  void lovableCloudManager.setProject(null);
   await stopOpenCode();
   await stopPreview();
   return true;
@@ -7490,8 +8462,16 @@ ipcMain.handle("vercel:get-state", async () => {
   return vercelManager.getState();
 });
 
+ipcMain.handle("vercel:detect-project", async (_event, gitRepoOverride?: string) => {
+  return await vercelManager.detectLinkedProject(gitRepoOverride);
+});
+
 ipcMain.handle("vercel:connect", async () => {
   return await vercelManager.connect();
+});
+
+ipcMain.handle("vercel:cancel-login", async () => {
+  return await vercelManager.cancelLogin();
 });
 
 ipcMain.handle("vercel:disconnect", async () => {
@@ -7501,6 +8481,77 @@ ipcMain.handle("vercel:disconnect", async () => {
 ipcMain.handle("vercel:unlink", async () => {
   const projectRoot = assertProjectRootSafe(currentProject, "vercel-unlink");
   return await vercelManager.unlinkProject(projectRoot);
+});
+
+ipcMain.handle("vercel:request-link-intent", async (_event, detectedProjectId?: string) => {
+  licenseManager.assertAccess("vínculo de projeto na Vercel");
+  const projectRoot = assertProjectRootSafe(currentProject, "vercel-request-link-intent");
+  const vercelUser = vercelManager.getState().username;
+  if (!vercelUser) {
+    throw new Error("Conecte sua conta da Vercel antes de vincular.");
+  }
+
+  const detectedProject = vercelManager.getState().detectedProject;
+  if (!detectedProject) {
+    throw new Error("Nenhum projeto Vercel correspondente foi detectado para este workspace.");
+  }
+
+  if (detectedProjectId && detectedProject.id && detectedProject.id !== detectedProjectId) {
+    throw new Error("O projeto detectado não corresponde à solicitação.");
+  }
+
+  const intent = vercelLinkIntentManager.createIntent({
+    projectPath: projectRoot,
+    projectId: detectedProject.id,
+    projectName: detectedProject.name,
+    gitRepo: detectedProject.gitRepo,
+    projectGeneration: projectTransitionGeneration,
+    username: vercelUser,
+  });
+
+  return {
+    intentId: intent.intentId,
+    expiresAt: intent.expiresAt,
+    projectPath: intent.projectPath,
+    projectName: intent.projectName,
+  };
+});
+
+ipcMain.handle("vercel:use-detected-project", async (_event, payload: { intentId: string }) => {
+  const intentId = payload?.intentId;
+  if (!intentId || typeof intentId !== "string") {
+    console.warn("[Vercel/Security] vínculo rejeitado: intenção inválida");
+    throw new Error("O vínculo com a Vercel requer confirmação explícita.");
+  }
+
+  licenseManager.assertAccess("vínculo de projeto na Vercel");
+  const projectRoot = assertProjectRootSafe(currentProject, "vercel-use-detected-project");
+  logProjectWorkspace("vercel-use-detected-project", projectRoot);
+
+  const currentVercelUser = vercelManager.getState().username;
+
+  // Validate and consume one-shot link intent
+  const validation = vercelLinkIntentManager.validateAndConsume(
+    intentId,
+    projectRoot,
+    projectTransitionGeneration,
+    currentVercelUser
+  );
+
+  if (!validation.valid || !validation.intent) {
+    console.warn(`[Vercel/Security] vínculo rejeitado: ${validation.reason}`);
+    throw new Error(validation.userMessage || "O vínculo com a Vercel requer confirmação explícita.");
+  }
+
+  // Validate git status matches
+  const gitStatus = await getGitStatus(projectRoot);
+  const currentNormalized = normalizeGithubRepo(gitStatus.linkedRepo || gitStatus.remote);
+  const intentNormalized = normalizeGithubRepo(validation.intent.gitRepo);
+  if (!currentNormalized || currentNormalized !== intentNormalized) {
+    throw new Error("O repositório Git do workspace mudou durante a confirmação do vínculo.");
+  }
+
+  return await vercelManager.linkDetectedProject(projectRoot, validation.intent.projectName);
 });
 
 ipcMain.handle("vercel:request-publish-intent", async (_event, customProjectName?: string) => {
@@ -7694,6 +8745,7 @@ function createWindow() {
     minWidth: 1100,
     minHeight: 700,
     show: false,
+    frame: false,
     icon: fs.existsSync(windowIconPath) ? windowIconPath : undefined,
     backgroundColor: "#070510",
     webPreferences: {
@@ -7703,9 +8755,26 @@ function createWindow() {
     }
   });
 
+  Menu.setApplicationMenu(null);
+
+  mainWindow.on("maximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("window:maximized-change", true);
+    }
+  });
+  mainWindow.on("unmaximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("window:maximized-change", false);
+    }
+  });
+  mainWindow.on("restore", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("window:maximized-change", false);
+    }
+  });
+
   mainWindow.once("ready-to-show", () => {
     // Start maximized like a normal Windows desktop app.
-    // This preserves the title bar and Windows taskbar (unlike kiosk/fullscreen).
     mainWindow?.maximize();
     mainWindow?.show();
   });
@@ -7743,6 +8812,21 @@ function createWindow() {
   vercelManager.on("log", (message) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("vercel:log", message);
+    }
+  });
+
+  lovableCloudManager.on("state-changed", async (state) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("lovable:state-changed", state);
+    }
+    const currentPath = lovableCloudManager.getActiveProjectPath();
+    if (currentPath) {
+      if (state.status === "connected" && state.projectId) {
+        await lovableMcpServer.start().catch(() => {});
+        await writeLovableOpenCodeConfig(currentPath, lovableMcpServer.getUrl(), lovableMcpServer.getSecretToken()).catch(() => {});
+      } else if (state.status === "disconnected") {
+        await removeLovableOpenCodeConfig(currentPath).catch(() => {});
+      }
     }
   });
 
@@ -8033,6 +9117,7 @@ app.whenReady().then(() => {
     return false;
   });
   void supabaseManager.initialize();
+  vercelManager.setGitStatusGetter(async (p: string) => getGitStatus(p));
   void vercelManager.initialize();
   void licenseManager.initialize();
 
@@ -8086,12 +9171,69 @@ app.whenReady().then(() => {
   createWindow();
   updaterManager.initialize(mainWindow);
 
+  ipcMain.handle("window:minimize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.minimize();
+    }
+  });
+
+  ipcMain.handle("window:toggleMaximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize();
+      } else {
+        mainWindow.maximize();
+      }
+    }
+  });
+
+  ipcMain.handle("window:isMaximized", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      return mainWindow.isMaximized();
+    }
+    return false;
+  });
+
+  ipcMain.handle("window:close", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+  });
+
   ipcMain.handle("updater:get-state", () => updaterManager.getState());
   ipcMain.handle("updater:check", () => updaterManager.checkForUpdates());
   ipcMain.handle("updater:download", () => updaterManager.downloadUpdate());
   ipcMain.handle("updater:install", () => {
     updaterManager.quitAndInstall();
     return { ok: true };
+  });
+
+  ipcMain.handle("lovable:get-state", async () => {
+    return lovableCloudManager.getState();
+  });
+
+  ipcMain.handle("lovable:open-login", async () => {
+    await lovableCloudManager.openLoginWindow();
+    return lovableCloudManager.getState();
+  });
+
+  ipcMain.handle("lovable:link-project", async (_event, projectId?: string) => {
+    try {
+      return await lovableCloudManager.linkProject(projectId);
+    } catch (error: any) {
+      return {
+        ...lovableCloudManager.getState(),
+        error: error?.message || "Erro ao vincular projeto Lovable",
+      };
+    }
+  });
+
+  ipcMain.handle("lovable:unlink", async () => {
+    return await lovableCloudManager.unlinkProject();
+  });
+
+  ipcMain.handle("lovable:test-connection", async () => {
+    return await lovableCloudManager.testConnection();
   });
 
   // Verificação automática silenciosa em segundo plano após inicialização da janela

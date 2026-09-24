@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { ChildProcess } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -6,10 +7,12 @@ import {
   EMPTY_VERCEL_STATE,
   VercelCliCommand,
   VercelState,
+  VercelDetectedProject,
   isValidVercelProjectName,
+  normalizeGithubRepo,
 } from "./vercel-types";
 import { VercelVaultManager } from "./vercel-vault";
-import { vercelIntentManager } from "./vercel-intent";
+import { vercelIntentManager, vercelLinkIntentManager } from "./vercel-intent";
 import {
   VercelCli,
   cleanVercelOutput,
@@ -51,15 +54,23 @@ export class VercelManager extends EventEmitter {
   private cli: VercelCliCommand | null = null;
   private authTask: Promise<VercelState> | null = null;
   private deploymentTask: Promise<VercelState> | null = null;
+  private activeLoginProcess: ChildProcess | null = null;
   private authAttempt = 0;
   private projectGeneration = 0;
   private shuttingDown = false;
   private deploymentUrls = new Map<string, string>();
 
+  private gitStatusGetter: ((projectPath: string) => Promise<{ linkedRepo?: string | null; remote?: string | null } | null>) | null = null;
+  private detectionTask: Promise<VercelDetectedProject | null> | null = null;
+
   constructor(vault?: VercelVaultManager, cliWrapper?: VercelCli) {
     super();
     if (vault) this.vault = vault;
     if (cliWrapper) this.cliWrapper = cliWrapper;
+  }
+
+  public setGitStatusGetter(getter: (projectPath: string) => Promise<{ linkedRepo?: string | null; remote?: string | null } | null>): void {
+    this.gitStatusGetter = getter;
   }
 
   public getState(): VercelState {
@@ -69,6 +80,108 @@ export class VercelManager extends EventEmitter {
   private setState(patch: Partial<VercelState>): void {
     this.state = { ...this.state, ...patch };
     this.emit("state-changed", this.getState());
+  }
+
+  public async detectLinkedProject(gitRepoOverride?: string | null): Promise<VercelDetectedProject | null> {
+    if (this.detectionTask) return this.detectionTask;
+    const task = this.detectLinkedProjectOnce(gitRepoOverride);
+    this.detectionTask = task;
+    try {
+      return await task;
+    } finally {
+      if (this.detectionTask === task) this.detectionTask = null;
+    }
+  }
+
+  private async detectLinkedProjectOnce(gitRepoOverride?: string | null): Promise<VercelDetectedProject | null> {
+    const projectPath = this.state.projectPath;
+    const generation = this.projectGeneration;
+
+    if (!projectPath || this.state.connection !== "connected" || !this.state.username) {
+      if (this.state.detectedProject !== null) {
+        this.setState({ detectedProject: null });
+      }
+      return null;
+    }
+
+    let rawRepo = gitRepoOverride;
+    if (!rawRepo && this.gitStatusGetter) {
+      try {
+        const gitInfo = await this.gitStatusGetter(projectPath);
+        rawRepo = gitInfo?.linkedRepo || gitInfo?.remote || null;
+      } catch (err) {
+        console.warn("[Neko/Vercel] error getting git status for detection:", err);
+      }
+    }
+
+    const normalizedRepo = normalizeGithubRepo(rawRepo);
+    if (!normalizedRepo) {
+      if (generation === this.projectGeneration && this.state.projectPath === projectPath) {
+        if (this.state.detectedProject !== null) {
+          this.setState({ detectedProject: null });
+        }
+      }
+      return null;
+    }
+
+    if (!this.cli && this.cliWrapper?.resolveCli) {
+      this.cli = await this.cliWrapper.resolveCli().catch(() => null);
+    }
+    if (!this.cli) return null;
+
+    try {
+      const projects = await this.cliWrapper.listProjectsJson(this.cli);
+      if (generation !== this.projectGeneration || this.state.projectPath !== projectPath) {
+        return null;
+      }
+
+      const matches: Array<{ id?: string; name: string; gitRepo: string; updatedAt?: number }> = [];
+
+      for (const p of projects) {
+        if (!p || !p.name) continue;
+        const link = p.link;
+        if (!link) continue;
+        const orgRepo = link.org && link.repo ? `${link.org}/${link.repo}` : link.repo || "";
+        const pNorm = normalizeGithubRepo(orgRepo);
+        if (pNorm && pNorm === normalizedRepo) {
+          matches.push({
+            id: p.id || p.projectId,
+            name: p.name,
+            gitRepo: `${link.org || ""}${link.org ? "/" : ""}${link.repo || ""}` || normalizedRepo,
+            updatedAt: p.updatedAt || p.createdAt || 0,
+          });
+        }
+      }
+
+      if (matches.length === 0) {
+        if (generation === this.projectGeneration && this.state.projectPath === projectPath) {
+          if (this.state.detectedProject !== null) {
+            this.setState({ detectedProject: null });
+          }
+        }
+        return null;
+      }
+
+      // Sort descending by updatedAt
+      matches.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      const bestMatch = matches[0];
+
+      if (generation === this.projectGeneration && this.state.projectPath === projectPath) {
+        const patch: Partial<VercelState> = { detectedProject: bestMatch };
+        if (
+          !this.state.linked &&
+          !this.state.deploymentUrl &&
+          (!this.state.projectName || this.state.projectName === path.basename(projectPath))
+        ) {
+          patch.projectName = bestMatch.name;
+        }
+        this.setState(patch);
+      }
+      return bestMatch;
+    } catch (err) {
+      console.warn("[Neko/Vercel] detectLinkedProject failed:", err);
+      return null;
+    }
   }
 
   public async initialize(): Promise<void> {
@@ -99,11 +212,13 @@ export class VercelManager extends EventEmitter {
       if (this.state.projectPath) {
         await this.restoreProjectBinding(this.state.projectPath, username);
       }
+      void this.detectLinkedProject();
     } else {
       this.setState({
         connection: "disconnected",
         username: null,
         error: null,
+        detectedProject: null,
       });
     }
   }
@@ -167,6 +282,7 @@ export class VercelManager extends EventEmitter {
   public async setProject(projectPath: string | null): Promise<void> {
     const generation = ++this.projectGeneration;
     vercelIntentManager.invalidateAll("project changed");
+    vercelLinkIntentManager.invalidateAll("project changed");
     if (!projectPath) {
       this.setState({
         projectPath: null,
@@ -175,6 +291,7 @@ export class VercelManager extends EventEmitter {
         deployment: "idle",
         deploymentUrl: null,
         error: null,
+        detectedProject: null,
       });
       return;
     }
@@ -209,6 +326,7 @@ export class VercelManager extends EventEmitter {
           deploymentUrl: cachedUrl,
           error: null,
         });
+        await this.detectLinkedProject();
       } else {
         // Account B does not have access to Account A's project
         // Remove stale .vercel/project.json so future publish links cleanly
@@ -223,6 +341,7 @@ export class VercelManager extends EventEmitter {
           deploymentUrl: null,
           error: null,
         });
+        await this.detectLinkedProject();
       }
       return;
     }
@@ -235,11 +354,13 @@ export class VercelManager extends EventEmitter {
       deploymentUrl: cachedUrl,
       error: null,
     });
+    await this.detectLinkedProject();
   }
 
   public async unlinkProject(projectPath: string): Promise<VercelState> {
     if (!projectPath) return this.getState();
     vercelIntentManager.invalidateByPath(projectPath, "project unlinked");
+    vercelLinkIntentManager.invalidateByPath(projectPath, "project unlinked");
     const vercelDir = path.join(projectPath, ".vercel");
     await fs.rm(vercelDir, { recursive: true, force: true }).catch(() => {});
     await this.vault.removeDeployment(projectPath);
@@ -253,14 +374,37 @@ export class VercelManager extends EventEmitter {
         deployment: "idle",
         error: null,
       });
+      await this.detectLinkedProject();
     }
+    return this.getState();
+  }
+
+  public async cancelLogin(): Promise<VercelState> {
+    console.log("[Neko/Vercel] cancel login requested");
+    this.authAttempt += 1;
+    if (this.activeLoginProcess) {
+      this.cliWrapper.terminate(this.activeLoginProcess);
+      this.activeLoginProcess = null;
+    }
+    await this.authTask?.catch(() => undefined);
+    this.authTask = null;
+    this.setState({
+      connection: "disconnected",
+      username: null,
+      error: null,
+    });
     return this.getState();
   }
 
   public async disconnect(): Promise<VercelState> {
     console.log("[Neko/Vercel] disconnect requested");
     vercelIntentManager.invalidateAll("account disconnected");
+    vercelLinkIntentManager.invalidateAll("account disconnected");
     this.authAttempt += 1;
+    if (this.activeLoginProcess) {
+      this.cliWrapper.terminate(this.activeLoginProcess);
+      this.activeLoginProcess = null;
+    }
     await this.authTask?.catch(() => undefined);
     this.authTask = null;
     try {
@@ -273,6 +417,7 @@ export class VercelManager extends EventEmitter {
         username: null,
         deployment: "idle",
         error: null,
+        detectedProject: null,
       });
     }
     return this.getState();
@@ -306,38 +451,134 @@ export class VercelManager extends EventEmitter {
       console.log(`[Neko/Vercel] authentication successful user=${existingUser}`);
       this.setState({ connection: "connected", username: existingUser, error: null });
       await this.restoreProjectBinding(this.state.projectPath, existingUser);
+      void this.detectLinkedProject();
       return this.getState();
     }
 
     this.setState({ connection: "authorizing", username: null, error: null });
-    try {
-      console.log("[Neko/Vercel] opening authentication terminal");
-      const termRes = await this.cliWrapper.openLoginTerminal(this.cli);
-      console.log(`[Neko/Vercel] terminal strategy=${termRes.strategy}`);
-      console.log(`[Neko/Vercel] terminal process spawned pid=${termRes.pid || "unknown"}`);
-      console.log("[Neko/Vercel] waiting for authentication");
+    let strategyIndex = 0;
+    const maxStrategies = 4;
 
-      const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-      while (!this.shuttingDown && attempt === this.authAttempt && Date.now() < deadline) {
-        await wait(2500);
-        console.log("[Neko/Vercel] checking authentication");
-        const username = await this.readUsername();
-        console.log(`[Neko/Vercel] whoami result=${username || "null"}`);
-        if (username) {
-          console.log(`[Neko/Vercel] authentication successful user=${username}`);
-          this.setState({ connection: "connected", username, error: null });
-          await this.restoreProjectBinding(this.state.projectPath, username);
+    try {
+      while (!this.shuttingDown && attempt === this.authAttempt && strategyIndex < maxStrategies) {
+        console.log("[Neko/Vercel] terminal launch requested");
+        let termSession: import("./vercel-cli").VercelLoginTerminalSession;
+        try {
+          termSession = await this.cliWrapper.openLoginTerminal(this.cli, strategyIndex);
+        } catch (err: any) {
+          console.log(`[Neko/Vercel] terminal launch failure: ${err?.message || "falha ao iniciar"}`);
+          throw err;
+        }
+
+        this.activeLoginProcess = termSession.child;
+        const startTime = Date.now();
+        console.log(`[Neko/Vercel] terminal strategy selected: ${termSession.strategy}`);
+        console.log(`[Neko/Vercel] terminal process spawned pid=${termSession.pid || "unknown"}`);
+        console.log("[Neko/Vercel] waiting for authentication");
+
+        const closeState: {
+          closed: boolean;
+          closedAt: number | null;
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        } = {
+          closed: false,
+          closedAt: null,
+          code: null,
+          signal: null,
+        };
+        const closePromise = termSession.waitClose().then((info) => {
+          closeState.closed = true;
+          closeState.closedAt = Date.now();
+          closeState.code = info.code;
+          closeState.signal = info.signal;
+        });
+
+        const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+        let earlyExit = false;
+
+        while (!this.shuttingDown && attempt === this.authAttempt && Date.now() < deadline) {
+          if (closeState.closed) {
+            const duration = (closeState.closedAt ?? Date.now()) - startTime;
+            console.log(
+              `[Neko/Vercel] terminal process exited (exitCode=${closeState.code ?? "null"}, duration=${duration}ms)`
+            );
+            console.log("[Neko/Vercel] checking authentication");
+            const username = await this.readUsername();
+            if (username) {
+              console.log(`[Neko/Vercel] login completion detected user=${username}`);
+              this.setState({ connection: "connected", username, error: null });
+              await this.restoreProjectBinding(this.state.projectPath, username);
+              void this.detectLinkedProject();
+              return this.getState();
+            }
+
+            // Proteção contra falha de inicialização / early exit (< 1000ms sem autenticação)
+            if (duration < 1000 && termSession.strategy !== "mock") {
+              console.log(
+                `[Neko/Vercel] terminal launch failure: process exited prematurely after ${duration}ms without authentication`
+              );
+              earlyExit = true;
+              break;
+            }
+
+            console.log("[Neko/Vercel] user cancellation: login terminal closed without completion");
+            this.setState({ connection: "disconnected", username: null, error: null });
+            return this.getState();
+          }
+
+          await Promise.race([wait(1500), closePromise]);
+          if (this.shuttingDown || attempt !== this.authAttempt) break;
+
+          if (closeState.closed) continue;
+
+          console.log("[Neko/Vercel] checking authentication");
+          const username = await this.readUsername();
+          console.log(`[Neko/Vercel] whoami result=${username || "null"}`);
+          if (username) {
+            console.log(`[Neko/Vercel] login completion detected user=${username}`);
+            this.setState({ connection: "connected", username, error: null });
+            await this.restoreProjectBinding(this.state.projectPath, username);
+            void this.detectLinkedProject();
+            return this.getState();
+          }
+        }
+
+        if (this.activeLoginProcess) {
+          this.cliWrapper.terminate(this.activeLoginProcess);
+          this.activeLoginProcess = null;
+        }
+
+        if (earlyExit) {
+          strategyIndex++;
+          console.log(`[Neko/Vercel] fallback strategy selected: index ${strategyIndex}`);
+          continue;
+        }
+
+        if (this.shuttingDown || attempt !== this.authAttempt) {
+          this.setState({ connection: "disconnected", username: null, error: null });
           return this.getState();
         }
+
+        console.log("[Neko/Vercel] authentication failed timeout");
+        throw new Error("Não foi possível concluir a autenticação da Vercel (tempo limite esgotado).");
       }
-      if (this.shuttingDown || attempt !== this.authAttempt) return this.getState();
-      console.log("[Neko/Vercel] authentication failed timeout");
-      throw new Error("Não foi possível concluir a autenticação da Vercel (tempo limite esgotado).");
+
+      throw new Error("Todas as estratégias de inicialização do terminal de login falharam.");
     } catch (error) {
+      if (this.shuttingDown || attempt !== this.authAttempt) {
+        this.setState({ connection: "disconnected", username: null, error: null });
+        return this.getState();
+      }
       const message = error instanceof Error ? error.message : "Não foi possível conectar à Vercel.";
       console.log(`[Neko/Vercel] authentication failed: ${message}`);
       this.setState({ connection: "error", username: null, error: message });
       throw error;
+    } finally {
+      if (this.activeLoginProcess) {
+        this.cliWrapper.terminate(this.activeLoginProcess);
+        this.activeLoginProcess = null;
+      }
     }
   }
 
@@ -495,6 +736,69 @@ export class VercelManager extends EventEmitter {
     return await this.pathExists(projectJsonPath);
   }
 
+  public async linkDetectedProject(projectPath: string, projectName: string): Promise<VercelState> {
+    if (!projectPath || this.state.projectPath !== projectPath) {
+      throw new Error("O projeto selecionado mudou antes do vínculo.");
+    }
+    const generation = this.projectGeneration;
+    if (!this.cli) this.cli = await this.cliWrapper.resolveCli();
+    if (!this.cli) {
+      throw new Error("O Vercel CLI não está disponível porque o npm não foi encontrado.");
+    }
+
+    const username = await this.readUsername();
+    if (generation !== this.projectGeneration || this.state.projectPath !== projectPath) {
+      throw new Error("O projeto ativo mudou antes do início do vínculo.");
+    }
+    if (!username) {
+      this.setState({ connection: "disconnected", username: null, error: null });
+      throw new Error("Conecte sua conta da Vercel antes de vincular.");
+    }
+
+    const projectNameToUse = projectName?.trim();
+    if (!projectNameToUse || !isValidVercelProjectName(projectNameToUse)) {
+      throw new Error("Nome do projeto Vercel inválido.");
+    }
+
+    await this.ensureVercelIgnored(projectPath);
+
+    this.emit("log", `Vinculando workspace ao projeto "${projectNameToUse}" na Vercel...`);
+
+    try {
+      await this.cliWrapper.runCli(
+        this.cli,
+        ["link", "--yes", "--project", projectNameToUse],
+        projectPath,
+        60000,
+        (line) => this.emit("log", line)
+      );
+    } catch (linkErr: any) {
+      throw new Error(formatVercelErrorMessage(linkErr?.message));
+    }
+
+    const projectJsonPath = path.join(projectPath, ".vercel", "project.json");
+    const isLinked = await this.pathExists(projectJsonPath);
+    if (!isLinked) {
+      throw new Error("Não foi possível criar a configuração local do vínculo (.vercel/project.json).");
+    }
+
+    if (generation !== this.projectGeneration || this.state.projectPath !== projectPath) {
+      throw new Error("O projeto ativo mudou durante o vínculo.");
+    }
+
+    const cachedUrl = this.deploymentUrls.get(projectPath) || null;
+    await this.vault.saveDeployment(projectPath, cachedUrl || "", projectNameToUse, username);
+
+    this.setState({
+      linked: true,
+      projectName: projectNameToUse,
+      error: null,
+    });
+
+    this.emit("log", `Projeto "${projectNameToUse}" vinculado com sucesso.`);
+    return this.getState();
+  }
+
   public async readUsername(): Promise<string | null> {
     if (!this.cli) return null;
     try {
@@ -534,6 +838,10 @@ export class VercelManager extends EventEmitter {
   public shutdown(): void {
     this.shuttingDown = true;
     this.authAttempt += 1;
+    if (this.activeLoginProcess) {
+      this.cliWrapper.terminate(this.activeLoginProcess);
+      this.activeLoginProcess = null;
+    }
     this.cliWrapper.shutdown();
   }
 }

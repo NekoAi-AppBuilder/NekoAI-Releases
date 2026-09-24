@@ -19,6 +19,7 @@ export function normalizeProjectPath(projectPath: string): string {
 
 export interface AppPreferences {
   lastProjectDirectory?: string;
+  projectAutoCommit?: Record<string, boolean>;
   [key: string]: any;
 }
 
@@ -159,6 +160,38 @@ export class AppPreferencesManager {
 
     await this.setLastProjectDirectory(parentDir);
     return parentDir;
+  }
+
+  /**
+   * Obtém a preferência de Auto Commit para um determinado projeto.
+   * Se o projeto não possuir valor configurado, retorna false por padrão.
+   */
+  public async getProjectAutoCommit(projectPath: string): Promise<boolean> {
+    if (!projectPath || typeof projectPath !== "string") return false;
+    const normalized = normalizeProjectPath(projectPath);
+    if (!normalized) return false;
+
+    const prefs = await this.getPreferences();
+    const map = (prefs.projectAutoCommit && typeof prefs.projectAutoCommit === "object") ? prefs.projectAutoCommit : {};
+    const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    return Boolean(map[key]);
+  }
+
+  /**
+   * Salva a preferência de Auto Commit para um determinado projeto.
+   */
+  public async setProjectAutoCommit(projectPath: string, enabled: boolean): Promise<void> {
+    if (!projectPath || typeof projectPath !== "string") return;
+    const normalized = normalizeProjectPath(projectPath);
+    if (!normalized) return;
+
+    const prefs = await this.getPreferences();
+    if (!prefs.projectAutoCommit || typeof prefs.projectAutoCommit !== "object") {
+      prefs.projectAutoCommit = {};
+    }
+    const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    prefs.projectAutoCommit[key] = Boolean(enabled);
+    await this.savePreferences(prefs);
   }
 
   /**

@@ -1,6 +1,13 @@
 export type VercelConnectionStatus = "checking" | "connected" | "disconnected" | "authorizing" | "error";
 export type VercelDeploymentStatus = "idle" | "deploying" | "ready" | "error";
 
+export interface VercelDetectedProject {
+  id?: string;
+  name: string;
+  gitRepo: string;
+  updatedAt?: number;
+}
+
 export interface VercelState {
   configured: boolean;
   connection: VercelConnectionStatus;
@@ -11,6 +18,7 @@ export interface VercelState {
   linked: boolean;
   deploymentUrl: string | null;
   error: string | null;
+  detectedProject: VercelDetectedProject | null;
 }
 
 export const EMPTY_VERCEL_STATE: VercelState = {
@@ -23,6 +31,7 @@ export const EMPTY_VERCEL_STATE: VercelState = {
   linked: false,
   deploymentUrl: null,
   error: null,
+  detectedProject: null,
 };
 
 export interface VercelProjectDeployment {
@@ -76,3 +85,17 @@ export function getVercelNameValidationError(name: string): string | null {
   return null;
 }
 
+export function normalizeGithubRepo(value?: string | null): string | null {
+  if (!value || typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const cleaned = trimmed
+    .replace(/^git@github\.com:/i, "")
+    .replace(/^https?:\/\/(?:www\.)?github\.com\//i, "")
+    .replace(/^ssh:\/\/git@github\.com\//i, "")
+    .replace(/\.git$/i, "")
+    .replace(/^\/+|\/+$/g, "");
+  const parts = cleaned.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  return `${parts[0].toLowerCase()}/${parts[1].toLowerCase()}`;
+}

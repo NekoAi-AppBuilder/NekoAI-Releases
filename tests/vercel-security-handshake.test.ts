@@ -20,6 +20,8 @@ class MockVercelCli {
   public failAdd = false;
   public failLink = false;
   public failDeploy = false;
+  public mockUser: string | null = "testuser";
+  public triggerTerminalClose: ((info: { code: number | null; signal: NodeJS.Signals | null }) => void) | null = null;
 
   public async resolveCli() {
     return { command: "vercel", prefix: [] };
@@ -29,10 +31,28 @@ class MockVercelCli {
     return {};
   }
 
+  public async openLoginTerminal(_cli: any) {
+    let resolver: any;
+    const waitClose = () =>
+      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        resolver = resolve;
+      });
+    this.triggerTerminalClose = (info) => {
+      if (resolver) resolver(info);
+    };
+    return {
+      strategy: "mock",
+      pid: 1234,
+      child: { pid: 1234, kill: () => {} } as any,
+      waitClose,
+    };
+  }
+
   public async runCli(_cli: any, args: string[], cwd?: string, _timeoutMs?: number, onLine?: (line: string) => void) {
     this.executedCommands.push({ args, cwd });
     if (args[0] === "whoami") {
-      return { stdout: "testuser", stderr: "" };
+      if (this.mockUser) return { stdout: `${this.mockUser}\n`, stderr: "" };
+      throw new Error("Not logged in");
     }
     if (args[0] === "project" && args[1] === "add") {
       if (this.failAdd) throw new Error("Project add failed");
@@ -54,11 +74,13 @@ class MockVercelCli {
       return { stdout: "https://my-app.vercel.app\n", stderr: "" };
     }
     if (args[0] === "logout") {
+      this.mockUser = null;
       return { stdout: "Logged out", stderr: "" };
     }
     return { stdout: "", stderr: "" };
   }
 
+  public terminate(_child: any) {}
   public shutdown() {}
 }
 
@@ -496,4 +518,176 @@ test("Vercel Security: N - Account B can subsequently create/link new project cl
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("Vercel Security: O - Closing login terminal terminates polling immediately and cancels authentication without error", async () => {
+  const tempDir = await createTempDir("vercel-term-cancel");
+  try {
+    const vault = new VercelVaultManager(path.join(tempDir, "vault.json"));
+    const mockCli = new MockVercelCli();
+    mockCli.mockUser = null; // not authenticated
+    const manager = new VercelManager(vault, mockCli as any);
+
+    // Start connect in background
+    const connectPromise = manager.connect();
+
+    // Give time to spawn
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(manager.getState().connection, "authorizing");
+
+    // Simulate user closing the terminal window (clicks [X] in terminal)
+    assert.ok(mockCli.triggerTerminalClose, "Terminal close trigger must be available");
+    mockCli.triggerTerminalClose({ code: 1, signal: null });
+
+    // connectPromise should resolve promptly (not wait 10 min)
+    const state = await connectPromise;
+    assert.equal(state.connection, "disconnected", "State must be disconnected after terminal closure");
+    assert.equal(state.username, null);
+    assert.equal(state.error, null, "Cancellation must not report an error");
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Vercel Security: P - cancelLogin terminates active login process and resets state cleanly", async () => {
+  const tempDir = await createTempDir("vercel-cancel-login");
+  try {
+    const vault = new VercelVaultManager(path.join(tempDir, "vault.json"));
+    const mockCli = new MockVercelCli();
+    mockCli.mockUser = null;
+    const manager = new VercelManager(vault, mockCli as any);
+
+    // Start connect
+    const connectPromise = manager.connect();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(manager.getState().connection, "authorizing");
+
+    // User cancels via modal button
+    const cancelState = await manager.cancelLogin();
+    assert.equal(cancelState.connection, "disconnected");
+    assert.equal(cancelState.username, null);
+    assert.equal(cancelState.error, null);
+
+    const connectState = await connectPromise;
+    assert.equal(connectState.connection, "disconnected");
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Vercel Security: R - Early exit (< 1000ms) on real strategy triggers fallback instead of user cancellation", async () => {
+  const tempDir = await createTempDir("vercel-fallback-test");
+  try {
+    const vault = new VercelVaultManager(path.join(tempDir, "vault.json"));
+    const mockCli = new MockVercelCli();
+    mockCli.mockUser = null;
+
+    const strategiesAttempted: number[] = [];
+    mockCli.openLoginTerminal = async (_cli: any, strategyIndex = 0) => {
+      strategiesAttempted.push(strategyIndex);
+      let resolver: any;
+      const waitClose = () =>
+        new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+          resolver = resolve;
+        });
+
+      // Se for a primeira estratégia (0), fecha instantaneamente simulando crash/early exit
+      if (strategyIndex === 0) {
+        setTimeout(() => resolver({ code: 0, signal: null }), 50);
+      } else {
+        // Estratégia secundária: autentica com sucesso
+        setTimeout(() => {
+          mockCli.mockUser = "fallback_success_user";
+          resolver({ code: 0, signal: null });
+        }, 1200);
+      }
+
+      return {
+        strategy: strategyIndex === 0 ? "conhost" : "powershell",
+        pid: 9900 + strategyIndex,
+        child: { pid: 9900 + strategyIndex, kill: () => {} } as any,
+        waitClose,
+      };
+    };
+
+    const manager = new VercelManager(vault, mockCli as any);
+    const result = await manager.connect();
+
+    // Deve ter tentado strategy 0 primeiro e depois fallback para strategy 1
+    assert.deepEqual(strategiesAttempted, [0, 1]);
+    assert.equal(result.connection, "connected");
+    assert.equal(result.username, "fallback_success_user");
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Vercel Security: S - Exhaustion of all fallback strategies reports technical error", async () => {
+  const tempDir = await createTempDir("vercel-exhaust-test");
+  try {
+    const vault = new VercelVaultManager(path.join(tempDir, "vault.json"));
+    const mockCli = new MockVercelCli();
+    mockCli.mockUser = null;
+
+    mockCli.openLoginTerminal = async (_cli: any, _strategyIndex = 0) => {
+      let resolver: any;
+      const waitClose = () =>
+        new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+          resolver = resolve;
+        });
+      // Todas as estratégias falham imediatamente (<1000ms)
+      setTimeout(() => resolver({ code: 0, signal: null }), 30);
+      return {
+        strategy: "conhost",
+        pid: 8888,
+        child: { pid: 8888, kill: () => {} } as any,
+        waitClose,
+      };
+    };
+
+    const manager = new VercelManager(vault, mockCli as any);
+    await assert.rejects(
+      async () => {
+        await manager.connect();
+      },
+      (err: any) => {
+        assert.ok(err.message.includes("falharam"));
+        return true;
+      }
+    );
+
+    assert.equal(manager.getState().connection, "error");
+    assert.ok(manager.getState().error?.includes("falharam"));
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Vercel Security: T - Renderer error extraction preserves technical messages and respects fallbacks without leaking secrets", () => {
+  const formatError = (error: any, vercelStateError: string | null): string => {
+    const rawMsg = (error as Error)?.message ?? "";
+    const cleanedMsg = rawMsg
+      .replace(/^Error invoking remote method '[^']+'(?::\s*Error:\s*|:\s*)/i, "")
+      .replace(/^Error:\s*/i, "")
+      .trim();
+    return cleanedMsg || vercelStateError || "Erro ao conectar com Vercel.";
+  };
+
+  // Cenário A: IPC rejeita com erro específico de terminal
+  const errA = new Error("Error invoking remote method 'vercel:connect': Error: Não foi possível abrir o terminal para autenticação da Vercel: teste");
+  assert.equal(formatError(errA, null), "Não foi possível abrir o terminal para autenticação da Vercel: teste");
+
+  // Cenário B: IPC rejeita com erro de CLI/npm não encontrado
+  const errB = new Error("Error invoking remote method 'vercel:connect': Error: O Vercel CLI não está disponível porque o npm não foi encontrado.");
+  assert.equal(formatError(errB, null), "O Vercel CLI não está disponível porque o npm não foi encontrado.");
+
+  // Cenário C: IPC rejeita sem mensagem útil
+  const errC = new Error("");
+  assert.equal(formatError(errC, null), "Erro ao conectar com Vercel.");
+
+  // Cenário D: Fallback para vercelState.error
+  assert.equal(formatError(null, "Erro interno gravado no estado"), "Erro interno gravado no estado");
+});
+
+
+
 

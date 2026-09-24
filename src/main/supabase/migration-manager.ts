@@ -143,13 +143,13 @@ export class MigrationManager extends EventEmitter {
       status: "PENDING",
       createdAt: Date.now(),
       expiresAt,
+      provider: request.provider || "supabase",
+      lovableProjectId: request.lovableProjectId,
+      projectGeneration: request.projectGeneration,
       summary
     };
 
     this.proposals.set(proposalId, proposal);
-
-    // Emite evento para o Chat Nativo renderizar o DatabaseMigrationCard
-    this.emit("migration-asked", proposal);
 
     return new Promise<MigrationExecutionResult>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
@@ -162,6 +162,9 @@ export class MigrationManager extends EventEmitter {
         timeoutId,
         request
       });
+
+      // Emite evento para o Chat Nativo renderizar o DatabaseMigrationCard
+      this.emit("migration-asked", proposal);
     });
   }
 
@@ -240,6 +243,15 @@ export class MigrationManager extends EventEmitter {
       status: "APPROVED"
     };
 
+    // Para provider "lovable": resolver a Promise imediatamente para que o MCP Server
+    // possa prosseguir com a execução real e chamar notifyToolCompleted em seguida.
+    // Para provider "supabase" (ou sem provider): manter o comportamento original onde
+    // a Promise fica pendente até notifyToolCompleted resolver com SUCCESS/FAILED.
+    if (proposal.provider === "lovable") {
+      this.pendingResolvers.delete(proposal.id);
+      resolver.resolve(result);
+    }
+
     return result;
   }
 
@@ -299,20 +311,22 @@ export class MigrationManager extends EventEmitter {
       return;
     }
 
-    // Sucesso da Execução Real pelo MCP -> Persistência Canônica do arquivo em Disco
+    // Sucesso da Execução Real pelo MCP -> Persistência Canônica do arquivo em Disco (Apenas Supabase)
     let savedFilename: string | undefined;
-    const rootDir = resolver?.request?.projectRoot || process.cwd();
-    const migrationsDir = path.join(rootDir, "supabase", "migrations");
-    const filename = `${this.formatTimestamp()}_${proposal.name}.sql`;
-    const filePath = path.join(migrationsDir, filename);
+    if (proposal.provider !== "lovable") {
+      const rootDir = resolver?.request?.projectRoot || process.cwd();
+      const migrationsDir = path.join(rootDir, "supabase", "migrations");
+      const filename = `${this.formatTimestamp()}_${proposal.name}.sql`;
+      const filePath = path.join(migrationsDir, filename);
 
-    try {
-      await fs.mkdir(migrationsDir, { recursive: true });
-      await fs.writeFile(filePath, proposal.originalSql + "\n", "utf8");
-      savedFilename = `supabase/migrations/${filename}`;
-      proposal.appliedFilename = savedFilename;
-    } catch (fileErr: any) {
-      console.error("[MigrationManager] Erro ao gravar arquivo de migração em disco:", fileErr);
+      try {
+        await fs.mkdir(migrationsDir, { recursive: true });
+        await fs.writeFile(filePath, proposal.originalSql + "\n", "utf8");
+        savedFilename = `supabase/migrations/${filename}`;
+        proposal.appliedFilename = savedFilename;
+      } catch (fileErr: any) {
+        console.error("[MigrationManager] Erro ao gravar arquivo de migração em disco:", fileErr);
+      }
     }
 
     proposal.status = "SUCCESS";

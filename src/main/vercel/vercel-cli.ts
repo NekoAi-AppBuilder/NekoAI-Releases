@@ -113,6 +113,13 @@ export const resolveExecutable = async (names: string[]): Promise<string | null>
   return null;
 };
 
+export interface VercelLoginTerminalSession {
+  strategy: string;
+  pid?: number;
+  child: ChildProcess;
+  waitClose: () => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+}
+
 export class VercelCli {
   private activeProcesses = new Set<ChildProcess>();
 
@@ -133,93 +140,150 @@ export class VercelCli {
     return environment;
   }
 
-  public async openLoginTerminal(cli: VercelCliCommand): Promise<{ strategy: string; pid?: number }> {
+  public async openLoginTerminal(
+    cli: VercelCliCommand,
+    strategyIndex = 0
+  ): Promise<VercelLoginTerminalSession> {
     if (process.platform !== "win32") {
       throw new Error("O login interativo da Vercel está disponível nesta versão para Windows.");
     }
 
     const cmdShell = process.env.ComSpec || "cmd.exe";
-    const terminalArgs = [cli.command, ...cli.prefix, "login"];
+    const quoteArg = (arg: string): string => (arg.includes(" ") ? `"${arg}"` : arg);
+    const fullCmd = [cli.command, ...cli.prefix, "login"].map(quoteArg).join(" ");
+
+    const createSession = (
+      name: string,
+      child: ChildProcess
+    ): Promise<VercelLoginTerminalSession> => {
+      this.activeProcesses.add(child);
+
+      const waitClose = () =>
+        new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+          if (child.exitCode !== null || child.killed) {
+            resolve({ code: child.exitCode, signal: child.signalCode });
+            return;
+          }
+          child.once("close", (code, signal) => resolve({ code, signal }));
+          child.once("error", () => resolve({ code: -1, signal: null }));
+        });
+
+      child.once("close", () => {
+        this.activeProcesses.delete(child);
+      });
+      child.once("error", () => {
+        this.activeProcesses.delete(child);
+      });
+
+      return new Promise<VercelLoginTerminalSession>((resolve, reject) => {
+        child.once("error", (err) => {
+          this.activeProcesses.delete(child);
+          reject(err);
+        });
+        child.once("spawn", () => {
+          resolve({
+            strategy: name,
+            pid: child.pid,
+            child,
+            waitClose,
+          });
+        });
+      });
+    };
 
     const strategies: Array<{
       name: string;
-      execute: () => Promise<{ strategy: string; pid?: number }>;
+      execute: () => Promise<VercelLoginTerminalSession>;
     }> = [
       {
-        name: "wt",
+        name: "conhost",
         execute: async () => {
-          const wtPath = await resolveExecutable(["wt.exe", "wt"]);
-          if (!wtPath) throw new Error("Windows Terminal (wt.exe) não encontrado.");
-          return new Promise<{ strategy: string; pid?: number }>((resolve, reject) => {
-            const child = spawn(
-              wtPath,
-              ["-w", "new", "new-tab", "--title", "NekoAI - Vercel Login", cmdShell, "/k", ...terminalArgs],
-              {
-                detached: true,
-                env: this.getCliEnvironment(),
-                windowsHide: false,
-                stdio: "ignore",
-              }
-            );
-            child.once("error", reject);
-            child.once("spawn", () => {
-              child.unref();
-              resolve({ strategy: "wt", pid: child.pid });
-            });
-          });
-        },
-      },
-      {
-        name: "cmd-start",
-        execute: async () => {
-          return new Promise<{ strategy: string; pid?: number }>((resolve, reject) => {
-            const child = spawn(
-              cmdShell,
-              ["/c", "start", "NekoAI - Vercel Login", cmdShell, "/k", ...terminalArgs],
-              {
-                detached: true,
-                env: this.getCliEnvironment(),
-                windowsHide: false,
-                stdio: "ignore",
-              }
-            );
-            child.once("error", reject);
-            child.once("spawn", () => {
-              child.unref();
-              resolve({ strategy: "cmd-start", pid: child.pid });
-            });
-          });
+          const conhostPath = await resolveExecutable(["conhost.exe", "conhost"]);
+          if (!conhostPath) throw new Error("conhost.exe não encontrado.");
+          const child = spawn(
+            conhostPath,
+            [cmdShell, "/c", `title NekoAI - Vercel Login && echo [NekoAI] Conectando a Vercel... && ${fullCmd}`],
+            {
+              env: this.getCliEnvironment(),
+              windowsHide: false,
+              stdio: "ignore",
+            }
+          );
+          return createSession("conhost", child);
         },
       },
       {
         name: "powershell",
         execute: async () => {
           const psPath = (await resolveExecutable(["powershell.exe", "powershell"])) || "powershell.exe";
-          const psArgs = terminalArgs.map((a) => `'${a.replace(/'/g, "''")}'`).join(", ");
-          const psScript = `Start-Process -FilePath '${cmdShell}' -ArgumentList '/k', ${psArgs}`;
-          return new Promise<{ strategy: string; pid?: number }>((resolve, reject) => {
-            const child = spawn(
-              psPath,
-              ["-NoProfile", "-NonInteractive", "-Command", psScript],
-              {
-                detached: true,
-                env: this.getCliEnvironment(),
-                windowsHide: false,
-                stdio: "ignore",
-              }
-            );
-            child.once("error", reject);
-            child.once("spawn", () => {
-              child.unref();
-              resolve({ strategy: "powershell", pid: child.pid });
-            });
-          });
+          const child = spawn(
+            psPath,
+            [
+              "-NoProfile",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-Command",
+              `[Console]::Title = 'NekoAI - Vercel Login'; Write-Host '[NekoAI] Conectando a Vercel...'; & ${fullCmd}`,
+            ],
+            {
+              env: this.getCliEnvironment(),
+              windowsHide: false,
+              stdio: "ignore",
+            }
+          );
+          return createSession("powershell", child);
+        },
+      },
+      {
+        name: "wt-wait",
+        execute: async () => {
+          const wtPath = await resolveExecutable(["wt.exe", "wt"]);
+          if (!wtPath) throw new Error("Windows Terminal (wt.exe) não encontrado.");
+          const child = spawn(
+            wtPath,
+            [
+              "--wait",
+              "-w",
+              "new",
+              "--title",
+              "NekoAI - Vercel Login",
+              cmdShell,
+              "/c",
+              `title NekoAI - Vercel Login && echo [NekoAI] Conectando a Vercel... && ${fullCmd}`,
+            ],
+            {
+              env: this.getCliEnvironment(),
+              windowsHide: false,
+              stdio: "ignore",
+            }
+          );
+          return createSession("wt-wait", child);
+        },
+      },
+      {
+        name: "cmd-direct",
+        execute: async () => {
+          const child = spawn(
+            cmdShell,
+            ["/c", `title NekoAI - Vercel Login && echo [NekoAI] Conectando a Vercel... && ${fullCmd}`],
+            {
+              env: this.getCliEnvironment(),
+              windowsHide: false,
+              stdio: "ignore",
+            }
+          );
+          return createSession("cmd-direct", child);
         },
       },
     ];
 
+    if (strategyIndex >= strategies.length) {
+      throw new Error("Todas as estratégias de terminal falharam.");
+    }
+
     let lastError: Error | null = null;
-    for (const strategy of strategies) {
+    for (let i = strategyIndex; i < strategies.length; i++) {
+      const strategy = strategies[i];
       try {
         const res = await strategy.execute();
         return res;
@@ -318,6 +382,20 @@ export class VercelCli {
       }).unref();
     } else {
       child.kill();
+    }
+  }
+
+  public async listProjectsJson(cli: VercelCliCommand): Promise<any[]> {
+    try {
+      const result = await this.runCli(cli, ["project", "ls", "--json"], undefined, 30000);
+      const raw = result.stdout || "[]";
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+      if (parsed && Array.isArray(parsed.projects)) return parsed.projects;
+      return [];
+    } catch (err) {
+      console.warn("[Neko/Vercel] listProjectsJson error:", err);
+      return [];
     }
   }
 

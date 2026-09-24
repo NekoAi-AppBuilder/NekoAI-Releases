@@ -2321,6 +2321,21 @@ html, body, #root, * {
   box-shadow: 0 6px 22px rgba(37, 99, 235, 0.2);
 }
 
+.home-btn-github {
+  background: rgba(35, 134, 54, 0.15);
+  border: 1px solid rgba(46, 160, 67, 0.45);
+  color: #ffffff;
+  box-shadow: 0 4px 18px rgba(35, 134, 54, 0.12);
+}
+
+.home-btn-github:hover {
+  background: rgba(46, 160, 67, 0.28);
+  border-color: rgba(63, 185, 80, 0.75);
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 22px rgba(35, 134, 54, 0.22);
+}
+
 /* Tabs & Divider */
 .home-divider-wrap {
   width: 100%;
@@ -6577,4 +6592,292 @@ button.github-pull-btn:hover:not(:disabled) {
   min-width: 32px !important;
   min-height: 32px !important;
   border-radius: 8px !important;
+}
+
+/* Modern Animated Preview Loader */
+.preview-loader-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  color: #81798e;
+  text-align: center;
+  padding: 30px;
+  max-width: 440px;
+  margin: 0 auto;
+}
+
+.preview-loader-spinner {
+  width: 54px;
+  height: 54px;
+  position: relative;
+  display: grid;
+  place-items: center;
+  margin-bottom: 4px;
+}
+
+.preview-loader-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  border-top-color: #c24cff;
+  border-right-color: #6330ff;
+  animation: previewSpin 0.9s linear infinite;
+  box-shadow: 0 0 24px rgba(162, 79, 255, 0.28);
+}
+
+.preview-loader-inner-icon {
+  color: #c24cff;
+  opacity: 0.9;
+}
+
+@keyframes previewSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.preview-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.preview-badge {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.preview-badge.framework {
+  background: rgba(162, 79, 255, 0.14);
+  color: #d6adff;
+  border: 1px solid rgba(162, 79, 255, 0.25);
+}
+
+.preview-badge.pm {
+  background: rgba(255, 255, 255, 0.05);
+  color: #a398b0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.preview-loader-title {
+  color: #ece5f5;
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0;
+  line-height: 1.3;
+}
+
+.preview-loader-subtitle {
+  color: #8c8397;
+  font-size: 11px;
+  line-height: 1.55;
+  margin: 0;
+  max-width: 340px;
+}
+
+.preview-error-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.preview-retry-btn {
+  border: 1px solid rgba(166, 76, 255, 0.35);
+  background: linear-gradient(135deg, rgba(166, 76, 255, 0.2), rgba(99, 48, 255, 0.2));
+  color: #e5d4fa;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+
+.preview-retry-btn:hover {
+  background: linear-gradient(135deg, rgba(166, 76, 255, 0.35), rgba(99, 48, 255, 0.35));
+  border-color: rgba(166, 76, 255, 0.5);
+  color: #fff;
+}
+
+.preview-logs-btn {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: #baaebd;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.preview-logs-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #eee7f5;
+}
+
+/* Custom NekoAI Window Title Bar */
+.neko-custom-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 34px;
+  background: #070510;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  user-select: none;
+  -webkit-app-region: drag;
+  z-index: 99999;
+  position: relative;
+  flex-shrink: 0;
+  padding: 0 4px;
+}
+
+.titlebar-left-menus {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-menu-item {
+  position: relative;
+}
+
+.titlebar-menu-btn {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #9494a8;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  height: 26px;
+  display: flex;
+  align-items: center;
+}
+
+.titlebar-menu-btn:hover,
+.titlebar-menu-btn.active {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+}
+
+.titlebar-menu-btn.brand-btn {
+  font-weight: 700;
+  color: #ede7f5;
+  letter-spacing: 0.3px;
+}
+
+.titlebar-menu-btn.brand-btn:hover {
+  color: #ca8a04;
+}
+
+.titlebar-dropdown-menu {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 4px;
+  background: #110d22;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 6px;
+  min-width: 210px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  z-index: 100000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #d1cbdc;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.titlebar-dropdown-item.action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.09);
+  color: #ffffff;
+}
+
+.titlebar-dropdown-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.titlebar-dropdown-item.version-info {
+  color: #ca8a04;
+  font-weight: 600;
+  cursor: default;
+  background: rgba(202, 138, 4, 0.1);
+}
+
+.titlebar-dropdown-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 4px 0;
+}
+
+.titlebar-drag-spacer {
+  flex: 1;
+  height: 100%;
+  -webkit-app-region: drag;
+}
+
+.titlebar-win-controls {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-win-btn {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: #8c8299;
+  width: 42px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.titlebar-win-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+
+.titlebar-win-btn.close:hover {
+  background: #e11d48;
+  color: #ffffff;
 }

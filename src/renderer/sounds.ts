@@ -8,7 +8,7 @@
 // Falhas de áudio/autoplay nunca quebram a aplicação.
 // ============================================================
 
-export type NotifyKind = "task-complete" | "task-error" | "question" | "approval" | "plan" | "test";
+export type NotifyKind = "task-complete" | "task-error" | "question" | "approval" | "plan" | "migration" | "test";
 
 const STORAGE_KEY = "nekoai.soundEnabled";
 const DEDUPE_WINDOW_MS = 60_000;
@@ -53,7 +53,7 @@ function audioContext(): AudioContext | null {
   }
 }
 
-function tone(freq: number, startDelay: number, duration: number, type: OscillatorType = "sine", peak = 0.28): void {
+function tone(freq: number, startDelay: number, duration: number, type: OscillatorType = "sine", peak = 0.65): void {
   const c = ctx;
   if (!c) return;
   try {
@@ -80,27 +80,33 @@ export function playNotify(kind: NotifyKind): void {
   try {
     switch (kind) {
       case "task-complete":
-        tone(660, 0, 0.18, "sine", 0.32);
-        tone(990, 0.12, 0.24, "sine", 0.32);
+        tone(660, 0, 0.22, "sine", 0.70);
+        tone(990, 0.12, 0.28, "sine", 0.70);
         break;
       case "task-error":
-        tone(330, 0, 0.2, "triangle", 0.28);
-        tone(220, 0.14, 0.28, "triangle", 0.28);
+        tone(330, 0, 0.22, "triangle", 0.65);
+        tone(220, 0.14, 0.30, "triangle", 0.65);
         break;
       case "question":
-        tone(523, 0, 0.16, "sine", 0.30);
-        tone(784, 0.12, 0.2, "sine", 0.30);
+        tone(523, 0, 0.18, "sine", 0.65);
+        tone(784, 0.12, 0.22, "sine", 0.65);
         break;
       case "approval":
-        tone(587, 0, 0.14, "sine", 0.30);
-        tone(880, 0.1, 0.18, "sine", 0.28);
+        tone(587, 0, 0.16, "sine", 0.65);
+        tone(880, 0.1, 0.20, "sine", 0.65);
         break;
       case "plan":
-        tone(494, 0, 0.16, "sine", 0.28);
-        tone(659, 0.11, 0.2, "sine", 0.28);
+        tone(494, 0, 0.18, "sine", 0.65);
+        tone(659, 0.11, 0.22, "sine", 0.65);
+        break;
+      case "migration":
+        // Som triplo distinto (arpejo ascendente futurista) para Banco de Dados / Migration
+        tone(440, 0, 0.14, "sine", 0.75);
+        tone(659, 0.08, 0.14, "sine", 0.75);
+        tone(880, 0.16, 0.24, "sine", 0.80);
         break;
       case "test":
-        tone(700, 0, 0.22, "sine", 0.30);
+        tone(700, 0, 0.25, "sine", 0.70);
         break;
     }
   } catch {}

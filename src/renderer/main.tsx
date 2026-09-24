@@ -1018,7 +1018,7 @@ function App() {
   const [brokenThumbs, setBrokenThumbs] = React.useState<Set<string>>(() => new Set());
   const [sessionId, setSessionId] = React.useState<string | null>(null);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.87");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.89");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -2668,12 +2668,27 @@ function App() {
     window.neko.githubStatus().then(result => setGithubStatus(result || { connected: false, repos: [] })).catch(() => setGithubStatus({ connected: false, repos: [] }));
     return window.neko.onGithubEvent((event:any) => {
       if (event?.type === "github.connected") {
-        setGithubStatus(event.properties || { connected: true, repos: [] });
+        const nextStatus = event.properties || { connected: true, repos: [] };
+        setGithubStatus(nextStatus);
         setGithubBusy(false);
         setGithubDevice(null);
         setGithubError("");
+
+        const isNeedsInst = Boolean(nextStatus.needsInstallation);
+        const installUrl = nextStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new";
+
+        // If Device Flow just finished and GitHub App installation is needed, automatically open installation URL in browser
+        if (isNeedsInst && (modalRef.current === "githubDevice" || githubDevice)) {
+          console.log("[GitHub Install] Device Flow completed, opening installation URL in browser");
+          void window.neko.githubOpen(installUrl);
+        }
+
         const intent = pendingGithubIntentRef.current;
-        if (intent === "clone") {
+        if (isNeedsInst) {
+          console.log("[GitHub Intent] App installation needed, keeping on 'github' modal");
+          setGithubIntent(null);
+          setModal("github");
+        } else if (intent === "clone") {
           console.log("[GitHub Intent] github connected, resuming clone flow");
           console.log("[GitHub Intent] opening githubClone modal");
           setGithubIntent(null);
@@ -2705,6 +2720,19 @@ function App() {
       }
     });
   }, [syncGithubContext]);
+
+  React.useEffect(() => {
+    const onFocus = () => {
+      if (githubStatus.connected && githubStatus.needsInstallation) {
+        console.log("[GitHub Install] Rechecking installation status on window focus");
+        void window.neko.githubStatus(true).then(st => {
+          if (st) setGithubStatus(st);
+        }).catch(() => {});
+      }
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [githubStatus.connected, githubStatus.needsInstallation]);
 
   const recordTimelineItem = React.useCallback((entry: Partial<TimelineItem> & { id: string; title: string }) => {
     const currentTaskId = currentTaskIdRef.current || `task-${Date.now()}`;
@@ -5393,6 +5421,10 @@ function App() {
     setGithubPublishPrivate(true);
     setGithubPublishError("");
     setGithubPublishBusy(false);
+    if (!githubStatus.connected || githubStatus.needsInstallation) {
+      setModal("github");
+      return;
+    }
     setModal("githubPublish");
   }
 
@@ -5961,7 +5993,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.88"}</span>
+                  <span>Versão {appVersion || "0.4.89"}</span>
                 </div>
                 <button
                   type="button"
@@ -6358,7 +6390,7 @@ function App() {
               <LovableIcon size={17}/>
               <span className="integration-dot"/>
             </button>
-            <button className={`integration-status ${githubStatus.connected ? "online" : "idle"}`} onClick={() => {
+            <button className={`integration-status ${githubStatus.connected ? (githubStatus.needsInstallation ? "busy" : "online") : "idle"}`} onClick={() => {
               setGithubError("");
               setGithubShowRepos(false);
               setGithubCommitSuccess(false);
@@ -6368,12 +6400,14 @@ function App() {
               }
               if (!githubStatus.connected) {
                 setModal("github");
+              } else if (githubStatus.needsInstallation) {
+                setModal("github");
               } else if (project && !githubLinkStatus.linkedRepo) {
                 prepareGithubPublish();
               } else {
                 setModal("github");
               }
-            }} title={githubStatus.connected ? `GitHub conectado como ${githubStatus.user?.login || ""}` : "GitHub não conectado"}>
+            }} title={!githubStatus.connected ? "GitHub não conectado" : (githubStatus.needsInstallation ? `GitHub autorizado (@${githubStatus.user?.login || ""}) — Instalação do App necessária` : `GitHub conectado como @${githubStatus.user?.login || ""}`)}>
               <GitHubIcon size={17}/>
               <span className="integration-dot"/>
             </button>
@@ -7562,9 +7596,29 @@ function App() {
           <div className="github-user">
             <div className="github-avatar">{githubStatus.user?.avatarUrl ? <img src={githubStatus.user.avatarUrl} alt=""/> : <GitHubIcon size={20} />}</div>
             <div><b>{githubStatus.user?.name || githubStatus.user?.login || "GitHub"}</b><small>@{githubStatus.user?.login || ""}</small></div>
-            <span className="github-ok">Conectado</span>
+            {githubStatus.needsInstallation ? (
+              <span className="github-warning" style={{ marginLeft: "auto", fontSize: 9, color: "#fbbf24", background: "rgba(251,191,36,.08)", border: "1px solid rgba(251,191,36,.22)", padding: "4px 7px", borderRadius: 5 }}>Instalação pendente</span>
+            ) : (
+              <span className="github-ok">Conectado</span>
+            )}
           </div>
-          {githubStatus.needsPermissions ? <div className="github-auth-update-needed"><div><b>Permissões do GitHub precisam de aprovação</b><small>O NekoAI está conectado, mas o GitHub App ainda não tem todas as permissões necessárias para publicar e enviar código.</small></div><button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}><GitHubIcon size={14}/> Verificar permissões</button></div> : null}
+          {githubStatus.needsInstallation ? (
+            <div className="github-auth-update-needed" style={{ margin: "12px 0 16px 0", flexDirection: "column", alignItems: "stretch" }}>
+              <div>
+                <b>Instalação do GitHub App necessária</b>
+                <small>Seu GitHub foi autorizado com sucesso, mas o NekoAI ainda precisa ser instalado na sua conta para ter acesso aos seus repositórios.</small>
+              </div>
+              <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, marginTop: 12, width: "100%" }}>
+                <button className="primary" onClick={() => window.neko.githubOpen(githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new")}>
+                  <GitHubIcon size={14}/> Instalar NekoAI no GitHub
+                </button>
+                <button className="secondary" onClick={() => void refreshGithub()} disabled={githubBranchRefreshing}>
+                  {githubBranchRefreshing ? <><Loader2 size={13} className="spin"/> Verificando...</> : <><RefreshCw size={13}/> Já instalei — verificar novamente</>}
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {githubStatus.needsPermissions && !githubStatus.needsInstallation ? <div className="github-auth-update-needed"><div><b>Permissões do GitHub precisam de aprovação</b><small>O NekoAI está conectado, mas o GitHub App ainda não tem todas as permissões necessárias para publicar e enviar código.</small></div><button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}><GitHubIcon size={14}/> Verificar permissões</button></div> : null}
           {project && githubLinkStatus.linkedRepo ? (() => {
             const isAccessible = Boolean(githubStatus.repos?.some(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase()));
             const linkedRepoUrl = githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`;
@@ -7729,6 +7783,22 @@ function App() {
                 </div>
               ) : (
                 <>
+                  {githubStatus.needsInstallation && (
+                    <div className="github-auth-update-needed" style={{ margin: "2px 0 12px 0" }}>
+                      <div>
+                        <b>Instalação do GitHub App necessária</b>
+                        <small>Sua conta foi autorizada, mas o NekoAI precisa ser instalado no GitHub para acessar seus repositórios.</small>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                        <button className="primary" onClick={() => window.neko.githubOpen(githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new")}>
+                          <GitHubIcon size={14}/> Instalar NekoAI no GitHub
+                        </button>
+                        <button className="secondary" onClick={() => void refreshGithub()} disabled={githubBranchRefreshing}>
+                          {githubBranchRefreshing ? <><Loader2 size={13} className="spin"/> Verificando...</> : <><RefreshCw size={13}/> Já instalei — verificar novamente</>}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <div className="github-repo-head" style={{ marginTop: 2, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                     <b>Selecione o repositório</b>
                     <button className="icon-btn" onClick={() => void refreshGithub()} title="Atualizar lista"><RefreshCw size={14}/></button>

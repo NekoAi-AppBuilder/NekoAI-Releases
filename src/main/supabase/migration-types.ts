@@ -30,6 +30,9 @@ export interface MigrationProposal {
   status: MigrationProposalStatus;
   createdAt: number;
   expiresAt: number;
+  provider?: "supabase" | "lovable";
+  lovableProjectId?: string;
+  projectGeneration?: number;
   summary?: string;
   error?: string;
   appliedFilename?: string;
@@ -44,6 +47,9 @@ export interface MigrationProposalRequest {
   projectRef: string;
   name: string;
   sql: string;
+  provider?: "supabase" | "lovable";
+  lovableProjectId?: string;
+  projectGeneration?: number;
   summary?: string;
   projectRoot?: string;
 }
