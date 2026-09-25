@@ -37,11 +37,13 @@ export interface MigrationProposal {
   error?: string;
   appliedFilename?: string;
   schemaVerificationStatus?: "VERIFIED" | "UNVERIFIED" | "FAILED";
+  jitRequestId?: string;
 }
 
 export interface MigrationProposalRequest {
   sessionId: string;
   permissionId?: string;
+  jitRequestId?: string;
   callId?: string;
   messageId?: string;
   projectRef: string;

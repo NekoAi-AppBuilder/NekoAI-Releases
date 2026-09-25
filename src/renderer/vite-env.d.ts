@@ -7,7 +7,13 @@ interface Window {
     getLastProjectDirectory?(): Promise<string | null>;
     projectExists(projectPath: string): Promise<boolean>;
     isInsideApplicationRoot(projectPath: string): Promise<boolean>;
-    reportRendererError(payload: { type: string; message: string; filename: string; lineno: number; colno: number; stack: string }): Promise<void>;
+    getRecentProjects?(): Promise<any[]>;
+    touchRecentProject?(projectPath: string): Promise<any[]>;
+    removeRecentProject?(projectPath: string): Promise<any[]>;
+    deleteProject?(projectPath: string): Promise<{ success: boolean; error?: string; updatedList: any[] }>;
+    toggleFavoriteProject?(targetPath: string): Promise<any[]>;
+    saveRecentProjects?(projects: any[]): Promise<any[]>;
+    onRecentProjectsUpdated?(callback: (projects: any[]) => void): () => void;
     createProject(path: string): Promise<any>;
     status(): Promise<any>;
     prompt(sessionId: string, text: string, model?: { providerID: string; modelID: string; variant?: string }, attachments?: any[], contextPaths?: string[], planMode?: boolean, effort?: string, perf?: { t0?: number; prepMs?: number }): Promise<any>;
@@ -186,18 +192,26 @@ interface Window {
     }) => void): () => void;
     lovableGetState(): Promise<{
       status: "disconnected" | "detecting" | "authorizing" | "validating" | "connected" | "error";
+      cloudStatus: "connected" | "auth_required" | "session_expired" | "forbidden" | "not_confirmed" | "no_cloud" | "error" | "unknown";
       isLovableProject: boolean;
       detectionReason?: string;
       detectedProjectId: string | null;
       projectId: string | null;
+      lovableProjectId: string | null;
+      hasLovableCloud: boolean | null;
+      lovableCloudConnected: boolean;
+      lovableSessionValid: boolean;
       userEmail: string | null;
       connectedAt: number | null;
       error: string | null;
+      explicitlyDisconnected?: boolean;
     }>;
     lovableOpenLogin(): Promise<void>;
     lovableLinkProject(projectId?: string): Promise<any>;
     lovableUnlink(): Promise<any>;
     lovableTestConnection(): Promise<{ success: boolean; error?: string }>;
+    lovableCancelJit(reason?: string): Promise<{ ok: boolean }>;
+    onLovableJitRequired(callback: (data: any) => void): () => void;
     onLovableStateChange(callback: (state: any) => void): () => void;
   };
 }

@@ -495,8 +495,20 @@ export class SupabaseManager extends EventEmitter {
     this.isBusy = true;
 
     try {
+      // Remove vault integration for the active project so applyProjectState
+      // does not auto-reconnect on the next app start or modal open.
+      if (this.activeProjectPath) {
+        await this.vault.removeIntegration(this.activeProjectPath).catch(() => {});
+      }
+
       await this.cli.logout().catch(() => {});
       this.currentAccessToken = null;
+
+      // Reset initPromise so initialize() runs fresh on next call
+      // instead of reusing a stale cached promise that would re-apply
+      // the (now removed) vault integration.
+      this.initPromise = null;
+
       this.setState({
         ...EMPTY_SUPABASE_STATE,
         configured: true,

@@ -216,6 +216,12 @@ function formatAgentError(raw: any) {
   return { friendly, details: details.join("\n"), code, statusCode, retryable, requestId, rawMessage: message };
 }
 
+function stripAnsiCodes(text: string): string {
+  if (!text) return "";
+  // Strips ANSI control characters / escape sequences cleanly
+  return text.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, "").replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
+}
+
 function sanitizeDiagnosticMessage(value: string) {
   return value
     .replace(/https?:\/\/[^\s]+/gi, "o serviço do provedor")
@@ -621,7 +627,7 @@ type GitStatus = {
   summary?: GitStatusSummary;
 };
 
-type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | null;
+type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | null;
 
 // Compara caminhos de projeto ignorando separador final (mesma identidade real).
 function pathNormalizedEqual(a: string, b: string): boolean {
@@ -1014,15 +1020,40 @@ function App() {
   const toggleSounds = (value: boolean) => { setSoundEnabled(value); setSoundsOn(value); };
   const [recentProjects, setRecentProjects] = React.useState<RecentProject[]>([]);
   const [recentProjectsMenuOpen, setRecentProjectsMenuOpen] = React.useState(false);
+  const [openCardMenuPath, setOpenCardMenuPath] = React.useState<string | null>(null);
+  const [projectToDelete, setProjectToDelete] = React.useState<RecentProject | null>(null);
+  const [deleteProjectBusy, setDeleteProjectBusy] = React.useState(false);
   const [homeTab, setHomeTab] = React.useState<"all" | "favorites">("all");
   const [brokenThumbs, setBrokenThumbs] = React.useState<Set<string>>(() => new Set());
   const [sessionId, setSessionId] = React.useState<string | null>(null);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.89");
+  React.useEffect(() => {
+    if (!openCardMenuPath) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.home-project-card-menu') && !target.closest('.home-project-more-btn')) {
+        setOpenCardMenuPath(null);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setOpenCardMenuPath(null);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openCardMenuPath]);
+
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.90");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
   const [windowMenuOpen, setWindowMenuOpen] = React.useState<boolean>(false);
+  const [integrationsMenuOpen, setIntegrationsMenuOpen] = React.useState<boolean>(false);
 
   React.useEffect(() => {
     void window.neko.version?.().then((v: string) => { if (v) setAppVersion(v); }).catch(() => {});
@@ -1032,18 +1063,19 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    if (!nekoMenuOpen && !viewMenuOpen && !windowMenuOpen) return;
+    if (!nekoMenuOpen && !viewMenuOpen && !windowMenuOpen && !integrationsMenuOpen) return;
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       if (!target.closest(".neko-titlebar-menu-wrap")) {
         setNekoMenuOpen(false);
         setViewMenuOpen(false);
         setWindowMenuOpen(false);
+        setIntegrationsMenuOpen(false);
       }
     };
     window.addEventListener("click", handleClickOutside);
     return () => window.removeEventListener("click", handleClickOutside);
-  }, [nekoMenuOpen, viewMenuOpen, windowMenuOpen]);
+  }, [nekoMenuOpen, viewMenuOpen, windowMenuOpen, integrationsMenuOpen]);
 
   const projectName = React.useMemo(() => {
     if (!project) return "Projeto";
@@ -1105,7 +1137,18 @@ function App() {
   const [managedModels, setManagedModels] = React.useState<Model[]>([]);
   const [providers, setProviders] = React.useState<Provider[]>([]);
   const LAST_MODEL_STORAGE_KEY = "nekoai.lastModel";
-  const [selectedModel, setSelectedModel] = React.useState<{ providerID: string; modelID: string } | undefined>();
+  const [selectedModel, setSelectedModel] = React.useState<{ providerID: string; modelID: string } | undefined>(() => {
+    try {
+      const raw = localStorage.getItem(LAST_MODEL_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.providerID === "string" && typeof parsed.modelID === "string" && parsed.providerID.trim() && parsed.modelID.trim()) {
+          return { providerID: parsed.providerID.trim(), modelID: parsed.modelID.trim() };
+        }
+      }
+    } catch {}
+    return undefined;
+  });
   const [modelOpen, setModelOpen] = React.useState(false);
   const [modelSearch, setModelSearch] = React.useState("");
   const [chatAccordionOpenProvider, setChatAccordionOpenProvider] = React.useState<string | null>(null);
@@ -1197,18 +1240,28 @@ function App() {
 
   const [lovableState, setLovableState] = React.useState<{
     status: "disconnected" | "detecting" | "authorizing" | "validating" | "connected" | "error";
+    cloudStatus: "connected" | "auth_required" | "session_expired" | "forbidden" | "not_confirmed" | "no_cloud" | "error" | "unknown";
     isLovableProject: boolean;
     detectionReason?: string;
     detectedProjectId: string | null;
     projectId: string | null;
+    lovableProjectId: string | null;
+    hasLovableCloud: boolean | null;
+    lovableCloudConnected: boolean;
+    lovableSessionValid: boolean;
     userEmail: string | null;
     connectedAt: number | null;
     error: string | null;
   }>({
     status: "disconnected",
+    cloudStatus: "unknown",
     isLovableProject: false,
     detectedProjectId: null,
     projectId: null,
+    lovableProjectId: null,
+    hasLovableCloud: null,
+    lovableCloudConnected: false,
+    lovableSessionValid: false,
     userEmail: null,
     connectedAt: null,
     error: null,
@@ -1216,6 +1269,23 @@ function App() {
   const [lovableBusy, setLovableBusy] = React.useState(false);
   const [lovableError, setLovableError] = React.useState("");
   const [lovableManualProjectId, setLovableManualProjectId] = React.useState("");
+  const pendingLovableCloudCheckRef = React.useRef(false);
+  type PendingJITState = {
+    source: "layer1" | "layer2";
+    sessionId: string;
+    text?: string;
+    model?: any;
+    attachments?: any[];
+    contextPaths?: string[];
+    planMode?: boolean;
+    effort?: string;
+    taskId?: string;
+    toolName?: string;
+    projectId?: string;
+    jitId?: string;
+  };
+  const pendingJITRef = React.useRef<PendingJITState | null>(null);
+  const pendingJITPromptRef = pendingJITRef;
 
   // Função de máscara rígida: NEKO-XXXX-XXXX-XXXX-XXXX ou NEKO-TEST-XXXX-XXXX-XXXX
   const formatLicenseKey = (input: string): string => {
@@ -1969,6 +2039,8 @@ function App() {
       await window.neko.stop({ source: source || "user" }).catch(() => {});
     } catch {}
     setProject(null);
+    pendingLovableCloudCheckRef.current = false;
+    pendingJITPromptRef.current = null;
     setStatus("offline");
     setMessages([]);
     setSessionId("");
@@ -2073,14 +2145,65 @@ function App() {
               </div>
             </div>
           )}
-          <button
-            className={`home-project-fav-btn ${item.favorite ? "favorited" : ""}`}
-            onClick={e => toggleFavoriteProject(item.path, e)}
-            title={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
-            aria-label={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
-          >
-            <Star size={14} fill={item.favorite ? "#a855f7" : "none"} />
-          </button>
+          <div className="home-project-actions">
+            <button
+              className={`home-project-fav-btn ${item.favorite ? "favorited" : ""}`}
+              onClick={e => toggleFavoriteProject(item.path, e)}
+              title={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
+              aria-label={item.favorite ? "Remover dos favoritos" : "Adicionar aos favoritos"}
+            >
+              <Star size={14} fill={item.favorite ? "#a855f7" : "none"} />
+            </button>
+            <button
+              className={`home-project-more-btn ${openCardMenuPath === item.path ? "active" : ""}`}
+              onClick={e => {
+                e.stopPropagation();
+                e.preventDefault();
+                setOpenCardMenuPath(prev => prev === item.path ? null : item.path);
+              }}
+              title="Opções do projeto"
+              aria-label={`Opções do projeto ${item.name}`}
+            >
+              <MoreVertical size={14} />
+            </button>
+          </div>
+          {openCardMenuPath === item.path && (
+            <div
+              className="home-project-card-menu"
+              onClick={e => e.stopPropagation()}
+              role="menu"
+            >
+              <button
+                className="home-project-card-menu-item"
+                onClick={e => {
+                  e.stopPropagation();
+                  setOpenCardMenuPath(null);
+                  if (item.missing) {
+                    showToast("Esta pasta não existe mais no computador.");
+                    return;
+                  }
+                  void openRecentProject(item.path, source);
+                }}
+              >
+                <FolderOpen size={13} />
+                <span>Abrir projeto</span>
+              </button>
+              <div className="home-project-card-menu-divider" />
+              <button
+                className="home-project-card-menu-item destructive"
+                onClick={e => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  setProjectToDelete(item);
+                  setOpenCardMenuPath(null);
+                  setModal("deleteProjectConfirm");
+                }}
+              >
+                <Trash2 size={13} />
+                <span>Excluir projeto</span>
+              </button>
+            </div>
+          )}
         </div>
         <div className="home-project-footer">
           <div className="home-project-info">
@@ -2117,10 +2240,10 @@ function App() {
         </div>
       </div>
     );
-  }, [openRecentProject, removeRecentProject, showToast, toggleFavoriteProject, brokenThumbs]);
+  }, [openRecentProject, removeRecentProject, showToast, toggleFavoriteProject, brokenThumbs, openCardMenuPath]);
 
   const appendTerminalLine = React.useCallback((kind: "log" | "console" | "error", text: unknown, source = "Neko") => {
-    const raw = String(text ?? "").trim();
+    const raw = stripAnsiCodes(String(text ?? "")).trim();
     if (!raw) return;
     let clean = raw
       .replace(/\bOpenCode\b/gi, "Neko")
@@ -2155,7 +2278,7 @@ function App() {
   // ==== Console do Preview (runtime) ====
   const CONSOLE_LIMIT = 1000;
   const pushConsoleEntry = React.useCallback((level: ConsoleLevel, message: string, source?: string, url?: string) => {
-    const text = String(message ?? "");
+    const text = stripAnsiCodes(String(message ?? "")).trim();
     if (!text) return;
     setConsoleEntries(prev => {
       const entry: PreviewConsoleEntry = {
@@ -2345,8 +2468,9 @@ function App() {
   // nativa (WebContentsView) é suspensa via setInternalPreviewOverlay para que o overlay DOM
   // pinte perfeitamente sobre a superfície de preview (o iframe underlay permanece renderizado
   // no DOM, garantindo que o Preview continue visível ao fundo sem desaparecer).
+  const isTitlebarMenuOpen = Boolean(nekoMenuOpen || viewMenuOpen || windowMenuOpen || integrationsMenuOpen);
   const isModalOpen = Boolean(modal || isSwitchingProject || lightboxImage);
-  const isTopbarDropdownOpen = Boolean(githubBranchMenuOpen || projectMenuOpen || recentProjectsMenuOpen);
+  const isTopbarDropdownOpen = Boolean(githubBranchMenuOpen || projectMenuOpen || recentProjectsMenuOpen || isTitlebarMenuOpen);
   const isInternalDropdownOpen = Boolean(previewRouteOpen);
   const isComposerDropdownOpen = Boolean(modelOpen || chatModeMenuOpen);
   const isTimelineOverlay = Boolean(timelineOpen && workspaceTab === "preview");
@@ -2369,10 +2493,10 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [modal]);
 
-  const selectedModelRef = React.useRef<{ providerID: string; modelID: string } | undefined>(undefined);
+  const selectedModelRef = React.useRef<{ providerID: string; modelID: string } | undefined>(selectedModel);
   // Where the current model selection came from. Only an explicit user pick
   // is persisted; automatic fallbacks never overwrite the saved model.
-  const modelPickSourceRef = React.useRef<"user" | "restored" | "fallback" | "none">("none");
+  const modelPickSourceRef = React.useRef<"user" | "restored" | "fallback" | "none">(selectedModel ? "restored" : "none");
   // True while the engine is inside a retry cycle. Keeps the status text on
   // "Ajustando a execução" instead of letting busy erase the retry fact.
   const retryActiveRef = React.useRef(false);
@@ -3157,13 +3281,76 @@ function App() {
 
   React.useEffect(() => {
     window.neko.lovableGetState().then((s: any) => { if (s) setLovableState(s); }).catch(() => {});
+    const unsubJit = window.neko.onLovableJitRequired?.((data: any) => {
+      console.log("[Lovable Guard] Layer 2 MCP JIT required event received", data);
+      taskPhaseRef.current = "waiting_for_lovable_cloud";
+      setBusy(false);
+      setWorkingStatus("Aguardando conexão com o Lovable Cloud...");
+      setModal("lovable_jit");
+      pendingJITRef.current = {
+        source: "layer2",
+        sessionId: data?.sessionId || sessionIdRef.current || "",
+        toolName: data?.toolName,
+        projectId: data?.projectId,
+        jitId: data?.jitId,
+      };
+    });
+
     const unsubState = window.neko.onLovableStateChange((s: any) => {
-      if (s) setLovableState(s);
+      if (s) {
+        setLovableState(s);
+        // JIT AUTO-RESUME: Se o Cloud conectou com sucesso
+        if (s.lovableCloudConnected === true || s.status === "connected") {
+          setModal(prev => (prev === "lovable_jit" ? null : prev));
+          const pending = pendingJITRef.current;
+          pendingJITRef.current = null; // Limpa imediatamente
+
+          if (pending?.source === "layer1" && pending.text) {
+            console.log("[Lovable Guard] Lovable Cloud connected");
+            console.log("[Lovable Guard] resuming pending execution (Layer 1)");
+            showToast("Lovable Cloud conectado com sucesso! Retomando sua solicitação...");
+            setModal(null);
+            setWorkingStatus("Conexão estabelecida. Continuando sua solicitação...");
+            setBusy(true);
+
+            void window.neko.prompt(
+              pending.sessionId,
+              pending.text,
+              pending.model,
+              pending.attachments,
+              pending.contextPaths,
+              pending.planMode,
+              pending.effort
+            ).then((res: any) => {
+              if (res?.taskId) {
+                currentTaskIdRef.current = String(res.taskId);
+              }
+            }).catch((err: any) => {
+              console.error("[Lovable Guard] Error resuming pending prompt:", err);
+              setBusy(false);
+              setWorkingStatus("");
+              setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(err?.message || "Erro ao retomar solicitação.") }]);
+            });
+          } else if (pending?.source === "layer2" || taskPhaseRef.current === "waiting_for_lovable_cloud") {
+            // Layer 2 resume: A tool MCP estava suspensa no backend aguardando conexão.
+            // O backend acabou de desbloquear a Promise da tool via resolveAllPendingJit().
+            // NUNCA chamar window.neko.prompt() para não duplicar execução e não gerar segunda migration.
+            console.log("[Lovable Guard] Lovable Cloud connected for suspended MCP tool (Layer 2)");
+            console.log("[Lovable Guard] resuming visual activity state without prompt duplicate");
+            showToast("Lovable Cloud conectado com sucesso! Continuando operação...");
+            setModal(null);
+            taskPhaseRef.current = "running";
+            setBusy(true);
+            setWorkingStatus("Executando operação no Lovable Cloud...");
+          }
+        }
+      }
     });
     return () => {
       unsubState();
+      unsubJit?.();
     };
-  }, []);
+  }, [showToast, sanitizeUserFacingText]);
 
   React.useEffect(() => {
     if (modal === "vercel" && !vercelState.linked && project) {
@@ -3240,13 +3427,17 @@ function App() {
       setProviders(result.providers || []);
 
       const availableModels = (result.models || []).filter((m: Model) => m.connected && m.enabled);
+      if (availableModels.length === 0) {
+        return result;
+      }
+
       let savedModel: { providerID: string; modelID: string } | undefined;
       try {
         const raw = localStorage.getItem(LAST_MODEL_STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed.providerID === "string" && typeof parsed.modelID === "string") {
-            savedModel = { providerID: parsed.providerID, modelID: parsed.modelID };
+          if (parsed && typeof parsed.providerID === "string" && typeof parsed.modelID === "string" && parsed.providerID.trim() && parsed.modelID.trim()) {
+            savedModel = { providerID: parsed.providerID.trim(), modelID: parsed.modelID.trim() };
           }
         }
       } catch {}
@@ -3257,11 +3448,6 @@ function App() {
       const restored = savedModel && availableModels.some((m: Model) =>
         m.providerID === savedModel!.providerID && m.modelID === savedModel!.modelID
       ) ? savedModel : undefined;
-
-      // Clean invalid or disqualified saved model from localStorage
-      if (savedModel && !restored) {
-        try { localStorage.removeItem(LAST_MODEL_STORAGE_KEY); } catch {}
-      }
 
       const current = selectedModelRef.current;
       const currentIsAvailable = current && availableModels.some((m: Model) =>
@@ -3284,14 +3470,7 @@ function App() {
           next = { providerID: availableModels[0].providerID, modelID: availableModels[0].modelID };
           source = "fallback";
           const oldLabel = savedModel ? `${savedModel.providerID}/${savedModel.modelID}` : current ? `${current.providerID}/${current.modelID}` : "desconhecido";
-          console.warn(`[Neko/Model] Modelo salvo anteriormente '${oldLabel}' não é compatível com Chat/Agent. Redirecionando para '${next.providerID}/${next.modelID}'.`);
-          try {
-            localStorage.setItem(LAST_MODEL_STORAGE_KEY, JSON.stringify({
-              providerID: next.providerID,
-              modelID: next.modelID,
-              updatedAt: Date.now()
-            }));
-          } catch {}
+          console.warn(`[Neko/Model] Modelo salvo anteriormente '${oldLabel}' não está disponível no momento. Usando temporariamente '${next.providerID}/${next.modelID}'.`);
         }
         modelPickSourceRef.current = source;
         if (!(next && current && next.providerID === current.providerID && next.modelID === current.modelID)) {
@@ -3674,6 +3853,14 @@ function App() {
         notifyOnce("approval", `per:${String(props.permission.id)}`);
         setPendingPermissions(prev => prev.some(p => p.id === props.permission.id) ? prev : [...prev, props.permission as PermissionRequest]);
       }
+      return;
+    }
+    if (state === "waiting_for_lovable_cloud") {
+      if (isTaskTerminal()) return;
+      taskPhaseRef.current = "waiting_for_lovable_cloud";
+      setBusy(false);
+      setWorkingStatus("Aguardando conexão com o Lovable Cloud...");
+      setModal("lovable_jit");
       return;
     }
     if (state === "completed") {
@@ -4196,7 +4383,59 @@ function App() {
           setPreviewLoading(false);
           setPreviewCurrentRoute("/");
           clearConsole();
+          // Clear active error lines when preview server becomes healthy and ready
+          setTerminalLines(prev => prev.filter(l => l.kind !== "error"));
           void loadPreviewRoutes(false);
+
+          // Pós-clone: Decidir se o modal Lovable Cloud deve ser exibido após Preview Ready
+          if (pendingLovableCloudCheckRef.current) {
+            pendingLovableCloudCheckRef.current = false;
+            void window.neko.lovableGetState().then((s: any) => {
+              if (s) {
+                setLovableState(s);
+                const hasValidId = Boolean(s.projectId || s.detectedProjectId);
+                const isConnected = s.status === "connected" || s.lovableCloudConnected === true;
+                const needsAuthVerification = Boolean(s.isLovableProject && hasValidId && !s.lovableSessionValid && !isConnected);
+                const isCloudConfirmedUnconnected = Boolean(s.isLovableProject && hasValidId && s.hasLovableCloud === true && !isConnected);
+                const shouldShow = needsAuthVerification || isCloudConfirmedUnconnected;
+
+                let reason = "";
+                if (!s.isLovableProject) {
+                  reason = "Projeto não identificado como Lovable";
+                } else if (!hasValidId) {
+                  reason = "ProjectId Lovable não encontrado";
+                } else if (isConnected) {
+                  reason = "Lovable Cloud já está conectado";
+                } else if (needsAuthVerification) {
+                  reason = "Projeto Lovable detectado com projectId, requer autenticação para verificar recursos e Lovable Cloud";
+                } else if (isCloudConfirmedUnconnected) {
+                  reason = "Cloud confirmado e não conectado";
+                } else {
+                  reason = `Cloud não confirmado após validação de sessão (cloudStatus: ${s.cloudStatus || "unknown"}, hasLovableCloud: ${s.hasLovableCloud})`;
+                }
+
+                console.log("[Lovable Post Clone]", {
+                  projectPath: projectRef.current,
+                  isLovableProject: s.isLovableProject,
+                  projectId: s.projectId || s.detectedProjectId || s.lovableProjectId || null,
+                  previewReady: true,
+                  hasLovableCloud: s.hasLovableCloud,
+                  cloudStatus: s.cloudStatus || "unknown",
+                  lovableSessionValid: s.lovableSessionValid,
+                  lovableCloudConnected: s.lovableCloudConnected,
+                  shouldShowModal: shouldShow,
+                  reason,
+                });
+
+                if (shouldShow) {
+                  console.log(`[Neko/Lovable] Pós-clone: ${reason}. Abrindo modal Lovable.`);
+                  setModal("lovable");
+                }
+              }
+            }).catch((err) => {
+              console.warn("[Lovable Post Clone] Erro ao obter estado Lovable pós-preview:", err);
+            });
+          }
         }
         if (event.type === "preview.route-changed") {
           // O seletor acompanha a rota real do Preview interno (links internos,
@@ -4275,7 +4514,7 @@ function App() {
   // mode, tab changes and window resize all drive the native preview surface.
   React.useLayoutEffect(() => {
     const host = previewViewHostRef.current;
-    const visible = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host);
+    const visible = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host) && !isAnyOverlayOpen;
     let raf = 0;
     let pumpRaf = 0;
 
@@ -4357,7 +4596,7 @@ function App() {
       window.removeEventListener("transitionend", schedule);
       window.removeEventListener("transitioncancel", schedule);
     };
-  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen]);
+  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen, isAnyOverlayOpen]);
 
   // Fallback watchdog for build execution. OpenCode can occasionally leave
   // session.status as busy or events can be dropped.
@@ -4863,6 +5102,24 @@ function App() {
         effort
       );
       if (result?.cancelled) return;
+      if (result?.waitingForLovableCloud) {
+        console.log("[Lovable Guard] prompt preserved, waiting for Lovable Cloud connection (Layer 1)");
+        pendingJITRef.current = {
+          source: "layer1",
+          sessionId,
+          text: resolved.agentPromptText,
+          model: getEffectiveModel(selectedModel),
+          attachments: promptAttachments.length > 0 ? promptAttachments : undefined,
+          contextPaths: contextPaths.length > 0 ? contextPaths : undefined,
+          planMode,
+          effort,
+          taskId: String(result.taskId || taskId),
+        };
+        setBusy(false);
+        setWorkingStatus("Aguardando conexão com o Lovable Cloud...");
+        setModal("lovable_jit");
+        return;
+      }
       if (result?.taskId) {
         const backendTaskId = String(result.taskId);
         currentTaskIdRef.current = backendTaskId;
@@ -4926,6 +5183,23 @@ function App() {
     } catch (error) {
       console.warn("[StopDevelopment] abort failed", String((error as Error)?.message ?? error));
     }
+  }, [sessionId, finishActivity]);
+
+  const cancelJITPrompt = React.useCallback(() => {
+    const pending = pendingJITRef.current;
+    pendingJITRef.current = null;
+    void window.neko.lovableCancelJit?.("Operação cancelada pelo usuário.").catch(() => {});
+    setModal(null);
+    setWorkingStatus("");
+    setBusy(false);
+    taskPhaseRef.current = "idle";
+    finishActivity();
+    if (pending?.sessionId) {
+      void window.neko.abort(pending.sessionId).catch(() => {});
+    } else if (sessionId) {
+      void window.neko.abort(sessionId).catch(() => {});
+    }
+    console.log("[Lovable Guard] JIT modal cancelled by user, pending state discarded");
   }, [sessionId, finishActivity]);
 
   const rejectPlan = React.useCallback(() => {
@@ -5446,11 +5720,26 @@ function App() {
     setModal("githubLink");
   }
 
-  function openGithubCloneFromHome() {
-    console.log("[GitHub Intent] clone requested");
-    setGithubIntent("clone");
+  function resetGithubCloneState() {
+    setGithubCloneRepo(null);
+    setGithubCloneName("");
+    setGithubCloneParent("");
+    setGithubRepoSearch("");
     setGithubError("");
     setGithubBusy(false);
+  }
+
+  function closeGithubCloneModal() {
+    if (!githubBusy) {
+      resetGithubCloneState();
+      setModal(null);
+    }
+  }
+
+  function openGithubCloneFromHome() {
+    console.log("[GitHub Intent] clone requested");
+    resetGithubCloneState();
+    setGithubIntent("clone");
     if (!githubStatus.connected) {
       console.log("[GitHub Intent] github disconnected, preserving clone intent");
       void refreshGithub();
@@ -5507,9 +5796,11 @@ function App() {
       console.log("[GitHubCloneLifecycle] clone:success", { path: res?.path });
       if (res?.path) {
         console.log("[GitHub Clone FLOW] renderer received path", { path: res.path });
-        console.log("[GitHub Clone FLOW] renderer may close modal");
+        console.log("[GitHub Clone FLOW] renderer closing modal and resetting clone state");
+        resetGithubCloneState();
         setModal(null);
         void touchRecentProject(res.path);
+        pendingLovableCloudCheckRef.current = true;
         if (res.workspaceResult) {
           if (res.workspaceResult.error) {
             showToast(res.workspaceResult.error);
@@ -5984,6 +6275,7 @@ function App() {
                 e.stopPropagation();
                 setViewMenuOpen(false);
                 setWindowMenuOpen(false);
+                setIntegrationsMenuOpen(false);
                 setNekoMenuOpen(v => !v);
               }}
             >
@@ -5993,7 +6285,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.89"}</span>
+                  <span>Versão {appVersion || "0.4.90"}</span>
                 </div>
                 <button
                   type="button"
@@ -6032,6 +6324,7 @@ function App() {
                 e.stopPropagation();
                 setNekoMenuOpen(false);
                 setWindowMenuOpen(false);
+                setIntegrationsMenuOpen(false);
                 setViewMenuOpen(v => !v);
               }}
             >
@@ -6099,6 +6392,7 @@ function App() {
                 e.stopPropagation();
                 setNekoMenuOpen(false);
                 setViewMenuOpen(false);
+                setIntegrationsMenuOpen(false);
                 setWindowMenuOpen(v => !v);
               }}
             >
@@ -6139,6 +6433,95 @@ function App() {
                 >
                   <X size={14} />
                   <span>Fechar</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Integrações Menu */}
+          <div className="titlebar-menu-item">
+            <button
+              type="button"
+              className={`titlebar-menu-btn ${integrationsMenuOpen ? "active" : ""}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                setNekoMenuOpen(false);
+                setViewMenuOpen(false);
+                setWindowMenuOpen(false);
+                setIntegrationsMenuOpen(v => !v);
+              }}
+            >
+              Integrações
+            </button>
+            {integrationsMenuOpen && (
+              <div className="titlebar-dropdown-menu">
+                <button
+                  type="button"
+                  className="titlebar-dropdown-item action"
+                  onClick={() => {
+                    setIntegrationsMenuOpen(false);
+                    setVercelError(null);
+                    const folderName = project ? (project.split(/[/\\]/).filter(Boolean).pop() || "") : "";
+                    setVercelProjectName(slugifyVercelProjectName(folderName));
+                    setModal("vercel");
+                  }}
+                >
+                  <VercelIcon size={14} />
+                  <span>Vercel</span>
+                </button>
+                <button
+                  type="button"
+                  className="titlebar-dropdown-item action"
+                  onClick={() => {
+                    setIntegrationsMenuOpen(false);
+                    console.log("[SupabaseUI] titlebar menu Supabase clicked, current state:", supabaseState);
+                    void window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
+                    setSupabaseError("");
+                    setSupabaseView("auto");
+                    setModal("supabase");
+                  }}
+                >
+                  <SupabaseIcon size={14} />
+                  <span>Supabase</span>
+                </button>
+                <button
+                  type="button"
+                  className="titlebar-dropdown-item action"
+                  onClick={() => {
+                    setIntegrationsMenuOpen(false);
+                    setLovableError("");
+                    setModal("lovable");
+                    void window.neko.lovableGetState().then((s: any) => { if (s) setLovableState(s); }).catch(() => {});
+                  }}
+                >
+                  <LovableIcon size={14} />
+                  <span>Lovable Cloud</span>
+                </button>
+                <button
+                  type="button"
+                  className="titlebar-dropdown-item action"
+                  onClick={() => {
+                    setIntegrationsMenuOpen(false);
+                    setGithubError("");
+                    setGithubShowRepos(false);
+                    setGithubCommitSuccess(false);
+                    void syncGithubContext();
+                    if (githubStatus.connected) {
+                      void window.neko.githubStatus(true).then(st => { if (st) setGithubStatus(st); }).catch(() => {});
+                    }
+                    if (!githubStatus.connected) {
+                      setModal("github");
+                    } else if (githubStatus.needsInstallation) {
+                      setModal("github");
+                    } else if (project && !githubLinkStatus.linkedRepo) {
+                      prepareGithubPublish();
+                    } else {
+                      setModal("github");
+                    }
+                  }}
+                >
+                  <GitHubIcon size={14} />
+                  <span>GitHub</span>
                 </button>
               </div>
             )}
@@ -6932,7 +7315,7 @@ function App() {
           </section>
 
           <section className="workspace">
-            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno"/> : null}</div></div> : <PreviewLoaderView status={previewStatus} phase={previewPhase} message={previewMessage} framework={previewFramework} packageManager={previewPackageManager} onRetry={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })} onOpenLogs={() => { setTerminalOpen(true); setTerminalTab("logs"); }} />)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
+            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} style={isAnyOverlayOpen ? { pointerEvents: "none" } : undefined} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno" style={isAnyOverlayOpen ? { pointerEvents: "none" } : undefined}/> : null}</div></div> : <PreviewLoaderView status={previewStatus} phase={previewPhase} message={previewMessage} framework={previewFramework} packageManager={previewPackageManager} onRetry={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })} onOpenLogs={() => { setTerminalOpen(true); setTerminalTab("logs"); }} />)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
             <div className={`terminal-panel ${terminalOpen ? "open" : "closed"}`}>
               <div className="terminal-head"><div className="terminal-tabs"><button className={terminalTab === "logs" ? "active" : ""} onClick={() => { setTerminalTab("logs"); setTerminalOpen(true); }}>Logs</button><button className={terminalTab === "console" ? "active" : ""} onClick={() => { setTerminalTab("console"); setTerminalOpen(true); }}>Console</button><button className={terminalTab === "errors" ? "active" : ""} onClick={() => { setTerminalTab("errors"); setTerminalOpen(true); }}>Erros</button></div><button className="terminal-collapse" onClick={() => setTerminalOpen(v => !v)}>{terminalOpen ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}</button></div>
               {terminalOpen && (terminalTab === "console" ? (
@@ -7227,7 +7610,8 @@ function App() {
         </>
       )}
 
-    {modal && <div className="modal-backdrop" role="presentation" onClick={() => { if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
+    {modal && createPortal(
+      <div className="modal-backdrop" role="presentation" onClick={() => { if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
       {modal === "tutorials" && (() => {
         const tutorials = getNekoTutorials();
         const openVideo = (tutorial: NekoTutorial) => {
@@ -7751,7 +8135,7 @@ function App() {
             <h2 id="modal-title"><GitHubIcon size={18}/> Clonar do GitHub</h2>
             <p>Escolha o repositório e a pasta de destino para criar seu projeto.</p>
           </div>
-          <button className="close-btn" onClick={() => { if (!githubBusy) { setGithubError(""); setModal(null); } }} aria-label="Fechar"><X size={17}/></button>
+          <button className="close-btn" onClick={closeGithubCloneModal} aria-label="Fechar"><X size={17}/></button>
         </div>
         {!githubStatus.connected ? (
           <div className="github-connect-panel">
@@ -7767,16 +8151,16 @@ function App() {
           <>
             <div className="modal-scroll-body new-project-panel github-clone-project-panel">
               {githubCloneRepo ? (
-                <div className="github-clone-source" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                    <GitHubIcon size={16}/>
-                    <div style={{ minWidth: 0 }}>
-                      <b style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{githubCloneRepo.fullName}</b>
-                      <small>{githubCloneRepo.private ? "Repositório privado" : "Repositório público"} · {githubCloneRepo.defaultBranch || "main"}</small>
+                <div className="github-clone-source" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0, flex: 1 }}>
+                    <GitHubIcon size={18} style={{ flexShrink: 0 }} />
+                    <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0, textAlign: "left" }}>
+                      <b style={{ fontSize: 12, color: "#ffffff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{githubCloneRepo.fullName}</b>
+                      <small style={{ fontSize: 11, color: "#9ca3af" }}>{githubCloneRepo.private ? "Repositório privado" : "Repositório público"} · {githubCloneRepo.defaultBranch || "main"}</small>
                     </div>
                   </div>
                   {!githubBusy && (
-                    <button className="secondary" style={{ padding: "4px 9px", fontSize: 11, flexShrink: 0 }} onClick={() => setGithubCloneRepo(null)}>
+                    <button className="secondary" style={{ padding: "4px 10px", fontSize: 11, flexShrink: 0 }} onClick={() => setGithubCloneRepo(null)}>
                       Trocar
                     </button>
                   )}
@@ -7891,7 +8275,7 @@ function App() {
               )}
             </div>
             <div className="modal-actions auth-actions">
-              <button className="secondary" onClick={() => { setGithubError(""); setModal(null); }} disabled={githubBusy}>Cancelar</button>
+              <button className="secondary" onClick={closeGithubCloneModal} disabled={githubBusy}>Cancelar</button>
               <button
                 className="primary"
                 disabled={!githubCloneRepo || !githubCloneParent || !githubCloneName.trim() || githubBusy}
@@ -7903,6 +8287,88 @@ function App() {
           </>
         )}
       </>}
+
+      {modal === "deleteProjectConfirm" && (() => {
+        const targetProject = projectToDelete || (openCardMenuPath ? recentProjects.find(p => p.path === openCardMenuPath) : null) || { name: "Projeto", path: "" };
+        return (
+          <>
+            <div className="modal-head">
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div className="branch-modal-icon-wrap danger"><AlertTriangle size={18} color="#ef4444"/></div>
+                <div>
+                  <h2 id="modal-title">Excluir projeto?</h2>
+                  <p>Confirmação de exclusão do projeto e envio para a Lixeira do Windows.</p>
+                </div>
+              </div>
+              <button
+                className="close-btn"
+                disabled={deleteProjectBusy}
+                onClick={() => {
+                  setModal(null);
+                  setProjectToDelete(null);
+                }}
+                aria-label="Fechar"
+              >
+                <X size={17} />
+              </button>
+            </div>
+            <div className="modal-scroll-body branch-discard-modal-body">
+              <div className="branch-discard-warning-card" style={{ borderColor: "rgba(239, 68, 68, 0.3)", background: "rgba(239, 68, 68, 0.06)" }}>
+                <b style={{ color: "#fca5a5" }}>Você está prestes a excluir o projeto:</b>
+                <p style={{ margin: "6px 0 10px 0", fontSize: "14px", fontWeight: 700, color: "#ffffff", wordBreak: "break-all" }}>
+                  {targetProject.name || "Projeto"}
+                </p>
+                <p style={{ margin: "0 0 10px 0", fontSize: "12px", color: "#eee", lineHeight: "1.5" }}>
+                  Esta ação irá remover o projeto do NekoAI e enviar a pasta do projeto para a Lixeira do Windows. Os arquivos não serão excluídos permanentemente e poderão ser restaurados pela Lixeira.
+                </p>
+                {targetProject.path ? <small style={{ display: "block", color: "#8c8299", wordBreak: "break-all" }}>{targetProject.path}</small> : null}
+              </div>
+            </div>
+            <div className="modal-actions branch-modal-actions">
+              <button
+                className="secondary"
+                disabled={deleteProjectBusy}
+                onClick={() => {
+                  setModal(null);
+                  setProjectToDelete(null);
+                }}
+              >
+                Cancelar
+              </button>
+              <button
+                className="primary danger-confirm-btn"
+                disabled={deleteProjectBusy || !targetProject.path}
+                onClick={async () => {
+                  if (!targetProject.path) return;
+                  setDeleteProjectBusy(true);
+                  try {
+                    const res = await window.neko.deleteProject(targetProject.path);
+                    if (res && !res.success && res.error) {
+                      showToast(res.error);
+                    } else {
+                      showToast("Projeto enviado para a Lixeira do Windows.");
+                      if (Array.isArray(res?.updatedList)) {
+                        setRecentProjects(res.updatedList);
+                      }
+                      if (project === targetProject.path) {
+                        void exitProject("deletedActiveProject");
+                      }
+                      setModal(null);
+                      setProjectToDelete(null);
+                    }
+                  } catch (err: any) {
+                    showToast("Não foi possível mover a pasta para a Lixeira: " + (err?.message || "Erro desconhecido"));
+                  } finally {
+                    setDeleteProjectBusy(false);
+                  }
+                }}
+              >
+                {deleteProjectBusy ? <><Loader2 size={15} className="spin"/> Excluindo...</> : <><Trash2 size={14}/> Excluir projeto</>}
+              </button>
+            </div>
+          </>
+        );
+      })()}
 
       {modal === "githubPublish" && <>
         <div className="modal-head">
@@ -8624,8 +9090,16 @@ function App() {
                 <LovableIcon size={20}/>
               </div>
               <div>
-                <h2 id="modal-title">Lovable Cloud</h2>
-                <p>Conecte seu banco de dados e backend do Lovable Cloud ao NekoAI.</p>
+                <h2 id="modal-title">
+                  {lovableState.isLovableProject && !lovableState.lovableSessionValid && !lovableState.lovableCloudConnected
+                    ? "Projeto Lovable Detectado"
+                    : "Lovable Cloud"}
+                </h2>
+                <p>
+                  {lovableState.isLovableProject && !lovableState.lovableSessionValid && !lovableState.lovableCloudConnected
+                    ? "Conecte sua conta Lovable para verificar os recursos do projeto e habilitar a integração com o Lovable Cloud."
+                    : "Conecte seu banco de dados e backend do Lovable Cloud ao NekoAI."}
+                </p>
               </div>
             </div>
             <button
@@ -8642,10 +9116,17 @@ function App() {
           </div>
 
           <div className="modal-scroll-body" style={{ display: "flex", flexDirection: "column", gap: 16, padding: "20px" }}>
-            {lovableState.isLovableProject && (
-              <div style={{ background: "rgba(168, 85, 247, 0.1)", border: "1px solid rgba(168, 85, 247, 0.25)", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#d8b4fe", display: "flex", alignItems: "center", gap: 8 }}>
+            {!lovableState.lovableSessionValid && !lovableState.hasLovableCloud && lovableState.isLovableProject && (
+              <div style={{ background: "rgba(168, 85, 247, 0.08)", border: "1px solid rgba(168, 85, 247, 0.2)", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#d8b4fe", display: "flex", alignItems: "center", gap: 8 }}>
                 <Sparkles size={16} style={{ flexShrink: 0 }}/>
-                <span><strong>Projeto Lovable Detectado:</strong> {lovableState.detectionReason}</span>
+                <span>Este projeto foi criado com Lovable. Conecte sua conta Lovable para verificar os recursos do projeto e habilitar a integração com o Lovable Cloud.</span>
+              </div>
+            )}
+
+            {lovableState.hasLovableCloud && lovableState.status !== "connected" && (
+              <div style={{ background: "rgba(59, 130, 246, 0.1)", border: "1px solid rgba(59, 130, 246, 0.25)", borderRadius: 8, padding: "10px 14px", fontSize: 12, color: "#93c5fd", display: "flex", alignItems: "center", gap: 8 }}>
+                <Sparkles size={16} style={{ flexShrink: 0 }}/>
+                <span>Este projeto foi criado com Lovable e possui Lovable Cloud, mas o Cloud ainda não está conectado ao NekoAI.</span>
               </div>
             )}
 
@@ -8662,7 +9143,7 @@ function App() {
                 <strong style={{ fontSize: 14, color: "#f0ebf7" }}>Validando conexão com Lovable Cloud...</strong>
                 <span style={{ fontSize: 11, color: "#a899b4" }}>Validando permissões de acesso com a API do Lovable Cloud...</span>
               </div>
-            ) : lovableState.status === "connected" && lovableState.projectId ? (
+            ) : (lovableState.lovableCloudConnected && lovableState.status === "connected" && lovableState.projectId) ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
                 <div style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "rgba(62, 229, 139, 0.12)", color: "#3ee58b", border: "1px solid rgba(62, 229, 139, 0.25)", borderRadius: 20, padding: "4px 10px", fontSize: 11, fontWeight: 600, width: "fit-content" }}>
                   <CheckCircle2 size={13}/> Projeto Lovable Vinculado
@@ -8757,7 +9238,9 @@ function App() {
                 <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "14px", display: "flex", flexDirection: "column", gap: 10 }}>
                   <strong style={{ fontSize: 13, color: "#f0ebf7" }}>1. Autenticação Lovable</strong>
                   <p style={{ margin: 0, fontSize: 11, color: "#a899b4", lineHeight: 1.5 }}>
-                    Abra o navegador integrado para fazer login na sua conta do Lovable.dev em sessão segura e isolada.
+                    {!lovableState.lovableSessionValid
+                      ? "Conecte sua conta Lovable no navegador integrado para autenticar e verificar o suporte ao Lovable Cloud deste projeto."
+                      : "Abra o navegador integrado para fazer login na sua conta do Lovable.dev em sessão segura e isolada."}
                   </p>
                   <button
                     className="primary"
@@ -8767,17 +9250,17 @@ function App() {
                     }}
                     style={{ width: "fit-content", background: "linear-gradient(135deg, #ec4899, #8b5cf6)", borderColor: "transparent" }}
                   >
-                    <ExternalLinkIcon size={14}/> Abrir Lovable Cloud / Login
+                    <ExternalLinkIcon size={14}/> {!lovableState.lovableSessionValid ? "Autenticar agora" : "Abrir Lovable Cloud / Login"}
                   </button>
                 </div>
 
                 <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, padding: "14px", display: "flex", flexDirection: "column", gap: 10 }}>
                   <strong style={{ fontSize: 13, color: "#f0ebf7" }}>2. Vincular Projeto</strong>
-                  {lovableState.detectedProjectId ? (
+                  {(lovableState.projectId || lovableState.detectedProjectId) ? (
                     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                       <span style={{ fontSize: 11, color: "#a899b4" }}>Projeto detectado na navegação ou arquivos locais:</span>
                       <code style={{ fontSize: 12, color: "#3ee58b", background: "rgba(0,0,0,0.3)", padding: "4px 8px", borderRadius: 4, width: "fit-content" }}>
-                        {lovableState.detectedProjectId}
+                        {lovableState.projectId || lovableState.detectedProjectId}
                       </code>
                       <button
                         className="primary"
@@ -8785,7 +9268,7 @@ function App() {
                         onClick={() => {
                           setLovableBusy(true);
                           setLovableError("");
-                          window.neko.lovableLinkProject(lovableState.detectedProjectId || undefined)
+                          window.neko.lovableLinkProject(lovableState.projectId || lovableState.detectedProjectId || undefined)
                             .then((s: any) => {
                               if (s) setLovableState(s);
                               if (s?.status === "connected") {
@@ -8837,8 +9320,124 @@ function App() {
                     </div>
                   )}
                 </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 4 }}>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={lovableBusy}
+                    onClick={() => {
+                      setModal(null);
+                      setLovableError("");
+                    }}
+                  >
+                    Agora não
+                  </button>
+                </div>
               </div>
             )}
+          </div>
+        </>
+      )}
+
+      {modal === "lovable_jit" && (
+        <>
+          <div className="modal-head">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div className="modal-icon" style={{ background: "rgba(255, 255, 255, 0.06)", color: "#ffffff", borderColor: "rgba(255, 255, 255, 0.12)" }}>
+                <LovableIcon size={20}/>
+              </div>
+              <div>
+                <h2 id="modal-title">Lovable Cloud não conectado</h2>
+                <p>Esta solicitação precisa acessar o Lovable Cloud deste projeto. Conecte o projeto ao Lovable Cloud para continuar.</p>
+              </div>
+            </div>
+            <button
+              className="close-btn"
+              disabled={lovableBusy || lovableState.status === "validating"}
+              onClick={cancelJITPrompt}
+              aria-label="Cancelar"
+            >
+              <X size={17}/>
+            </button>
+          </div>
+
+          <div className="modal-body" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 14, borderRadius: 8, background: "rgba(255, 255, 255, 0.03)", border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Database size={15} style={{ color: "#f472b6" }} />
+                <span style={{ fontSize: 13, fontWeight: 600, color: "#f0ebf7" }}>Acesso ao Banco de Dados Necessário</span>
+              </div>
+              <span style={{ fontSize: 12, color: "#c2b6cf", lineHeight: 1.5 }}>
+                Sua solicitação envolve operações de banco de dados (estruturas, tabelas, consultas ou migrations). O NekoAI pausou a execução para evitar alterações parciais até que o Lovable Cloud esteja conectado.
+              </span>
+              {lovableState.projectId && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+                  <span style={{ fontSize: 11, color: "#8a7f94" }}>Projeto Lovable:</span>
+                  <code style={{ fontSize: 11, color: "#f472b6", background: "rgba(0,0,0,0.3)", padding: "2px 6px", borderRadius: 4 }}>{lovableState.projectId}</code>
+                </div>
+              )}
+              {lovableState.userEmail && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 11, color: "#8a7f94" }}>Conta:</span>
+                  <span style={{ fontSize: 11, color: "#f0ebf7" }}>{lovableState.userEmail}</span>
+                </div>
+              )}
+            </div>
+
+            {(lovableError || lovableState.error) && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 6, background: "rgba(239, 68, 68, 0.12)", border: "1px solid rgba(239, 68, 68, 0.25)", color: "#fca5a5", fontSize: 12 }}>
+                <AlertCircle size={15} style={{ flexShrink: 0 }}/>
+                <span>{lovableError || lovableState.error}</span>
+              </div>
+            )}
+
+            {lovableBusy || lovableState.status === "validating" ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, padding: 14, borderRadius: 8, background: "rgba(255, 255, 255, 0.04)" }}>
+                <Loader2 size={18} className="spin" style={{ color: "#f472b6" }} />
+                <div style={{ display: "flex", flexDirection: "column" }}>
+                  <strong style={{ fontSize: 13, color: "#f0ebf7" }}>Conectando ao Lovable Cloud...</strong>
+                  <span style={{ fontSize: 11, color: "#a899b4" }}>Aguardando validação com a API do Lovable Cloud...</span>
+                </div>
+              </div>
+            ) : null}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
+              <button
+                type="button"
+                className="secondary"
+                disabled={lovableBusy || lovableState.status === "validating"}
+                onClick={cancelJITPrompt}
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={lovableBusy || lovableState.status === "validating"}
+                onClick={() => {
+                  setLovableError("");
+                  if (!lovableState.lovableSessionValid) {
+                    void window.neko.lovableOpenLogin();
+                  } else {
+                    setLovableBusy(true);
+                    window.neko.lovableLinkProject(lovableState.projectId || lovableState.detectedProjectId || undefined)
+                      .then((s: any) => {
+                        if (s) setLovableState(s);
+                      })
+                      .catch((err: any) => setLovableError(err?.message || "Falha ao conectar projeto"))
+                      .finally(() => setLovableBusy(false));
+                  }
+                }}
+                style={{ background: "#7c3aed", borderColor: "#6d28d9" }}
+              >
+                {!lovableState.lovableSessionValid ? (
+                  <><ExternalLinkIcon size={14}/> Conectar Lovable Cloud</>
+                ) : (
+                  <><Check size={14}/> Conectar Lovable Cloud</>
+                )}
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -9910,14 +10509,16 @@ function App() {
       )}
 
       </div>
-    </div>
-    }
+    </div>,
+    document.body
+    )}
 
-    {lightboxImage && (
+    {lightboxImage && createPortal(
       <div className="lightbox-overlay" role="dialog" aria-label="Visualização da imagem" onClick={() => setLightboxImage(null)}>
         <button type="button" className="lightbox-close" onClick={() => setLightboxImage(null)} aria-label="Fechar visualização"><X size={18}/></button>
         <img className="lightbox-image" src={lightboxImage.url} alt={lightboxImage.name} onClick={e => e.stopPropagation()}/>
-      </div>
+      </div>,
+      document.body
     )}
     </div>
   );

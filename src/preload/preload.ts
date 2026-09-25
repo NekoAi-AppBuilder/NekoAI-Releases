@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld("neko", {
   getRecentProjects: () => ipcRenderer.invoke("projects:getRecent"),
   touchRecentProject: (projectPath: string) => ipcRenderer.invoke("projects:touchRecent", projectPath),
   removeRecentProject: (projectPath: string) => ipcRenderer.invoke("projects:removeRecent", projectPath),
+  deleteProject: (projectPath: string) => ipcRenderer.invoke("projects:delete", projectPath),
   toggleFavoriteProject: (projectPath: string) => ipcRenderer.invoke("projects:toggleFavorite", projectPath),
   saveRecentProjects: (projects: any[]) => ipcRenderer.invoke("projects:saveRecent", projects),
   detectTechnology: (projectPath: string) => ipcRenderer.invoke("projects:detectTechnology", projectPath),
@@ -149,6 +150,12 @@ contextBridge.exposeInMainWorld("neko", {
   lovableLinkProject: (projectId?: string) => ipcRenderer.invoke("lovable:link-project", projectId),
   lovableUnlink: () => ipcRenderer.invoke("lovable:unlink"),
   lovableTestConnection: () => ipcRenderer.invoke("lovable:test-connection"),
+  lovableCancelJit: (reason?: string) => ipcRenderer.invoke("lovable:cancel-jit", reason),
+  onLovableJitRequired: (callback: (data: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
+    ipcRenderer.on("lovable:jit-required", listener);
+    return () => ipcRenderer.removeListener("lovable:jit-required", listener);
+  },
   onLovableStateChange: (callback: (state: any) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
     ipcRenderer.on("lovable:state-changed", listener);

@@ -1,4 +1,4 @@
-﻿// src/main/thumbnail-service.ts
+// src/main/thumbnail-service.ts
 // Serviço universal de captura e cache de miniaturas de projetos no NekoAI.
 // Responsabilidade: Capturar o Preview funcional de qualquer tecnologia,
 // persistir em .neko/thumbnail.png e atualizar o cache do RecentProjectsManager.
@@ -103,23 +103,13 @@ export class ThumbnailService {
     this.lastCaptureTime.set(key, Date.now());
 
     try {
-      // 1. Tenta capturar do WebContentsView interno ativo caso esteja carregado na mesma URL
-      let capturedImage: electron.NativeImage | null = null;
-      const internalView = this.internalViewGetter ? this.internalViewGetter() : null;
+      // 1. PRIORIDADE 1: Tenta capturar do WebContentsView interno ativo.
+      // Se estiver inicializando ou estabilizando o carregamento (ex: cold start Vite),
+      // aguarda a estabilização em vez de criar precipitadamente uma janela OSR.
+      let capturedImage = await this.captureFromInternalView(url);
 
-      if (internalView && !internalView.webContents.isDestroyed()) {
-        try {
-          const currentViewUrl = internalView.webContents.getURL();
-          if (currentViewUrl && this.urlsMatch(currentViewUrl, url)) {
-            const pageImage = await internalView.webContents.capturePage();
-            if (!pageImage.isEmpty()) {
-              capturedImage = pageImage;
-            }
-          }
-        } catch {}
-      }
-
-      // 2. Se não foi possível capturar do view ativo, usa uma janela offscreen isolada
+      // 2. PRIORIDADE 2: Fallback offscreen somente quando realmente necessário
+      // (ex: view interno ausente ou indisponível após espera de estabilização)
       if (!capturedImage || capturedImage.isEmpty()) {
         capturedImage = await this.captureOffscreen(url);
       }
@@ -162,8 +152,157 @@ export class ThumbnailService {
     }
   }
 
+  /**
+   * PRIORIDADE 1: Captura diretamente do WebContentsView interno ativo quando disponível.
+   * Aguarda o preview estabilizar (did-finish-load / did-stop-loading) antes de capturar,
+   * evitando a criação de BrowserWindow offscreen desnecessária.
+   */
+  private async captureFromInternalView(url: string): Promise<electron.NativeImage | null> {
+    if (!this.internalViewGetter) return null;
+
+    // Se o view interno ainda não foi anexado (corrida imediata pós preview.ready),
+    // aguarda brevemente (até 2500ms) para que o Renderer envie o preview:attach.
+    let internalView = this.internalViewGetter();
+    if (!internalView) {
+      const waitStart = Date.now();
+      while (!internalView && Date.now() - waitStart < 2500) {
+        await new Promise(r => setTimeout(r, 100));
+        internalView = this.internalViewGetter();
+      }
+    }
+
+    if (!internalView || internalView.webContents.isDestroyed()) {
+      return null;
+    }
+
+    try {
+      const currentUrl = internalView.webContents.getURL();
+      const urlMatches = Boolean(currentUrl && this.urlsMatch(currentUrl, url));
+      const isLoading = internalView.webContents.isLoading();
+
+      // Se o view ainda está carregando ou a URL de destino ainda não estabilizou,
+      // aguarda did-finish-load / did-stop-loading
+      if (isLoading || !urlMatches) {
+        const settled = await this.waitForViewStable(internalView, url, 7000);
+        if (!settled && (!internalView.webContents.isDestroyed() && !this.urlsMatch(internalView.webContents.getURL(), url))) {
+          return null;
+        }
+      }
+
+      if (internalView.webContents.isDestroyed()) return null;
+
+      // Breve pausa para estabilização de renderização (layout, fontes, DOM)
+      await new Promise(r => setTimeout(r, 600));
+
+      if (internalView.webContents.isDestroyed()) return null;
+
+      const settledUrl = internalView.webContents.getURL();
+      if (settledUrl && this.urlsMatch(settledUrl, url)) {
+        const pageImage = await internalView.webContents.capturePage();
+        if (!pageImage.isEmpty()) {
+          console.log(`[ThumbnailService] Miniatura capturada prioritariamente do internalPreviewView.`);
+          return pageImage;
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[ThumbnailService] Falha ao capturar do internalPreviewView:`, err?.message || err);
+    }
+
+    return null;
+  }
+
+  /**
+   * Aguarda a estabilização de carregamento do WebContentsView (did-finish-load ou did-stop-loading).
+   */
+  private async waitForViewStable(
+    view: WebContentsView,
+    expectedUrl: string,
+    timeoutMs = 7000
+  ): Promise<boolean> {
+    if (view.webContents.isDestroyed()) return false;
+
+    if (!view.webContents.isLoading() && this.urlsMatch(view.webContents.getURL(), expectedUrl)) {
+      return true;
+    }
+
+    return new Promise<boolean>(resolve => {
+      let settled = false;
+      let timer: NodeJS.Timeout | null = null;
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        if (!view.webContents.isDestroyed()) {
+          view.webContents.removeListener("did-finish-load", onFinish);
+          view.webContents.removeListener("did-stop-loading", onStop);
+          view.webContents.removeListener("did-fail-load", onFail);
+        }
+      };
+
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+
+      const onFinish = () => {
+        if (!view.webContents.isDestroyed() && this.urlsMatch(view.webContents.getURL(), expectedUrl)) {
+          finish(true);
+        }
+      };
+
+      const onStop = () => {
+        if (!view.webContents.isDestroyed() && this.urlsMatch(view.webContents.getURL(), expectedUrl)) {
+          finish(true);
+        }
+      };
+
+      const onFail = (_event: any, code: number) => {
+        // ERR_ABORTED (-3): reload do servidor/HMR, não falha imediatamente
+        if (code === -3) return;
+        finish(false);
+      };
+
+      timer = setTimeout(() => {
+        if (!view.webContents.isDestroyed() && this.urlsMatch(view.webContents.getURL(), expectedUrl)) {
+          finish(true);
+        } else {
+          finish(false);
+        }
+      }, timeoutMs);
+
+      view.webContents.once("did-finish-load", onFinish);
+      view.webContents.once("did-stop-loading", onStop);
+      view.webContents.on("did-fail-load", onFail);
+    });
+  }
+
+  /**
+   * PRIORIDADE 2 & 3: Fallback offscreen isolado quando o view interno não estiver disponível.
+   * Blindado contra ERR_ABORTED (-3) e contra destruição concorrente com o pipeline de composição.
+   */
   private async captureOffscreen(url: string): Promise<electron.NativeImage | null> {
     let win: BrowserWindow | null = null;
+    let isAborted = false;
+
+    // PRIORIDADE 3: Limpeza assíncrona segura.
+    // NUNCA destrói a janela síncronamente na mesma callstack de navegação/aborto do Chromium.
+    const safeCleanupWindow = (targetWin: BrowserWindow | null) => {
+      if (!targetWin || targetWin.isDestroyed()) return;
+      try {
+        if (!targetWin.webContents.isDestroyed()) {
+          targetWin.webContents.stop();
+        }
+      } catch {}
+      setImmediate(() => {
+        try {
+          if (!targetWin.isDestroyed()) {
+            targetWin.destroy();
+          }
+        } catch {}
+      });
+    };
+
     try {
       win = new BrowserWindow({
         show: false,
@@ -177,29 +316,57 @@ export class ThumbnailService {
         }
       });
 
-      // Timeout de segurança de 10s para não prender recursos caso a página trave
-      const loadPromise = win.loadURL(url);
+      // Intercepta did-fail-load para ERR_ABORTED (-3)
+      win.webContents.on("did-fail-load", (_event, errorCode) => {
+        if (errorCode === -3) {
+          isAborted = true;
+          console.log("[ThumbnailService] Navegação offscreen abortada pelo servidor/reload (ERR_ABORTED -3).");
+        }
+      });
+
+      // Timeout de segurança de 10s para não prender recursos
+      const loadPromise = win.loadURL(url).catch((err: any) => {
+        const msg = String(err?.message || err);
+        if (msg.includes("ERR_ABORTED") || err?.errno === -3) {
+          isAborted = true;
+          return;
+        }
+        throw err;
+      });
+
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Timeout ao carregar preview para miniatura")), 10_000)
       );
 
       await Promise.race([loadPromise, timeoutPromise]);
 
+      if (isAborted) {
+        safeCleanupWindow(win);
+        win = null;
+        return null;
+      }
+
       // Espera um tempo breve (1500ms) para renderização de fontes, estilos e DOM
       await new Promise(r => setTimeout(r, 1500));
 
-      if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+      if (win && !win.isDestroyed() && !win.webContents.isDestroyed() && !isAborted) {
         const image = await win.webContents.capturePage();
         return image.isEmpty() ? null : image;
       }
       return null;
-    } catch (err) {
-      console.warn("[ThumbnailService] Captura offscreen falhou:", err);
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      if (msg.includes("ERR_ABORTED") || isAborted) {
+        console.log(`[ThumbnailService] Captura offscreen ignorada devido a cancelamento/reload (${msg}).`);
+      } else {
+        console.warn("[ThumbnailService] Captura offscreen falhou:", msg);
+      }
       return null;
     } finally {
-      try {
-        if (win && !win.isDestroyed()) win.close();
-      } catch {}
+      if (win) {
+        safeCleanupWindow(win);
+        win = null;
+      }
     }
   }
 

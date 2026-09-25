@@ -13,6 +13,8 @@ import {
   normalizeProjectPath,
   areProjectPathsEqual,
   extractFriendlyProjectName,
+  isPathSafeForDeletion,
+  deleteProjectToTrash,
   MAX_RECENT_PROJECTS,
   type RecentProjectItem
 } from "../src/main/recent-projects-manager.ts";
@@ -347,3 +349,80 @@ test("10. Thumbnail: projetos com mesmo nome em diretórios diferentes possuem m
 
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
+
+test("11. Validação de segurança de caminhos antes da exclusão (isPathSafeForDeletion)", async () => {
+  const home = os.homedir();
+  assert.equal(isPathSafeForDeletion(home).safe, false, "Home dir não pode ser seguro");
+  assert.equal(isPathSafeForDeletion(path.join(home, "Desktop")).safe, false, "Desktop não pode ser seguro");
+  assert.equal(isPathSafeForDeletion(path.join(home, "Documents")).safe, false, "Documents não pode ser seguro");
+  assert.equal(isPathSafeForDeletion(path.join(home, "Downloads")).safe, false, "Downloads não pode ser seguro");
+  assert.equal(isPathSafeForDeletion(process.platform === "win32" ? "C:\\" : "/").safe, false, "Raiz do disco não pode ser segura");
+
+  const safeProj = path.join(home, "Projetos", "MeuApp");
+  assert.equal(isPathSafeForDeletion(safeProj).safe, true, "Subdiretório de projeto deve ser seguro");
+});
+
+test("12. Exclusão física (deleteProjectToTrash) e remoção do histórico", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "neko-test-delete-"));
+  const storageFile = path.join(tmpDir, "recent-projects.json");
+  const manager = new RecentProjectsManager(storageFile);
+
+  const testProj = path.join(tmpDir, "projeto-para-deletar");
+  await fs.mkdir(testProj, { recursive: true });
+  await fs.writeFile(path.join(testProj, "index.html"), "<h1>Test</h1>");
+
+  await manager.touchRecentProject(testProj);
+
+  const res = await deleteProjectToTrash(testProj, manager);
+  assert.equal(res.success, true, "Exclusão deve ter sucesso");
+  assert.equal(await checkProjectExistsOnDisk(testProj), false, "Pasta física deve ter sido removida do local original");
+
+  const list = await manager.getRecentProjectsWithStatus();
+  assert.equal(list.length, 0, "Projeto deve ter sido removido do registro");
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
+});
+
+test("13. Preservação de múltiplos projetos ausentes: remover B mantém C como ausente sem reativação", async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "neko-test-missing-multi-"));
+  const storageFile = path.join(tmpDir, "recent-projects.json");
+  const manager = new RecentProjectsManager(storageFile);
+
+  const projA = path.join(tmpDir, "projeto-a");
+  const projB = path.join(tmpDir, "projeto-b");
+  const projC = path.join(tmpDir, "projeto-c");
+  await fs.mkdir(projA, { recursive: true });
+  await fs.mkdir(projB, { recursive: true });
+  await fs.mkdir(projC, { recursive: true });
+
+  await manager.touchRecentProject(projA);
+  await manager.touchRecentProject(projB);
+  await manager.touchRecentProject(projC);
+
+  // Deletar B e C fisicamente (simulando Windows Explorer)
+  await fs.rm(projB, { recursive: true, force: true });
+  await fs.rm(projC, { recursive: true, force: true });
+
+  // Verificar status inicial
+  let list = await manager.getRecentProjectsWithStatus();
+  assert.equal(list.length, 3);
+  assert.equal(list.find(p => p.name === "projeto-a")?.missing, false);
+  assert.equal(list.find(p => p.name === "projeto-b")?.missing, true);
+  assert.equal(list.find(p => p.name === "projeto-c")?.missing, true);
+
+  // Remover projeto B
+  const afterRemoveB = await manager.removeRecentProject(projB);
+  assert.equal(afterRemoveB.length, 2, "Lista resultante deve conter A e C");
+
+  const itemA = afterRemoveB.find(p => p.name === "projeto-a");
+  const itemC = afterRemoveB.find(p => p.name === "projeto-c");
+
+  assert.ok(itemA, "Projeto A deve continuar existindo");
+  assert.equal(itemA.missing, false, "Projeto A deve continuar ativo");
+
+  assert.ok(itemC, "Projeto C deve continuar existindo na lista");
+  assert.equal(itemC.missing, true, "CRÍTICO: Projeto C NUNCA pode voltar para ativo, deve continuar missing: true");
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
+});
+

@@ -104,21 +104,31 @@ export class MigrationManager extends EventEmitter {
       throw new Error("Esta exata proposta de migração já foi aprovada e executada anteriormente.");
     }
 
-    // Se já existe uma proposta PENDING com o mesmo permissionId ou mesmo (sessionId + hash), retorna a mesma Promise
+    // Se já existe uma proposta correspondente (por jitRequestId, permissionId, sessionId+hash ou normalizedSql)
     for (const [existingId, existingProposal] of this.proposals.entries()) {
-      if (
-        existingProposal.status === "PENDING" &&
-        ((request.permissionId && existingProposal.permissionId === request.permissionId) ||
-         (existingProposal.sessionId === sessionId && existingProposal.hash === hash))
-      ) {
-        const existingResolver = this.pendingResolvers.get(existingId);
-        if (existingResolver) {
-          console.log(`[MigrationManager] Reutilizando proposta pendente existente id=${existingId} permissionId=${request.permissionId}`);
-          return new Promise<MigrationExecutionResult>((resolve, reject) => {
-            const origResolve = existingResolver.resolve;
-            const origReject = existingResolver.reject;
-            existingResolver.resolve = (res) => { origResolve(res); resolve(res); };
-            existingResolver.reject = (err) => { origReject(err); reject(err); };
+      const matchJit = Boolean(request.jitRequestId && existingProposal.jitRequestId && existingProposal.jitRequestId === request.jitRequestId);
+      const matchPermission = Boolean(request.permissionId && existingProposal.permissionId && existingProposal.permissionId === request.permissionId);
+      const matchSessionAndHash = Boolean(sessionId && existingProposal.sessionId === sessionId && existingProposal.hash === hash);
+      const matchNormalizedSql = Boolean(existingProposal.status === "PENDING" && existingProposal.normalizedSql === normalizedSql && (existingProposal.sessionId === sessionId || (request.lovableProjectId && existingProposal.lovableProjectId === request.lovableProjectId)));
+
+      if (matchJit || matchPermission || matchSessionAndHash || matchNormalizedSql) {
+        if (existingProposal.status === "PENDING") {
+          const existingResolver = this.pendingResolvers.get(existingId);
+          if (existingResolver) {
+            console.log(`[MigrationManager] Reutilizando proposta pendente existente id=${existingId} permissionId=${request.permissionId} jitId=${request.jitRequestId}`);
+            return new Promise<MigrationExecutionResult>((resolve, reject) => {
+              const origResolve = existingResolver.resolve;
+              const origReject = existingResolver.reject;
+              existingResolver.resolve = (res) => { origResolve(res); resolve(res); };
+              existingResolver.reject = (err) => { origReject(err); reject(err); };
+            });
+          }
+        } else if (existingProposal.status === "APPROVED" || existingProposal.status === "EXECUTING" || existingProposal.status === "SUCCESS") {
+          console.log(`[MigrationManager] Reutilizando proposta já autorizada id=${existingId} status=${existingProposal.status} jitId=${request.jitRequestId}`);
+          return Promise.resolve({
+            success: true,
+            proposalId: existingId,
+            status: existingProposal.status
           });
         }
       }
@@ -131,6 +141,7 @@ export class MigrationManager extends EventEmitter {
       id: proposalId,
       sessionId,
       permissionId: request.permissionId,
+      jitRequestId: request.jitRequestId,
       callId: request.callId,
       messageId,
       projectRef,

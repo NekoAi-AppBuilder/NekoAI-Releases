@@ -21,13 +21,14 @@ import { licenseManager } from "./license/license-manager";
 import { updaterManager } from "./updater";
 import { lovableCloudManager } from "./lovable/lovable-cloud-manager";
 import { lovableMcpServer, writeLovableOpenCodeConfig, removeLovableOpenCodeConfig } from "./lovable/lovable-mcp-server";
+import { detectDatabaseIntent } from "./lovable/lovable-intent-detector";
 import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
 import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession } from "./vision-fallback";
 import { discoverPreviewRoutes, routeFromUrl, normalizeRoutePath, isDynamicSegment, type PreviewRoute } from "./preview-routes";
 import { analyzeSite, cancelAllSiteClones, importSiteAssets, type SiteCloneAnalysis, type SiteCloneLimits } from "./site-clone";
 import { captureSiteChromium } from "./site-capture";
-import { recentProjectsManager, detectProjectTechnology, checkProjectExistsOnDisk, normalizeProjectPath } from "./recent-projects-manager";
+import { recentProjectsManager, detectProjectTechnology, checkProjectExistsOnDisk, normalizeProjectPath, deleteProjectToTrash } from "./recent-projects-manager";
 import { appPreferencesManager, isValidDirectory } from "./app-preferences-manager";
 import { thumbnailService } from "./thumbnail-service";
 import { sessionParentMap, registerSessionParent, resolveRootSessionId as resolveRootFromTree, clearSessionTree } from "./session-tree";
@@ -280,9 +281,9 @@ function newTaskCorrelationId(sessionId: string): string {
 // the authoritative `neko.task.state` event.
 //
 // States: idle, running, waiting_for_user, waiting_for_approval,
-//         completed, cancelled, failed
+//         waiting_for_lovable_cloud, completed, cancelled, failed
 // ============================================================
-type TaskState = "idle" | "running" | "waiting_for_user" | "waiting_for_approval" | "completed" | "cancelled" | "failed";
+type TaskState = "idle" | "running" | "waiting_for_user" | "waiting_for_approval" | "waiting_for_lovable_cloud" | "completed" | "cancelled" | "failed";
 type TaskRecord = {
   taskId: string;
   sessionId: string;
@@ -434,6 +435,23 @@ function resolveTaskIdForSession(sessionId: string): string {
   }
 
   return sessionTaskIds.get(sessionId) ?? (rootSessionId ? sessionTaskIds.get(rootSessionId) : "") ?? "";
+}
+
+function getActiveSessionId(): string {
+  for (const [sessionId, record] of taskRecords.entries()) {
+    if (record.state === "running" || record.state === "waiting_for_lovable_cloud" || (record.state as any) === "busy") {
+      return sessionId;
+    }
+  }
+  let latestSessionId = "";
+  let latestAt = 0;
+  for (const [sessionId, record] of taskRecords.entries()) {
+    if (record.stateAt > latestAt) {
+      latestAt = record.stateAt;
+      latestSessionId = sessionId;
+    }
+  }
+  return latestSessionId;
 }
 
 function normalizeTimestamp(value: unknown): number {
@@ -3716,6 +3734,7 @@ let internalPreviewView: WebContentsView | null = null;
 let internalPreviewUrl = "";
 let internalPreviewState: InternalPreviewState = "idle";
 let internalPreviewSession = 0;
+let internalPreviewOverlayActive = false;
 
 function logInternalPreview(state: InternalPreviewState, extra = "") {
   internalPreviewState = state;
@@ -3737,6 +3756,7 @@ function detachInternalPreviewView(destroy = false) {
     try { if (!view.webContents.isDestroyed()) view.webContents.close(); } catch {}
     internalPreviewView = null;
     internalPreviewUrl = "";
+    internalPreviewOverlayActive = false;
     logInternalPreview("idle");
   }
 }
@@ -4400,6 +4420,34 @@ import(${JSON.stringify(entry)}).then(() => {
   }
 }
 
+function sanitizeLogOutput(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,}/g, "[REDACTED_TOKEN]")
+    .replace(/bearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]")
+    .replace(/(?:sk-[A-Za-z0-9_-]{20,})/g, "[REDACTED_KEY]")
+    .replace(/(?:password|secret|token|api[_-]?key)=([^\s&]+)/gi, "$1=[REDACTED]");
+}
+
+function isPeerDependencyError(text: string): boolean {
+  const lower = String(text || "").toLowerCase();
+  return (
+    lower.includes("eresolve") ||
+    lower.includes("peer dependency") ||
+    lower.includes("could not resolve dependency") ||
+    lower.includes("missing peer") ||
+    lower.includes("peerdependencies") ||
+    lower.includes("unable to resolve dependency")
+  );
+}
+
+function extractErrorDetails(stderr: string, stdout: string): string {
+  const combined = (stderr.trim() + "\n" + stdout.trim()).trim();
+  if (!combined) return "";
+  const sanitized = sanitizeLogOutput(combined);
+  return sanitized.length > 2500 ? "..." + sanitized.slice(-2500) : sanitized;
+}
+
 async function runNodeCommand(cwd: string, args: string[], label: string) {
   return new Promise<void>((resolve, reject) => {
     const isWindows = process.platform === "win32";
@@ -4421,7 +4469,13 @@ async function runNodeCommand(cwd: string, args: string[], label: string) {
     child.on("error", reject);
     child.on("exit", code => {
       if (code === 0) resolve();
-      else reject(Object.assign(new Error(`${label} terminou com código ${code}.`), { code, stdout, stderr }));
+      else {
+        const details = extractErrorDetails(stderr, stdout);
+        const msg = details
+          ? `${label} terminou com código ${code}.\n\nDetalhes:\n${details}`
+          : `${label} terminou com código ${code}.`;
+        reject(Object.assign(new Error(msg), { code, stdout, stderr, label }));
+      }
     });
   });
 }
@@ -4445,7 +4499,8 @@ async function runCommand(command: string, args: string[], cwd: string, label: s
     const childArgs = isWindows
       ? ["/d", "/s", "/c", windowsCommandLine(command, args)]
       : args;
-    console.log(`[Neko/Preview/${label}] Executando: ${isWindows ? windowsCommandLine(command, args) : [command, ...args].join(" ")}`);
+    const displayCmd = isWindows ? windowsCommandLine(command, args) : [command, ...args].join(" ");
+    console.log(`[Preview Install] Running ${label}: ${displayCmd}`);
     const child = spawn(executable, childArgs, { cwd, windowsHide: true, shell: false, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -4459,50 +4514,85 @@ async function runCommand(command: string, args: string[], cwd: string, label: s
       stderr += text;
       console.error(`[Neko/Preview/${label}]`, text);
     });
-    child.on("error", reject);
+    child.on("error", err => {
+      console.error(`[Preview Install] ${label} spawn error:`, err?.message || err);
+      reject(err);
+    });
     child.on("exit", code => {
-      if (code === 0) resolve();
-      else reject(Object.assign(new Error(`${label} terminou com código ${code}.`), { code, stdout, stderr }));
+      if (code === 0) {
+        console.log(`[Preview Install] ${label} completed successfully (exit 0)`);
+        resolve();
+      } else {
+        const details = extractErrorDetails(stderr, stdout);
+        console.warn(`[Preview Install] ${label} failed with exit code ${code}`);
+        const errorMsg = details
+          ? `${label} terminou com código ${code}.\n\nDetalhes:\n${details}`
+          : `${label} terminou com código ${code}.`;
+        reject(Object.assign(new Error(errorMsg), { code, stdout, stderr, label }));
+      }
     });
   });
 }
 
-async function installDependencies(projectPath: string, packageManager: string) {
-  console.log(`[Preview/Install] started pm=${packageManager}`);
+async function installDependencies(projectPath: string, packageManager: string): Promise<string> {
+  console.log(`[Preview Install] package manager detected: ${packageManager}`);
   const files: string[] = await fs.promises.readdir(projectPath).catch((): string[] => []);
   const hasLock = files.includes("package-lock.json");
 
-  // Prefer clean/frozen install if lockfile is present
+  // Prefer clean/frozen install for npm if package-lock.json is present
   if (packageManager === "npm" && hasLock) {
+    console.log(`[Preview Install] Running npm ci`);
     try {
-      await runCommand(packageManagerExecutable("npm"), ["ci"], projectPath, "Install-CI");
-      console.log(`[Preview/Install] completed pm=${packageManager}`);
-      return;
-    } catch (ciErr) {
-      console.warn("[Neko/Preview/Install] npm ci falhou, tentando fallback com npm install:", ciErr);
+      await runCommand(packageManagerExecutable("npm"), ["ci"], projectPath, "npm ci");
+      return "npm ci";
+    } catch (ciErr: any) {
+      console.warn(`[Preview Install] npm ci failed (${ciErr?.message || ciErr}), falling back to npm install`);
+    }
+  }
+
+  if (packageManager === "npm" || packageManager === "npm_install") {
+    console.log(`[Preview Install] Running npm install`);
+    try {
+      await runCommand(packageManagerExecutable("npm"), ["install"], projectPath, "npm install");
+      return "npm install";
+    } catch (installErr: any) {
+      const errDetails = String(installErr?.stderr || installErr?.message || installErr);
+      if (isPeerDependencyError(errDetails)) {
+        console.warn(`[Preview Install] npm install failed with ERESOLVE / peer dependency conflict. Attempting npm install --legacy-peer-deps`);
+        await runCommand(packageManagerExecutable("npm"), ["install", "--legacy-peer-deps"], projectPath, "npm install --legacy-peer-deps");
+        return "npm install --legacy-peer-deps";
+      }
+      throw installErr;
     }
   }
 
   let installArgs = ["install"];
+  let commandLabel = `${packageManager} install`;
   if (packageManager === "pnpm" && files.includes("pnpm-lock.yaml")) {
     installArgs = ["install", "--frozen-lockfile"];
+    commandLabel = "pnpm install --frozen-lockfile";
   } else if (packageManager === "yarn" && files.includes("yarn.lock")) {
     installArgs = ["install", "--frozen-lockfile"];
+    commandLabel = "yarn install --frozen-lockfile";
   } else if (packageManager === "bun" && (files.includes("bun.lockb") || files.includes("bun.lock"))) {
     installArgs = ["install", "--frozen-lockfile"];
+    commandLabel = "bun install --frozen-lockfile";
   }
 
+  console.log(`[Preview Install] Running ${commandLabel}`);
   try {
-    await runCommand(packageManagerExecutable(packageManager), installArgs, projectPath, "Install");
-  } catch (err) {
+    await runCommand(packageManagerExecutable(packageManager), installArgs, projectPath, commandLabel);
+    return commandLabel;
+  } catch (err: any) {
     if (installArgs.includes("--frozen-lockfile")) {
-      // Fallback without frozen lockfile
-      await runCommand(packageManagerExecutable(packageManager), ["install"], projectPath, "Install-Relaxed");
+      const relaxedLabel = `${packageManager} install`;
+      console.warn(`[Preview Install] ${commandLabel} failed (${err?.message || err}). Attempting relaxed install: ${relaxedLabel}`);
+      await runCommand(packageManagerExecutable(packageManager), ["install"], projectPath, relaxedLabel);
+      return relaxedLabel;
     } else {
       throw err;
     }
   }
-  console.log(`[Preview/Install] completed pm=${packageManager}`);
 }
 
 async function waitForFilesystemSettling(projectPath: string, info: any): Promise<void> {
@@ -4526,6 +4616,7 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
   if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
   if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
+  const attemptsLog: { manager: string; command: string; status: "passed" | "failed"; error?: string }[] = [];
   let primaryPassed = false;
   let primaryErrorMsg = "";
 
@@ -4538,36 +4629,47 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
       framework: info.framework,
       message: `Instalando dependências com ${preferredManager}...`
     });
-    await installDependencies(projectPath, preferredManager);
+    const executedCmd = await installDependencies(projectPath, preferredManager);
+    attemptsLog.push({ manager: preferredManager, command: executedCmd, status: "passed" });
+
     if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
     if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
     await waitForFilesystemSettling(projectPath, info);
-    await verifyRuntimeDependency(projectPath, info, preferredManager);
-    primaryPassed = true;
-    return preferredManager;
+    try {
+      await verifyRuntimeDependency(projectPath, info, preferredManager);
+      console.log(`[Preview Install] Dependencies validated successfully with ${preferredManager}`);
+      primaryPassed = true;
+      return preferredManager;
+    } catch (valErr: any) {
+      const valErrMsg = `As dependências foram instaladas com ${preferredManager}, mas a validação do runtime '${info?.runtimeEntry || info?.framework || "desconhecido"}' falhou: ${valErr?.message || valErr}`;
+      console.warn(`[Preview Install] ${valErrMsg}`);
+      primaryErrorMsg = valErrMsg;
+      attemptsLog.push({ manager: preferredManager, command: `validação de runtime (${preferredManager})`, status: "failed", error: valErrMsg });
+    }
   } catch (primaryErr: any) {
     primaryErrorMsg = String(primaryErr?.message || primaryErr);
-    console.warn(`[Preview/Install] Falha na instalação/validação com ${preferredManager}:`, primaryErrorMsg);
+    console.warn(`[Preview Install] Instalação com ${preferredManager} falhou:`, primaryErrorMsg);
+    attemptsLog.push({ manager: preferredManager, command: preferredManager, status: "failed", error: primaryErrorMsg });
   }
 
   if (primaryPassed) return preferredManager;
 
-  // If preferred manager was already npm and failed, we reached terminal failure
+  // If preferred manager was npm and failed, construct detailed report
   if (preferredManager === "npm") {
-    console.error(`[Preview] terminal failure: npm install failed. Details: ${primaryErrorMsg}`);
+    console.error(`[Preview Install] Terminal failure: npm install failed.`);
     logPreviewLifecycle("error", {
       stage: "dependencies",
       message: primaryErrorMsg,
       packageManager: "npm",
-      recoveryAttempt: 1,
       previewSession: sessionId
     });
-    throw new Error(`Falha ao instalar dependências. A instalação foi tentada com npm, mas o node_modules permaneceu inválido. Detalhes: ${primaryErrorMsg}`);
+    const attemptsSummary = attemptsLog.map(a => `• ${a.manager} (${a.command}) — ${a.status === "passed" ? "instalado" : "falhou"}`).join("\n");
+    throw new Error(`Não foi possível instalar as dependências.\n\nTentativas:\n${attemptsSummary}\n\nÚltimo erro:\n${sanitizeLogOutput(primaryErrorMsg)}`);
   }
 
-  // Step 2: Single bounded fallback to npm (dependencyRecoveryAttempt = 1)
-  console.log(`[Preview/Fallback] npm started (reason: ${preferredManager} failed installation/runtime validation)`);
+  // Step 2: Single bounded fallback to npm (when preferredManager is bun, pnpm, yarn)
+  console.log(`[Preview Install] Falling back to npm (reason: ${preferredManager} failed)`);
   logPreviewLifecycle("recovery:clean-start", { packageManager: "npm", reason: primaryErrorMsg, recoveryAttempt: 1 });
   emitPreview("preview.installing", {
     status: "installing",
@@ -4589,27 +4691,61 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
       framework: info.framework,
       message: "Instalando dependências com npm..."
     });
-    await installDependencies(projectPath, "npm");
+    const npmCmd = await installDependencies(projectPath, "npm");
+    attemptsLog.push({ manager: "npm", command: npmCmd, status: "passed" });
+
     if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
     if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
     await waitForFilesystemSettling(projectPath, info);
-    await verifyRuntimeDependency(projectPath, info, "npm");
-    logPreviewLifecycle("recovery:clean-complete", { packageManager: "npm", recoveryAttempt: 1 });
-    console.log(`[Preview/Fallback] npm completed successfully`);
-    return "npm";
+    try {
+      await verifyRuntimeDependency(projectPath, info, "npm");
+      logPreviewLifecycle("recovery:clean-complete", { packageManager: "npm", recoveryAttempt: 1 });
+      console.log(`[Preview Install] Dependencies validated successfully with npm`);
+      return "npm";
+    } catch (valErr: any) {
+      if (npmCmd === "npm ci") {
+        console.warn(`[Preview Install] Validação pós-npm ci falhou (${valErr?.message || valErr}). Tentando 'npm install' para resolver dependências da plataforma...`);
+        try {
+          emitPreview("preview.installing", {
+            status: "installing",
+            phase: "installing_dependencies",
+            packageManager: "npm",
+            framework: info.framework,
+            message: "Ajustando dependências com npm install..."
+          });
+          const regularCmd = await installDependencies(projectPath, "npm_install");
+          attemptsLog.push({ manager: "npm", command: regularCmd, status: "passed" });
+          await waitForFilesystemSettling(projectPath, info);
+          await verifyRuntimeDependency(projectPath, info, "npm");
+          logPreviewLifecycle("recovery:clean-complete", { packageManager: "npm", recoveryAttempt: 2 });
+          console.log(`[Preview Install] Dependencies validated successfully with npm install`);
+          return "npm";
+        } catch (regularErr: any) {
+          console.warn(`[Preview Install] Validação pós-npm install também falhou:`, regularErr?.message || regularErr);
+        }
+      }
+      const valErrMsg = `As dependências foram instaladas com npm, mas a validação do runtime '${info?.runtimeEntry || info?.framework || "desconhecido"}' falhou: ${valErr?.message || valErr}`;
+      console.warn(`[Preview Install] ${valErrMsg}`);
+      attemptsLog.push({ manager: "npm", command: `validação de runtime (npm)`, status: "failed", error: valErrMsg });
+      throw new Error(valErrMsg);
+    }
   } catch (fallbackErr: any) {
     const fallbackErrorMsg = String(fallbackErr?.message || fallbackErr);
-    console.error(`[Preview] terminal failure: fallback to npm also failed:`, fallbackErrorMsg);
+    if (!attemptsLog.some(a => a.manager === "npm" && a.status === "failed")) {
+      attemptsLog.push({ manager: "npm", command: "npm", status: "failed", error: fallbackErrorMsg });
+    }
+    console.error(`[Preview Install] Terminal failure: fallback to npm also failed:`, fallbackErrorMsg);
     logPreviewLifecycle("error", {
       stage: "dependencies",
       message: fallbackErrorMsg,
       preferredManager,
       fallbackManager: "npm",
-      recoveryAttempt: 1,
       previewSession: sessionId
     });
-    throw new Error(`Falha ao instalar dependências. A instalação foi tentada com ${preferredManager} e npm, mas o node_modules permaneceu inválido (${fallbackErrorMsg}).`);
+
+    const attemptsSummary = attemptsLog.map(a => `• ${a.manager} (${a.command}) — ${a.status === "passed" ? "instalado" : "falhou"}`).join("\n");
+    throw new Error(`Não foi possível instalar as dependências.\n\nTentativas:\n${attemptsSummary}\n\nÚltimo erro:\n${sanitizeLogOutput(fallbackErrorMsg)}`);
   }
 }
 
@@ -6846,27 +6982,37 @@ ipcMain.handle("projects:getRecent", async () => {
 });
 
 ipcMain.handle("projects:touchRecent", async (_event, projectPath: string) => {
-  const updated = await recentProjectsManager.touchRecentProject(projectPath);
-  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
-  return updated;
+  await recentProjectsManager.touchRecentProject(projectPath);
+  const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
+  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  return enriched;
 });
 
 ipcMain.handle("projects:removeRecent", async (_event, projectPath: string) => {
-  const updated = await recentProjectsManager.removeRecentProject(projectPath);
-  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
-  return updated;
+  await recentProjectsManager.removeRecentProject(projectPath);
+  const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
+  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  return enriched;
 });
 
 ipcMain.handle("projects:toggleFavorite", async (_event, projectPath: string) => {
-  const updated = await recentProjectsManager.toggleFavoriteProject(projectPath);
-  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
-  return updated;
+  await recentProjectsManager.toggleFavoriteProject(projectPath);
+  const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
+  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  return enriched;
 });
 
 ipcMain.handle("projects:saveRecent", async (_event, projects: any[]) => {
-  const updated = await recentProjectsManager.saveRecentProjects(projects);
-  mainWindow?.webContents.send("recent-projects:updated", await recentProjectsManager.getRecentProjectsWithStatus());
-  return updated;
+  await recentProjectsManager.saveRecentProjects(projects);
+  const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
+  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  return enriched;
+});
+
+ipcMain.handle("projects:delete", async (_event, projectPath: string) => {
+  const result = await deleteProjectToTrash(projectPath);
+  mainWindow?.webContents.send("recent-projects:updated", result.updatedList);
+  return result;
 });
 
 ipcMain.handle("projects:detectTechnology", async (_event, projectPath: string) => {
@@ -7060,7 +7206,7 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
     await supabaseManager.setProject(targetPath);
     void vercelManager.setProject(targetPath);
     const lovableState = await lovableCloudManager.setProject(targetPath);
-    if (lovableState.status === "connected" && lovableState.projectId) {
+    if (lovableState.isLovableProject && (lovableState.projectId || lovableState.detectedProjectId)) {
       await lovableMcpServer.start().catch(err => console.warn("[Neko/LovableMCP] Erro ao iniciar MCP:", err));
       await writeLovableOpenCodeConfig(targetPath, lovableMcpServer.getUrl(), lovableMcpServer.getSecretToken()).catch(err => console.warn("[Neko/LovableMCP] Erro ao escrever config:", err));
     } else {
@@ -7550,6 +7696,51 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   });
   logTask("created", taskCorrelationId, payload.sessionId, `model=${modelLabel}${payload.planMode ? " mode=plan" : ""}`);
 
+  // ============================================================
+  // LOVABLE CLOUD JUST-IN-TIME (JIT) GUARD (FASE 4B)
+  // ------------------------------------------------------------
+  // Detecta se a solicitação atual exige acesso/mutação de banco de
+  // dados no Lovable Cloud. Se o projeto for Lovable mas o Cloud não
+  // estiver conectado (lovableCloudConnected !== true), a execução é
+  // pausada ANTES de qualquer alteração parcial no workspace.
+  // O payload original do prompt (texto exato, anexos, contexto, modelo)
+  // é preservado integralmente para retomada automática pós-conexão.
+  // ============================================================
+  const lovableState = lovableCloudManager.getState();
+  const effectiveLovableId =
+    lovableState.projectId ||
+    lovableState.lovableProjectId ||
+    lovableState.detectedProjectId ||
+    null;
+  const isLovableTarget = Boolean(lovableState.isLovableProject && effectiveLovableId);
+
+  console.log(
+    `[Lovable JIT Debug Layer 1] isLovableProject=${lovableState.isLovableProject} projectId=${lovableState.projectId} lovableProjectId=${lovableState.lovableProjectId} detectedProjectId=${lovableState.detectedProjectId} effectiveLovableId=${effectiveLovableId} hasLovableCloud=${lovableState.hasLovableCloud} lovableCloudConnected=${lovableState.lovableCloudConnected} lovableSessionValid=${lovableState.lovableSessionValid} status=${lovableState.status} isLovableTarget=${isLovableTarget}`
+  );
+
+  if (isLovableTarget && !lovableState.lovableCloudConnected) {
+    const intent = detectDatabaseIntent(payload.text);
+    if (intent.requiresDatabase) {
+      console.log(`[Lovable Guard] prompt requires database = true`);
+      console.log(`[Lovable Guard] cloud connected = false`);
+      console.log(`[Lovable Guard] execution paused waiting_for_lovable_cloud`);
+      console.log(`[Lovable Guard] pending prompt preserved`);
+
+      setTaskState(payload.sessionId, "waiting_for_lovable_cloud", "lovable-cloud-required", {
+        projectId: effectiveLovableId,
+        userEmail: lovableState.userEmail,
+        hasLovableCloud: lovableState.hasLovableCloud,
+        reason: intent.reason,
+      });
+
+      return {
+        waitingForLovableCloud: true,
+        taskId: taskCorrelationId,
+        sessionId: payload.sessionId,
+      };
+    }
+  }
+
   if (uploadCount > 0) perfMark("uploadStart", payload.sessionId);
   const contextParts: any[] = [];
   const imageAttachments: Array<{ url: string; filename: string; mime: string }> = [];
@@ -7867,6 +8058,7 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
     logTask("cancelled", resolveTaskIdForSession(sessionId), sessionId);
   }
   migrationManager.cancelAllPendingProposals();
+  lovableMcpServer.cancelAllPendingJit("Operação abortada pelo usuário.");
   cancelVisionFallbackFor(sessionId);
   perfFlushTask(sessionId, "aborted");
 
@@ -7908,7 +8100,7 @@ ipcMain.handle("preview:styleFrame", async () => {
 });
 
 ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
-  const visible = Boolean(payload?.visible);
+  const visible = Boolean(payload?.visible) && !internalPreviewOverlayActive;
   const url = typeof payload?.url === "string" ? payload.url : "";
   const session = Number(payload?.session);
   const rawBounds = payload?.bounds;
@@ -7931,7 +8123,10 @@ ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
   const height = Math.max(1, Math.round(Number(rawBounds?.height)) || 0);
   const view = ensureInternalPreviewView();
   if (!view) return { enabled: false, state: "idle" as const };
-  try { mainWindow?.contentView.addChildView(view); } catch {}
+  try {
+    mainWindow?.contentView.addChildView(view);
+    view.setVisible(true);
+  } catch {}
   view.setBounds({ x, y, width, height });
   internalPreviewSession = session;
   if (!previewUrlsMatch(internalPreviewUrl, url)) {
@@ -7968,20 +8163,29 @@ ipcMain.handle("preview:refresh", async () => {
   }
 });
 
-// Page Selector overlay support. The internal Preview is a native
+// Page Selector & Overlay support. The internal Preview is a native
 // WebContentsView, which Electron always paints ABOVE the renderer DOM — no
-// CSS z-index can raise a DOM dropdown over it. While a DOM overlay (the page
-// selector dropdown) is open we hide the native view so the dropdown paints
-// fully on top; it is restored as soon as the overlay closes.
+// CSS z-index can raise a DOM dropdown over it. While a DOM overlay (modal,
+// page selector, dropdown) is open we hide and detach the native view so the DOM
+// overlay paints fully on top; it is restored as soon as the overlay closes.
 ipcMain.handle("preview:internalOverlay", async (_event, overlay: boolean) => {
+  internalPreviewOverlayActive = Boolean(overlay);
   const view = internalPreviewView;
   if (!view || view.webContents.isDestroyed()) {
-    return { ok: false, visible: !overlay };
+    return { ok: false, visible: !internalPreviewOverlayActive };
   }
   try {
-    view.setVisible(!overlay);
+    if (internalPreviewOverlayActive) {
+      mainWindow?.contentView.removeChildView(view);
+      view.setVisible(false);
+    } else {
+      view.setVisible(true);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.contentView.addChildView(view);
+      }
+    }
   } catch {}
-  return { ok: true, visible: !overlay };
+  return { ok: true, visible: !internalPreviewOverlayActive };
 });
 
 // Page Selector: returns the discovered routes of the active project.
@@ -8815,16 +9019,40 @@ function createWindow() {
     }
   });
 
+  lovableMcpServer.setActiveSessionGetter(() => getActiveSessionId());
+
+  lovableMcpServer.setOnJitRequired(({ sessionId, toolName, projectId, jitId }) => {
+    const rootSessionId = resolveRootSessionId(sessionId) || sessionId;
+    console.log(`[Lovable Guard] Layer 2 MCP JIT required for tool=${toolName} session=${rootSessionId} jitId=${jitId}`);
+
+    setTaskState(rootSessionId, "waiting_for_lovable_cloud", "lovable-mcp-cloud-required", {
+      projectId,
+      toolName,
+      jitId,
+      source: "mcp_tool"
+    });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("lovable:jit-required", {
+        sessionId: rootSessionId,
+        toolName,
+        projectId,
+        jitId,
+        source: "mcp_tool"
+      });
+    }
+  });
+
   lovableCloudManager.on("state-changed", async (state) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("lovable:state-changed", state);
     }
     const currentPath = lovableCloudManager.getActiveProjectPath();
     if (currentPath) {
-      if (state.status === "connected" && state.projectId) {
+      if (state.isLovableProject && (state.projectId || state.detectedProjectId)) {
         await lovableMcpServer.start().catch(() => {});
         await writeLovableOpenCodeConfig(currentPath, lovableMcpServer.getUrl(), lovableMcpServer.getSecretToken()).catch(() => {});
-      } else if (state.status === "disconnected") {
+      } else if (!state.isLovableProject) {
         await removeLovableOpenCodeConfig(currentPath).catch(() => {});
       }
     }
@@ -9229,7 +9457,13 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("lovable:unlink", async () => {
+    lovableMcpServer.cancelAllPendingJit("Projeto Lovable desvinculado.");
     return await lovableCloudManager.unlinkProject();
+  });
+
+  ipcMain.handle("lovable:cancel-jit", async (_event, reason?: string) => {
+    lovableMcpServer.cancelAllPendingJit(reason || "Operação cancelada pelo usuário.");
+    return { ok: true };
   });
 
   ipcMain.handle("lovable:test-connection", async () => {

@@ -316,7 +316,7 @@ export class RecentProjectsManager {
     const pruned = this.pruneList(currentList);
     this.cache = pruned;
     await this.persist(pruned);
-    return [...pruned];
+    return await this.getRecentProjectsWithStatus();
   }
 
   public async updateProjectThumbnail(
@@ -329,7 +329,7 @@ export class RecentProjectsManager {
     }
   ): Promise<RecentProjectItem[]> {
     const normalized = normalizeProjectPath(projectPath);
-    if (!normalized) return this.getRecentProjects();
+    if (!normalized) return this.getRecentProjectsWithStatus();
 
     const currentList = await this.getRecentProjects();
     const target = currentList.find(p => areProjectPathsEqual(p.path, normalized));
@@ -342,24 +342,24 @@ export class RecentProjectsManager {
       this.cache = [...currentList];
       await this.persist(this.cache);
     }
-    return [...(this.cache || currentList)];
+    return await this.getRecentProjectsWithStatus();
   }
 
   public async removeRecentProject(projectPath: string): Promise<RecentProjectItem[]> {
     const normalized = normalizeProjectPath(projectPath);
-    if (!normalized) return this.getRecentProjects();
+    if (!normalized) return this.getRecentProjectsWithStatus();
 
     const currentList = await this.getRecentProjects();
     const filtered = currentList.filter(p => !areProjectPathsEqual(p.path, normalized));
 
     this.cache = filtered;
     await this.persist(filtered);
-    return [...filtered];
+    return await this.getRecentProjectsWithStatus();
   }
 
   public async toggleFavoriteProject(projectPath: string): Promise<RecentProjectItem[]> {
     const normalized = normalizeProjectPath(projectPath);
-    if (!normalized) return this.getRecentProjects();
+    if (!normalized) return this.getRecentProjectsWithStatus();
 
     const currentList = await this.getRecentProjects();
     const target = currentList.find(p => areProjectPathsEqual(p.path, normalized));
@@ -368,7 +368,7 @@ export class RecentProjectsManager {
       this.cache = [...currentList];
       await this.persist(this.cache);
     }
-    return [...(this.cache || currentList)];
+    return await this.getRecentProjectsWithStatus();
   }
 
   public async saveRecentProjects(projects: RecentProjectItem[]): Promise<RecentProjectItem[]> {
@@ -376,7 +376,7 @@ export class RecentProjectsManager {
     const pruned = this.pruneList(cleaned);
     this.cache = pruned;
     await this.persist(pruned);
-    return [...pruned];
+    return await this.getRecentProjectsWithStatus();
   }
 
   /**
@@ -431,7 +431,7 @@ export class RecentProjectsManager {
           }
         } catch {
           // Arquivo de thumbnail em disco não existe
-          if (thumbnailPath && thumbnailPath.toLowerCase().includes(".neko")) {
+          if (!thumbnail && thumbnailPath && thumbnailPath.toLowerCase().includes(".neko")) {
             thumbnail = null;
             thumbnailPath = null;
             thumbnailUpdatedAt = undefined;
@@ -503,3 +503,115 @@ export class RecentProjectsManager {
 }
 
 export const recentProjectsManager = new RecentProjectsManager();
+
+export function isPathSafeForDeletion(projectPath: string): { safe: boolean; reason?: string } {
+  const norm = normalizeProjectPath(projectPath);
+  if (!norm) return { safe: false, reason: "Caminho de projeto inválido." };
+
+  const parsed = path.parse(norm);
+  if (norm.toLowerCase() === parsed.root.toLowerCase()) {
+    return { safe: false, reason: "Não é permitido excluir a raiz do disco." };
+  }
+
+  const home = os.homedir();
+  const normHome = normalizeProjectPath(home);
+  if (areProjectPathsEqual(norm, normHome)) {
+    return { safe: false, reason: "Não é permitido excluir o diretório principal do usuário." };
+  }
+
+  const protectedPaths: string[] = [
+    normHome,
+    normalizeProjectPath(path.join(home, "Desktop")),
+    normalizeProjectPath(path.join(home, "Área de Trabalho")),
+    normalizeProjectPath(path.join(home, "Documents")),
+    normalizeProjectPath(path.join(home, "Documentos")),
+    normalizeProjectPath(path.join(home, "Downloads")),
+    normalizeProjectPath(path.join(home, "OneDrive")),
+    normalizeProjectPath(process.env.SystemRoot || "C:\\Windows"),
+    normalizeProjectPath(process.env["ProgramFiles"] || "C:\\Program Files"),
+    normalizeProjectPath(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)"),
+  ];
+
+  try {
+    const appData = getUserDataDir();
+    if (appData) protectedPaths.push(normalizeProjectPath(appData));
+  } catch {}
+
+  try {
+    const appInstance = (electron as any)?.app || (electron as any)?.default?.app;
+    if (appInstance && typeof appInstance.getPath === "function") {
+      const keys = ["desktop", "documents", "downloads", "userData", "appData", "temp", "home"];
+      for (const k of keys) {
+        try {
+          const p = appInstance.getPath(k);
+          if (p) protectedPaths.push(normalizeProjectPath(p));
+        } catch {}
+      }
+    }
+  } catch {}
+
+  for (const prot of protectedPaths) {
+    if (prot && areProjectPathsEqual(norm, prot)) {
+      return {
+        safe: false,
+        reason: `Não é permitido excluir diretórios do sistema ou pastas padrão (${path.basename(prot)}).`
+      };
+    }
+  }
+
+  return { safe: true };
+}
+
+export async function deleteProjectToTrash(
+  projectPath: string,
+  managerInstance: RecentProjectsManager = recentProjectsManager
+): Promise<{ success: boolean; error?: string; updatedList: RecentProjectItem[] }> {
+  const norm = normalizeProjectPath(projectPath);
+  if (!norm) {
+    return {
+      success: false,
+      error: "Caminho de projeto inválido.",
+      updatedList: await managerInstance.getRecentProjectsWithStatus()
+    };
+  }
+
+  // 1. Safety validation
+  const safety = isPathSafeForDeletion(norm);
+  if (!safety.safe) {
+    return {
+      success: false,
+      error: safety.reason || "Caminho não permitido para exclusão por segurança.",
+      updatedList: await managerInstance.getRecentProjectsWithStatus()
+    };
+  }
+
+  // 2. Physical existence check
+  const exists = await checkProjectExistsOnDisk(norm);
+
+  if (exists) {
+    try {
+      const appShell = (electron as any)?.shell || (electron as any)?.default?.shell;
+      if (appShell && typeof appShell.trashItem === "function") {
+        await appShell.trashItem(norm);
+      } else {
+        // Fallback para ambiente de testes caso shell.trashItem não esteja presente
+        await fs.rm(norm, { recursive: true, force: true });
+      }
+    } catch (err: any) {
+      console.error("[Neko/RecentProjects] Erro ao mover pasta para Lixeira:", err);
+      const msg = err?.message || String(err);
+      return {
+        success: false,
+        error: `Não foi possível mover a pasta para a Lixeira. ${msg ? `(${msg})` : ""}`,
+        updatedList: await managerInstance.getRecentProjectsWithStatus()
+      };
+    }
+  }
+
+  // 3. Remove project from persistence
+  await managerInstance.removeRecentProject(norm);
+  const updatedList = await managerInstance.getRecentProjectsWithStatus();
+
+  return { success: true, updatedList };
+}
+
