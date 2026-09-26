@@ -14,6 +14,7 @@ import { getModelCapabilities } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
 import { nextChatMode, chatModeLabel, CHAT_MODES, type ChatMode } from "../shared/chat-mode";
 import { getUserFacingError } from "../shared/error-extractor";
+import { shouldShowLovableOnboardingModal } from "../main/lovable/lovable-types";
 import { getNekoTutorials, type NekoTutorial } from "./tutorials";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import { ReleaseNotesRenderer } from "./components/ReleaseNotesRenderer";
@@ -1048,7 +1049,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.90");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.91");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1099,6 +1100,8 @@ function App() {
   const pendingQuestionRef = React.useRef<AgentQuestion | null>(null);
   const handledQuestionIdsRef = React.useRef<Set<string>>(new Set());
   const [pendingMigration, setPendingMigration] = React.useState<MigrationCardProposal | null>(null);
+  const pendingMigrationRef = React.useRef<MigrationCardProposal | null>(null);
+  pendingMigrationRef.current = pendingMigration;
   const [migrationHistory, setMigrationHistory] = React.useState<Map<string, MigrationCardProposal>>(new Map());
   // Lightbox simples para visualizar imagens anexadas em tamanho maior.
   const [lightboxImage, setLightboxImage] = React.useState<{ url: string; name: string } | null>(null);
@@ -1269,7 +1272,6 @@ function App() {
   const [lovableBusy, setLovableBusy] = React.useState(false);
   const [lovableError, setLovableError] = React.useState("");
   const [lovableManualProjectId, setLovableManualProjectId] = React.useState("");
-  const pendingLovableCloudCheckRef = React.useRef(false);
   type PendingJITState = {
     source: "layer1" | "layer2";
     sessionId: string;
@@ -1628,6 +1630,15 @@ function App() {
   // Preview Page Selector: rotas reais descobertas no projeto ativo.
   const [previewRoutes, setPreviewRoutes] = React.useState<{ path: string; label: string }[]>([]);
   const [previewCurrentRoute, setPreviewCurrentRoute] = React.useState<string>("/");
+  const previewEffectiveUrl = React.useMemo(() => {
+    if (!previewUrl) return "";
+    if (!previewCurrentRoute || previewCurrentRoute === "/") return previewUrl;
+    try {
+      return new URL(previewCurrentRoute, previewUrl).toString();
+    } catch {
+      return previewUrl;
+    }
+  }, [previewUrl, previewCurrentRoute]);
   const [previewRouteOpen, setPreviewRouteOpen] = React.useState(false);
   const previewRouteLoadingRef = React.useRef(false);
   const previewRoutesProjectRef = React.useRef<string | null>(null);
@@ -1753,7 +1764,7 @@ function App() {
   const modelGroups = React.useMemo(() => {
     const map = new Map<string, { providerID: string; providerName: string; models: Model[] }>();
     for (const m of models) {
-      if (!m.connected || !m.enabled) continue;
+      if (!m.enabled) continue;
       if (!map.has(m.providerID)) map.set(m.providerID, { providerID: m.providerID, providerName: m.providerName, models: [] });
       map.get(m.providerID)!.models.push(m);
     }
@@ -1762,7 +1773,16 @@ function App() {
       .filter(g => g.models.length > 0)
       .filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
 
-    // Order: The provider of the currently selected model is ALWAYS first
+    // Order: Connected providers first, then unconnected providers
+    groups.sort((a, b) => {
+      const aConn = a.models.some(m => m.connected);
+      const bConn = b.models.some(m => m.connected);
+      if (aConn && !bConn) return -1;
+      if (!aConn && bConn) return 1;
+      return 0;
+    });
+
+    // The provider of the currently selected model is ALWAYS first
     if (selectedModel?.providerID) {
       const activeIdx = groups.findIndex(g => g.providerID === selectedModel.providerID);
       if (activeIdx > 0) {
@@ -1777,8 +1797,8 @@ function App() {
 
   const managedModelGroups = React.useMemo(() => {
     const map = new Map<string, { providerID: string; providerName: string; models: Model[] }>();
-    // Pre-populate all connected providers so they always appear in "Gerenciar Modelos"
-    for (const p of connectedProviders) {
+    // Pre-populate all providers so they appear in "Gerenciar Modelos"
+    for (const p of providers) {
       map.set(p.id, { providerID: p.id, providerName: p.name, models: [] });
     }
     for (const m of managedModels) {
@@ -1788,18 +1808,22 @@ function App() {
     const q = modelSearch.toLowerCase();
     const filtered = Array.from(map.values()).filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
 
-    // Order: Providers with at least one free model appear before providers without free models
+    // Order: Connected providers first, then free model providers, then others
+    const connectedGroups: typeof filtered = [];
     const freeProviders: typeof filtered = [];
     const paidProviders: typeof filtered = [];
     for (const group of filtered) {
-      if (group.models.some(isModelFree)) {
+      const isConnected = providers.some(p => p.id === group.providerID && p.connected);
+      if (isConnected) {
+        connectedGroups.push(group);
+      } else if (group.models.some(isModelFree)) {
         freeProviders.push(group);
       } else {
         paidProviders.push(group);
       }
     }
-    return [...freeProviders, ...paidProviders];
-  }, [managedModels, connectedProviders, modelSearch]);
+    return [...connectedGroups, ...freeProviders, ...paidProviders];
+  }, [managedModels, providers, modelSearch]);
 
   const filteredProviders = React.useMemo(() => {
     const q = providerSearch.toLowerCase();
@@ -2017,6 +2041,9 @@ function App() {
       setModal(null);
       setProjectMenuOpen(false);
       setRecentProjectsMenuOpen(false);
+      if (shouldShowLovableOnboardingModal(res.lovableState)) {
+        setModal("lovable");
+      }
       return true;
     } catch (err: any) {
       console.error("[BLACKSCREEN] openRecentProject:runtime-error", err);
@@ -2039,7 +2066,6 @@ function App() {
       await window.neko.stop({ source: source || "user" }).catch(() => {});
     } catch {}
     setProject(null);
-    pendingLovableCloudCheckRef.current = false;
     pendingJITPromptRef.current = null;
     setStatus("offline");
     setMessages([]);
@@ -3280,7 +3306,14 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    window.neko.lovableGetState().then((s: any) => { if (s) setLovableState(s); }).catch(() => {});
+    window.neko.lovableGetState().then((s: any) => {
+      if (s) {
+        setLovableState(s);
+        if (shouldShowLovableOnboardingModal(s)) {
+          setModal("lovable");
+        }
+      }
+    }).catch(() => {});
     const unsubJit = window.neko.onLovableJitRequired?.((data: any) => {
       console.log("[Lovable Guard] Layer 2 MCP JIT required event received", data);
       taskPhaseRef.current = "waiting_for_lovable_cloud";
@@ -3687,9 +3720,9 @@ function App() {
         requestInFlightRef.current = false;
         requestObservedBusyRef.current = false;
         upsertActivity({ id: "validation", icon: "check", title: "Projeto validado", detail: "Build e Preview verificados.", state: "done" });
-        const finishTaskId = currentTaskIdRef.current || (sessionIdRef.current ? `task-${sessionIdRef.current}` : undefined);
-        void triggerAutoCommitIfEligible(finishTaskId);
       }
+      const finishTaskId = currentTaskIdRef.current || (sessionIdRef.current ? `task-${sessionIdRef.current}` : undefined);
+      void triggerAutoCommitIfEligible(finishTaskId);
     } catch (error) {
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
@@ -3842,16 +3875,25 @@ function App() {
     }
     if (state === "waiting_for_approval") {
       if (isTaskTerminal()) return;
+      const currentMigration = pendingMigrationRef.current || pendingMigration;
       // Se a proposta de migração já foi aprovada/está executando e não há outras permissões pendentes, não reverter para waiting_for_approval
-      if (pendingMigration && (pendingMigration.status === "APPROVED" || pendingMigration.status === "EXECUTING") && pendingPermissions.length === 0) {
+      if (currentMigration && (currentMigration.status === "APPROVED" || currentMigration.status === "EXECUTING") && pendingPermissions.length === 0) {
         return;
       }
       taskPhaseRef.current = "waiting_for_approval";
       setBusy(false);
       setWorkingStatus("Neko está aguardando sua aprovação");
       if (props?.permission?.id) {
-        notifyOnce("approval", `per:${String(props.permission.id)}`);
-        setPendingPermissions(prev => prev.some(p => p.id === props.permission.id) ? prev : [...prev, props.permission as PermissionRequest]);
+        const permName = String(props.permission.permission ?? props.permission.type ?? "");
+        const isMigration =
+          props?.reason === "migration-asked" ||
+          isSupabaseMigrationPermission(permName) ||
+          Boolean(currentMigration && (currentMigration.permissionId === props.permission.id || currentMigration.status === "PENDING"));
+
+        if (!isMigration) {
+          notifyOnce("approval", `per:${String(props.permission.id)}`);
+          setPendingPermissions(prev => prev.some(p => p.id === props.permission.id) ? prev : [...prev, props.permission as PermissionRequest]);
+        }
       }
       return;
     }
@@ -3905,7 +3947,7 @@ function App() {
       console.log(`[TaskLifecycle] state=failed taskId=${props?.taskId ?? "-"} reason=${String(props?.reason ?? "")}`);
       return;
     }
-  }, [concludeCurrentTask, completeTaskTimeline, isTaskTerminal, upsertActivity, finishActivity, pendingPermissions]);
+  }, [concludeCurrentTask, completeTaskTimeline, isTaskTerminal, upsertActivity, finishActivity, pendingPermissions, pendingMigration]);
 
   // Stable references for the event-handler effect. The effect must NEVER
   // re-subscribe because a callback identity changed: several callbacks
@@ -4381,61 +4423,13 @@ function App() {
           setPreviewSurface("webcontents");
           setPreviewFrameReady(false);
           setPreviewLoading(false);
-          setPreviewCurrentRoute("/");
+          if (typeof props.path === "string" && props.path) {
+            setPreviewCurrentRoute(props.path === "/" ? "/" : props.path.replace(/\/+$/, "") || "/");
+          }
           clearConsole();
           // Clear active error lines when preview server becomes healthy and ready
           setTerminalLines(prev => prev.filter(l => l.kind !== "error"));
           void loadPreviewRoutes(false);
-
-          // Pós-clone: Decidir se o modal Lovable Cloud deve ser exibido após Preview Ready
-          if (pendingLovableCloudCheckRef.current) {
-            pendingLovableCloudCheckRef.current = false;
-            void window.neko.lovableGetState().then((s: any) => {
-              if (s) {
-                setLovableState(s);
-                const hasValidId = Boolean(s.projectId || s.detectedProjectId);
-                const isConnected = s.status === "connected" || s.lovableCloudConnected === true;
-                const needsAuthVerification = Boolean(s.isLovableProject && hasValidId && !s.lovableSessionValid && !isConnected);
-                const isCloudConfirmedUnconnected = Boolean(s.isLovableProject && hasValidId && s.hasLovableCloud === true && !isConnected);
-                const shouldShow = needsAuthVerification || isCloudConfirmedUnconnected;
-
-                let reason = "";
-                if (!s.isLovableProject) {
-                  reason = "Projeto não identificado como Lovable";
-                } else if (!hasValidId) {
-                  reason = "ProjectId Lovable não encontrado";
-                } else if (isConnected) {
-                  reason = "Lovable Cloud já está conectado";
-                } else if (needsAuthVerification) {
-                  reason = "Projeto Lovable detectado com projectId, requer autenticação para verificar recursos e Lovable Cloud";
-                } else if (isCloudConfirmedUnconnected) {
-                  reason = "Cloud confirmado e não conectado";
-                } else {
-                  reason = `Cloud não confirmado após validação de sessão (cloudStatus: ${s.cloudStatus || "unknown"}, hasLovableCloud: ${s.hasLovableCloud})`;
-                }
-
-                console.log("[Lovable Post Clone]", {
-                  projectPath: projectRef.current,
-                  isLovableProject: s.isLovableProject,
-                  projectId: s.projectId || s.detectedProjectId || s.lovableProjectId || null,
-                  previewReady: true,
-                  hasLovableCloud: s.hasLovableCloud,
-                  cloudStatus: s.cloudStatus || "unknown",
-                  lovableSessionValid: s.lovableSessionValid,
-                  lovableCloudConnected: s.lovableCloudConnected,
-                  shouldShowModal: shouldShow,
-                  reason,
-                });
-
-                if (shouldShow) {
-                  console.log(`[Neko/Lovable] Pós-clone: ${reason}. Abrindo modal Lovable.`);
-                  setModal("lovable");
-                }
-              }
-            }).catch((err) => {
-              console.warn("[Lovable Post Clone] Erro ao obter estado Lovable pós-preview:", err);
-            });
-          }
         }
         if (event.type === "preview.route-changed") {
           // O seletor acompanha a rota real do Preview interno (links internos,
@@ -4519,9 +4513,10 @@ function App() {
     let pumpRaf = 0;
 
     const sync = () => {
+      const effectiveUrl = previewEffectiveUrl || previewUrl;
       if (!visible || !host || !previewUrl) {
         previewViewSyncKeyRef.current = "";
-        void window.neko.syncInternalPreview({ session: previewInternalSession, url: previewUrl || "", visible: false }).catch(() => {});
+        void window.neko.syncInternalPreview({ session: previewInternalSession, url: effectiveUrl || "", visible: false }).catch(() => {});
         return;
       }
       const rect = host.getBoundingClientRect();
@@ -4530,10 +4525,10 @@ function App() {
       const width = Math.max(1, Math.round(rect.right) - left);
       const height = Math.max(1, Math.round(rect.bottom) - top);
       const bounds = { x: left, y: top, width, height };
-      const key = `${previewInternalSession}:${previewUrl}:${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}`;
+      const key = `${previewInternalSession}:${effectiveUrl}:${bounds.x}:${bounds.y}:${bounds.width}:${bounds.height}`;
       if (key === previewViewSyncKeyRef.current) return;
       previewViewSyncKeyRef.current = key;
-      void window.neko.syncInternalPreview({ session: previewInternalSession, url: previewUrl, visible: true, bounds }).catch(error => {
+      void window.neko.syncInternalPreview({ session: previewInternalSession, url: effectiveUrl, visible: true, bounds }).catch(error => {
         console.error("[Preview/Internal] sync failed", error);
         setPreviewSurface("iframe");
       });
@@ -4596,7 +4591,7 @@ function App() {
       window.removeEventListener("transitionend", schedule);
       window.removeEventListener("transitioncancel", schedule);
     };
-  }, [previewSurface, workspaceTab, previewUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen, isAnyOverlayOpen]);
+  }, [previewSurface, workspaceTab, previewUrl, previewEffectiveUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen, isAnyOverlayOpen]);
 
   // Fallback watchdog for build execution. OpenCode can occasionally leave
   // session.status as busy or events can be dropped.
@@ -5800,7 +5795,6 @@ function App() {
         resetGithubCloneState();
         setModal(null);
         void touchRecentProject(res.path);
-        pendingLovableCloudCheckRef.current = true;
         if (res.workspaceResult) {
           if (res.workspaceResult.error) {
             showToast(res.workspaceResult.error);
@@ -5831,6 +5825,9 @@ function App() {
           setTerminalLines([]);
           setProjectMenuOpen(false);
           setRecentProjectsMenuOpen(false);
+          if (shouldShowLovableOnboardingModal(ws.lovableState)) {
+            setModal("lovable");
+          }
         }
         console.log("[GitHubCloneLifecycle] workspace:opened", { path: res.path });
       } else {
@@ -6200,16 +6197,6 @@ function App() {
     return match ? match.label : (previewCurrentRoute === "/" ? "Home" : previewCurrentRoute.replace(/\//g, " / ") || "Home");
   })();
 
-  const previewEffectiveUrl = React.useMemo(() => {
-    if (!previewUrl) return "";
-    if (!previewCurrentRoute || previewCurrentRoute === "/") return previewUrl;
-    try {
-      return new URL(previewCurrentRoute, previewUrl).toString();
-    } catch {
-      return previewUrl;
-    }
-  }, [previewUrl, previewCurrentRoute]);
-
   // The selector is only shown when the Preview tab has an active server.
   const showPreviewSelector = previewSurface === "webcontents" && Boolean(previewUrl) && workspaceTab === "preview";
 
@@ -6285,7 +6272,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.90"}</span>
+                  <span>Versão {appVersion || "0.4.91"}</span>
                 </div>
                 <button
                   type="button"
@@ -6688,7 +6675,7 @@ function App() {
                 <button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")} title="Tablet"><Tablet size={14}/></button>
                 <button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")} title="Mobile"><Smartphone size={14}/></button>
                 <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={14}/></button>
-                <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; console.log("[Neko/PreviewExternal] click", `url=${String(previewUrl)}`); void window.neko.openPreviewExternal(previewUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={14}/></button>
+                <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; const targetUrl = previewEffectiveUrl || previewUrl; console.log("[Neko/PreviewExternal] click", `url=${String(targetUrl)}`); void window.neko.openPreviewExternal(targetUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={14}/></button>
               </div>
             )}
           </div>
@@ -7253,10 +7240,11 @@ function App() {
                                 <div className="model-picker-items">
                                   {displayModels.map(m => {
                                     const isItemActive = selectedModel?.providerID === m.providerID && selectedModel?.modelID === m.modelID;
+                                    const isConnected = m.connected;
                                     return (
                                       <button
                                         key={`${m.providerID}:${m.modelID}`}
-                                        className={`model-choice ${isItemActive ? "selected" : ""}`}
+                                        className={`model-choice ${isItemActive ? "selected" : ""} ${!isConnected ? "unconfigured" : ""}`}
                                         onClick={() => {
                                           modelPickSourceRef.current = "user";
                                           setSelectedModel({ providerID: m.providerID, modelID: m.modelID });
@@ -7267,9 +7255,10 @@ function App() {
                                         <span className="model-glyph"><ProviderIcon id={m.providerID} size={15}/></span>
                                         <span className="model-choice-labels">
                                           <b>{m.name}</b>
-                                          <small>{m.modelID}</small>
+                                          <small>{m.modelID}{!isConnected ? " • Não configurado" : ""}</small>
                                         </span>
-                                        {isItemActive && <i><Check size={14}/></i>}
+                                        {!isConnected && <span className="model-unconfigured-tag">Não configurado</span>}
+                                        {isItemActive && isConnected && <i><Check size={14}/></i>}
                                       </button>
                                     );
                                   })}
@@ -7277,7 +7266,7 @@ function App() {
                               )}
                             </section>
                           );
-                        }) : <div className="model-picker-empty">{modelSearch ? "Nenhum modelo encontrado." : "Nenhum provider ativo disponível."}</div>}
+                        }) : <div className="model-picker-empty">{modelSearch ? "Nenhum modelo encontrado." : "Nenhum modelo disponível no catálogo."}</div>}
                       </div>
                       <button className="manage-models" onClick={() => { setModelOpen(false); setModal("models"); }}><Settings2 size={15}/> Gerenciar modelos</button>
                     </div>}

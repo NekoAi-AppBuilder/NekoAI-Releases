@@ -8,6 +8,7 @@ import {
   SupabaseCreateProjectPayload,
   SupabaseStructuredError,
 } from "./supabase-types";
+import { resolveNodeRuntime, getEmbeddedRuntimeEnv } from "../node-runtime";
 
 export function sanitizeLog(text: string): string {
   return text
@@ -104,7 +105,7 @@ export function parseSupabaseError(rawError: any): SupabaseStructuredError {
   }
 
   // 6. Token / PAT inválido ou expirado
-  if (/invalid access token|unauthorized|401|token expired|invalid token/i.test(text)) {
+  if (/invalid access token|unauthorized|401|403|token expired|invalid token|token.*(?:inválido|invalido|expirou)|autentica(?:ção|cao) expirada/i.test(text)) {
     return {
       code: "AUTH_EXPIRED",
       title: "Autenticação expirada",
@@ -158,6 +159,14 @@ export function parseSupabaseError(rawError: any): SupabaseStructuredError {
 }
 
 export function executableDirectories(): string[] {
+  let bundledBinDir: string | null = null;
+  try {
+    const runtime = resolveNodeRuntime();
+    if (runtime?.binDir) {
+      bundledBinDir = runtime.binDir;
+    }
+  } catch {}
+
   const pathDirectories = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
   const appData = process.env.APPDATA;
   const localAppData = process.env.LOCALAPPDATA;
@@ -167,9 +176,12 @@ export function executableDirectories(): string[] {
   const resourcesPath = process.resourcesPath || "";
 
   const candidates = [
+    bundledBinDir || "",
+    path.resolve(__dirname, "..", "..", "tools", "node"),
+    path.resolve(process.cwd(), "tools", "node"),
     path.join(__dirname, "..", "..", "tools"),
-    resourcesPath ? path.join(resourcesPath, "tools") : "",
     resourcesPath ? path.join(resourcesPath, "tools", "node") : "",
+    resourcesPath ? path.join(resourcesPath, "tools") : "",
     resourcesPath ? path.join(resourcesPath, "tools", "supabase", "node_modules", ".bin") : "",
     localAppData ? path.join(localAppData, "NekoAI", "tools") : "",
     appData ? path.join(appData, "npm") : "",
@@ -324,6 +336,14 @@ export class SupabaseCli {
   private isShuttingDown = false;
   private cliQueue: Promise<any> = Promise.resolve();
   private detectedVersion: string | null = null;
+  private customFetch?: typeof fetch;
+  private inMemoryToken: string | null = null;
+
+  constructor(customFetch?: typeof fetch) {
+    if (customFetch) {
+      this.customFetch = customFetch;
+    }
+  }
 
   private terminate(child: ChildProcess) {
     if (child.pid && process.platform === "win32") {
@@ -349,13 +369,17 @@ export class SupabaseCli {
   }
 
   public async ensureCliAvailable(): Promise<void> {
+    const standalone = await resolveExecutable(["supabase"]);
+    if (!standalone) {
+      console.log("[Neko/SupabaseCLI] Standalone CLI não detectado; operando em modo REST API direto.");
+      return;
+    }
     try {
       const res = await this.runCli(["--version"], 15000);
       this.detectedVersion = res.stdout;
       console.log(`[Neko/SupabaseCLI] version=${this.detectedVersion}`);
     } catch (err: any) {
-      const code = err?.code || (err instanceof Error ? err.message : "");
-      throw new Error(`Supabase CLI não pôde ser iniciado no sistema: ${code}`);
+      console.warn(`[Neko/SupabaseCLI] Aviso ao verificar versão da CLI: ${err?.message || err}`);
     }
   }
 
@@ -394,7 +418,7 @@ export class SupabaseCli {
           ...invocation.options,
           cwd: process.cwd(),
           env: {
-            ...process.env,
+            ...getEmbeddedRuntimeEnv(),
             NO_COLOR: "1",
             SUPABASE_TELEMETRY_DISABLED: "1",
             DO_NOT_TRACK: "1",
@@ -623,15 +647,75 @@ export class SupabaseCli {
     } catch {}
   }
 
+  private getToken(): string | null {
+    if (this.inMemoryToken) return this.inMemoryToken;
+    return this.readStoredCliToken();
+  }
+
   public async login(token: string): Promise<void> {
-    await this.ensureCliAvailable();
-    await this.runCli(["login", "--token", token.trim()], 45000);
+    const trimmed = token.trim();
+    if (!trimmed) {
+      throw new Error("Token de acesso inválido.");
+    }
+
+    // 1) Validação rápida contra a REST API oficial do Supabase
+    const fetchFn = this.customFetch || globalThis.fetch;
+    let response: Response;
+    try {
+      response = await fetchFn("https://api.supabase.com/v1/organizations", {
+        headers: {
+          Authorization: `Bearer ${trimmed}`,
+          "User-Agent": "NekoAI/0.4.91",
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (err: any) {
+      if (err?.name === "TimeoutError" || /timed out|tempo limite/i.test(err?.message || "")) {
+        throw new Error("A operação do Supabase excedeu o tempo limite.");
+      }
+      throw new Error(`Erro de conexão com o Supabase: ${err?.message || "falha de rede"}`);
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("O token de acesso do Supabase é inválido ou expirou.");
+    }
+
+    if (!response.ok) {
+      throw new Error(`Supabase API retornou erro HTTP ${response.status}`);
+    }
+
+    // 2) Armazenamento canônico do token no disco em ~/.supabase/access-token
+    try {
+      const home = os.homedir();
+      const supabaseDir = path.join(home, ".supabase");
+      if (!fsSync.existsSync(supabaseDir)) {
+        fsSync.mkdirSync(supabaseDir, { recursive: true });
+      }
+      const tokenPath = path.join(supabaseDir, "access-token");
+      fsSync.writeFileSync(tokenPath, trimmed, "utf8");
+    } catch (writeErr) {
+      console.warn("[Neko/SupabaseCLI] Aviso ao persistir access-token em disco:", writeErr);
+    }
+
+    this.inMemoryToken = trimmed;
+
+    // 3) Se houver standalone CLI instalada localmente, sincroniza silenciosamente
+    const standalone = await resolveExecutable(["supabase"]);
+    if (standalone) {
+      this.runCli(["login", "--token", trimmed], 15000).catch((err) => {
+        console.warn("[Neko/SupabaseCLI] Sincronização CLI opcional:", err?.message || err);
+      });
+    }
   }
 
   public async logout(): Promise<void> {
-    try {
-      await this.runCli(["logout"], 15000);
-    } catch {}
+    this.inMemoryToken = null;
+    const standalone = await resolveExecutable(["supabase"]);
+    if (standalone) {
+      try {
+        await this.runCli(["logout"], 15000);
+      } catch {}
+    }
     try {
       const home = os.homedir();
       const tokenPath = path.join(home, ".supabase", "access-token");
@@ -653,47 +737,152 @@ export class SupabaseCli {
   }
 
   public async listProjects(): Promise<SupabaseProject[]> {
-    const result = await this.runCli(["projects", "list", "--output-format", "json"]);
-    try {
-      const jsonStart = Math.min(
-        ...[result.stdout.indexOf("["), result.stdout.indexOf("{")].filter((i) => i !== -1)
-      );
-      if (jsonStart === Infinity) throw new Error("Saída de projetos inválida.");
-      const parsed = JSON.parse(result.stdout.substring(jsonStart));
-      const list: any[] = Array.isArray(parsed) ? parsed : parsed.projects || [];
-      return list
-        .map((p) => ({
-          id: p.id || p.ref,
-          name: p.name || "Projeto Sem Nome",
-          ref: p.ref || p.id,
-          region: p.region || "Desconhecida",
-          status: p.status || "ACTIVE",
-        }))
-        .sort((a, b) => b.status.localeCompare(a.status) || a.name.localeCompare(b.name));
-    } catch {
-      throw new Error("Não foi possível carregar a lista de projetos do Supabase.");
+    const token = this.getToken();
+    if (token) {
+      const fetchFn = this.customFetch || globalThis.fetch;
+      try {
+        const res = await fetchFn("https://api.supabase.com/v1/projects", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "User-Agent": "NekoAI/0.4.91",
+          },
+          signal: AbortSignal.timeout(20000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const list: any[] = Array.isArray(data) ? data : data.projects || [];
+          return list
+            .map((p) => ({
+              id: p.id || p.ref,
+              name: p.name || "Projeto Sem Nome",
+              ref: p.ref || p.id,
+              region: p.region || "Desconhecida",
+              status: p.status || "ACTIVE",
+            }))
+            .sort((a, b) => b.status.localeCompare(a.status) || a.name.localeCompare(b.name));
+        }
+      } catch (apiErr) {
+        console.warn("[Neko/SupabaseCLI] Erro na REST API listProjects:", apiErr);
+      }
     }
+
+    const standalone = await resolveExecutable(["supabase"]);
+    if (standalone) {
+      const result = await this.runCli(["projects", "list", "--output-format", "json"]);
+      try {
+        const jsonStart = Math.min(
+          ...[result.stdout.indexOf("["), result.stdout.indexOf("{")].filter((i) => i !== -1)
+        );
+        if (jsonStart === Infinity) throw new Error("Saída de projetos inválida.");
+        const parsed = JSON.parse(result.stdout.substring(jsonStart));
+        const list: any[] = Array.isArray(parsed) ? parsed : parsed.projects || [];
+        return list
+          .map((p) => ({
+            id: p.id || p.ref,
+            name: p.name || "Projeto Sem Nome",
+            ref: p.ref || p.id,
+            region: p.region || "Desconhecida",
+            status: p.status || "ACTIVE",
+          }))
+          .sort((a, b) => b.status.localeCompare(a.status) || a.name.localeCompare(b.name));
+      } catch {
+        throw new Error("Não foi possível carregar a lista de projetos do Supabase.");
+      }
+    }
+
+    throw new Error("Não foi possível carregar a lista de projetos do Supabase.");
   }
 
   public async listOrganizations(): Promise<SupabaseOrganization[]> {
-    const result = await this.runCli(["orgs", "list", "--output-format", "json"]);
-    try {
-      const jsonStart = Math.min(
-        ...[result.stdout.indexOf("["), result.stdout.indexOf("{")].filter((i) => i !== -1)
-      );
-      if (jsonStart === Infinity) throw new Error("Saída de organizações inválida.");
-      const parsed = JSON.parse(result.stdout.substring(jsonStart));
-      const list: any[] = Array.isArray(parsed) ? parsed : parsed.organizations || [];
-      return list.map((o) => ({
-        id: o.id,
-        name: o.name || "Organização",
-      }));
-    } catch {
-      throw new Error("Não foi possível carregar a lista de organizações do Supabase.");
+    const token = this.getToken();
+    if (token) {
+      const fetchFn = this.customFetch || globalThis.fetch;
+      try {
+        const res = await fetchFn("https://api.supabase.com/v1/organizations", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "User-Agent": "NekoAI/0.4.91",
+          },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const list: any[] = Array.isArray(data) ? data : data.organizations || [];
+          return list.map((o) => ({
+            id: o.id,
+            name: o.name || "Organização",
+          }));
+        }
+      } catch (apiErr) {
+        console.warn("[Neko/SupabaseCLI] Erro na REST API listOrganizations:", apiErr);
+      }
     }
+
+    const standalone = await resolveExecutable(["supabase"]);
+    if (standalone) {
+      const result = await this.runCli(["orgs", "list", "--output-format", "json"]);
+      try {
+        const jsonStart = Math.min(
+          ...[result.stdout.indexOf("["), result.stdout.indexOf("{")].filter((i) => i !== -1)
+        );
+        if (jsonStart === Infinity) throw new Error("Saída de organizações inválida.");
+        const parsed = JSON.parse(result.stdout.substring(jsonStart));
+        const list: any[] = Array.isArray(parsed) ? parsed : parsed.organizations || [];
+        return list.map((o) => ({
+          id: o.id,
+          name: o.name || "Organização",
+        }));
+      } catch {
+        throw new Error("Não foi possível carregar a lista de organizações do Supabase.");
+      }
+    }
+
+    throw new Error("Não foi possível carregar a lista de organizações do Supabase.");
   }
 
   public async createProject(payload: SupabaseCreateProjectPayload): Promise<void> {
+    const token = this.getToken();
+    if (token) {
+      const fetchFn = this.customFetch || globalThis.fetch;
+      try {
+        const res = await fetchFn("https://api.supabase.com/v1/projects", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "User-Agent": "NekoAI/0.4.91",
+          },
+          body: JSON.stringify({
+            name: payload.name,
+            organization_id: payload.orgId,
+            db_pass: payload.dbPassword,
+            region: payload.region || "sa-east-1",
+            plan: "free",
+          }),
+          signal: AbortSignal.timeout(60000),
+        });
+
+        if (res.ok) {
+          return;
+        }
+
+        let errBody = "";
+        try {
+          const json = await res.json();
+          errBody = json.message || json.error || JSON.stringify(json);
+        } catch {
+          errBody = await res.text();
+        }
+        throw new Error(errBody || `HTTP ${res.status}`);
+      } catch (err: any) {
+        const standalone = await resolveExecutable(["supabase"]);
+        if (!standalone) {
+          throw err;
+        }
+        console.warn("[Neko/SupabaseCLI] REST API createProject falhou, tentando CLI standalone fallback:", err);
+      }
+    }
+
     await this.runCli(
       [
         "projects",
@@ -711,38 +900,75 @@ export class SupabaseCli {
   }
 
   public async fetchApiKeys(ref: string): Promise<{ publishableKey: string }> {
-    const result = await this.runCli([
-      "projects",
-      "api-keys",
-      "--project-ref",
-      ref,
-      "--output-format",
-      "json",
-    ]);
-
-    try {
-      const jsonStart = result.stdout.indexOf("{");
-      if (jsonStart === -1) throw new Error("Saída inválida");
-      const parsed = JSON.parse(result.stdout.substring(jsonStart));
-      const keys: any[] = parsed.keys || [];
-      const keyEntry = keys.find(
-        (k) =>
-          k.type === "publishable" ||
-          k.type === "anon" ||
-          k.name === "anon" ||
-          k.id === "anon" ||
-          k.role === "anon"
-      );
-      if (!keyEntry?.api_key) {
-        throw new Error("Chave pública (anon/publishable) não encontrada para este projeto.");
+    const token = this.getToken();
+    if (token) {
+      const fetchFn = this.customFetch || globalThis.fetch;
+      try {
+        const res = await fetchFn(`https://api.supabase.com/v1/projects/${ref}/api-keys`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "User-Agent": "NekoAI/0.4.91",
+          },
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const keys: any[] = Array.isArray(data) ? data : data.keys || [];
+          const keyEntry = keys.find(
+            (k) =>
+              k.type === "publishable" ||
+              k.type === "anon" ||
+              k.name === "anon" ||
+              k.id === "anon" ||
+              k.role === "anon"
+          );
+          const apiKey = keyEntry?.api_key || keyEntry?.apiKey;
+          if (apiKey) {
+            return { publishableKey: apiKey };
+          }
+        }
+      } catch (apiErr) {
+        console.warn("[Neko/SupabaseCLI] Erro na REST API fetchApiKeys:", apiErr);
       }
-      return { publishableKey: keyEntry.api_key };
-    } catch (error) {
-      throw new Error(
-        error instanceof Error
-          ? error.message
-          : "Não foi possível obter as chaves públicas do Supabase para este projeto."
-      );
     }
+
+    const standalone = await resolveExecutable(["supabase"]);
+    if (standalone) {
+      const result = await this.runCli([
+        "projects",
+        "api-keys",
+        "--project-ref",
+        ref,
+        "--output-format",
+        "json",
+      ]);
+
+      try {
+        const jsonStart = result.stdout.indexOf("{");
+        if (jsonStart === -1) throw new Error("Saída inválida");
+        const parsed = JSON.parse(result.stdout.substring(jsonStart));
+        const keys: any[] = parsed.keys || [];
+        const keyEntry = keys.find(
+          (k) =>
+            k.type === "publishable" ||
+            k.type === "anon" ||
+            k.name === "anon" ||
+            k.id === "anon" ||
+            k.role === "anon"
+        );
+        if (!keyEntry?.api_key) {
+          throw new Error("Chave pública (anon/publishable) não encontrada para este projeto.");
+        }
+        return { publishableKey: keyEntry.api_key };
+      } catch (error) {
+        throw new Error(
+          error instanceof Error
+            ? error.message
+            : "Não foi possível obter as chaves públicas do Supabase para este projeto."
+        );
+      }
+    }
+
+    throw new Error("Não foi possível obter as chaves públicas do Supabase para este projeto.");
   }
 }

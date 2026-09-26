@@ -1,6 +1,6 @@
 {
   "name": "nekoai",
-  "version": "0.4.90",
+  "version": "0.4.91",
   "private": true,
   "description": "NekoAI - AI software builder",
   "main": "dist/main/main.js",
@@ -89,6 +89,14 @@
       {
         "from": "tools/git",
         "to": "tools/git"
+      },
+      {
+        "from": "tools/node",
+        "to": "tools/node"
+      },
+      {
+        "from": "tools/node/node_modules",
+        "to": "tools/node/node_modules"
       }
     ],
     "win": {
