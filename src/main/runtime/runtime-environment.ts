@@ -6,6 +6,10 @@ import path from "node:path";
 import {
   RuntimeDescriptor,
 } from "./runtime-types";
+import {
+  resolvePackageManagerExecutablePath,
+  getKnownPackageManagerDirectories,
+} from "../preview-package-manager";
 
 export type EnvironmentResolutionStatus =
   | "ready"
@@ -19,6 +23,15 @@ export interface ResolveEnvironmentOptions {
   basePath?: string;
   baseEnv?: Record<string, string | undefined>;
   validateExecutables?: boolean;
+}
+
+export interface BuildPreviewEnvironmentOptions {
+  packageManager?: string;
+  projectPath?: string;
+  baseEnv?: Record<string, string | undefined>;
+  basePath?: string;
+  extraBinDirs?: string[];
+  extraDescriptors?: RuntimeDescriptor[];
 }
 
 export interface ResolvedRuntimeEnvironment {
@@ -145,6 +158,9 @@ export class RuntimeEnvironmentBuilder {
     // 4. Injeção isolada de variáveis de ambiente
     const mergedEnv: Record<string, string | undefined> = { ...baseEnv };
     mergedEnv.PATH = effectivePath;
+    if (process.platform === "win32") {
+      mergedEnv.Path = effectivePath;
+    }
 
     const declaredEnv = descriptor.environmentVariables || {};
     for (const [k, v] of Object.entries(declaredEnv)) {
@@ -176,6 +192,9 @@ export class RuntimeEnvironmentBuilder {
     if (!descriptors || descriptors.length === 0) {
       const { basePath = process.env.PATH || "", baseEnv = { ...process.env } } = options;
       const merged: Record<string, string | undefined> = { ...baseEnv, PATH: basePath };
+      if (process.platform === "win32") {
+        merged.Path = basePath;
+      }
       return {
         status: "ready",
         binDirs: [],
@@ -261,6 +280,118 @@ export class RuntimeEnvironmentBuilder {
       env: mergedEnv,
       executables: allResolvedExecutables,
       error: issues.length > 0 ? issues.join(" | ") : undefined,
+    };
+  }
+
+  /**
+   * Constrói o ambiente isolado de execução para o Preview do NekoAI.
+   * Resolve o package manager solicitado (ex: Bun, pnpm, yarn, npm), localiza seus executáveis
+   * e monta um dicionário de ambiente isolado com PATH robusto sem mutação global de process.env.
+   */
+  public static buildPreviewEnvironment(
+    options: BuildPreviewEnvironmentOptions = {}
+  ): ResolvedRuntimeEnvironment {
+    const {
+      packageManager = "npm",
+      baseEnv = { ...process.env },
+      basePath = options.baseEnv?.PATH || options.baseEnv?.Path || process.env.PATH || process.env.Path || "",
+      extraBinDirs = [],
+      extraDescriptors = [],
+    } = options;
+
+    const pmBinDirs: string[] = [];
+    const resolvedExecutables: Record<string, string> = {};
+
+    // 1. Resolver o executável específico do package manager (ex: bun, bun.exe)
+    const exePath = resolvePackageManagerExecutablePath(packageManager);
+    if (exePath && fsSync.existsSync(exePath)) {
+      resolvedExecutables[packageManager] = exePath;
+      const dir = path.dirname(exePath);
+      if (!pmBinDirs.includes(dir)) {
+        pmBinDirs.push(dir);
+      }
+    }
+
+    // 2. Incluir diretórios conhecidos de instalação do package manager
+    const knownDirs = getKnownPackageManagerDirectories(packageManager);
+    for (const kd of knownDirs) {
+      if (!pmBinDirs.includes(kd)) {
+        pmBinDirs.push(kd);
+      }
+    }
+
+    // 3. Incluir extraBinDirs fornecidos
+    for (const ed of extraBinDirs) {
+      if (ed && fsSync.existsSync(ed) && !pmBinDirs.includes(ed)) {
+        pmBinDirs.push(ed);
+      }
+    }
+
+    // 4. Se houver descriptors gerenciados adicionais (ex: Bun provisionado no RuntimeStore)
+    if (extraDescriptors && extraDescriptors.length > 0) {
+      for (const desc of extraDescriptors) {
+        if (desc.installDir && fsSync.existsSync(desc.installDir)) {
+          const raw = desc.binDirs && desc.binDirs.length > 0 ? desc.binDirs : ["."];
+          for (const rel of raw) {
+            const abs = path.resolve(desc.installDir, rel);
+            if (fsSync.existsSync(abs) && !pmBinDirs.includes(abs)) {
+              pmBinDirs.push(abs);
+            }
+          }
+        }
+      }
+    }
+
+    // 5. Compor PATH determinístico e isolado
+    const pathEntries: string[] = [];
+    const seenPaths = new Set<string>();
+
+    const addPathEntry = (p: string) => {
+      if (!p || typeof p !== "string") return;
+      const normalized = path.normalize(p.trim());
+      if (!normalized) return;
+      const compareKey = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+      if (!seenPaths.has(compareKey)) {
+        seenPaths.add(compareKey);
+        pathEntries.push(normalized);
+      }
+    };
+
+    // Prepend package manager and runtime bin directories
+    for (const bin of pmBinDirs) {
+      addPathEntry(bin);
+    }
+
+    // Append original base PATH entries
+    const baseEntries = basePath.split(path.delimiter);
+    for (const entry of baseEntries) {
+      addPathEntry(entry);
+    }
+
+    const effectivePath = pathEntries.join(path.delimiter);
+
+    const mergedEnv: Record<string, string | undefined> = { ...baseEnv };
+    mergedEnv.PATH = effectivePath;
+    if (process.platform === "win32") {
+      mergedEnv.Path = effectivePath;
+    }
+
+    if (packageManager.toLowerCase() === "bun" && exePath) {
+      const bunDir = path.dirname(exePath);
+      const bunParent = path.dirname(bunDir);
+      if (!mergedEnv.BUN_INSTALL && fsSync.existsSync(bunParent)) {
+        mergedEnv.BUN_INSTALL = bunParent;
+      }
+    }
+
+    return {
+      status: "ready",
+      binDirs: pmBinDirs,
+      pathEntries,
+      effectivePath,
+      environmentVariables: {},
+      env: mergedEnv,
+      executables: resolvedExecutables,
     };
   }
 }

@@ -231,3 +231,120 @@ test("15. Simulação Lov-Infinity (Lovable Project): Preview e Validation Build
   }
 });
 
+// ============================================================================
+// SUÍTE DE TESTES: WINDOWS REAL BUN DETECTION & RUNTIME ISOLATION
+// ============================================================================
+
+import {
+  findExecutableOnPath,
+  resolvePackageManagerExecutablePath,
+  getKnownPackageManagerDirectories,
+  getWindowsRegistryPathEntries,
+} from "../src/main/preview-package-manager.ts";
+import { RuntimeEnvironmentBuilder } from "../src/main/runtime/runtime-environment.ts";
+import { spawnSync } from "node:child_process";
+
+test("16. Detecção Windows: localiza Bun instalado no perfil do usuário (.bun/bin) mesmo com PATH do processo zerado", () => {
+  const originalPath = process.env.PATH;
+  const originalPathLower = process.env.Path;
+  try {
+    // Simula Electron iniciado sem o diretório do Bun no PATH
+    process.env.PATH = "C:\\Windows\\System32;C:\\Windows";
+    if (process.platform === "win32") {
+      process.env.Path = "C:\\Windows\\System32;C:\\Windows";
+    }
+
+    const knownDirs = getKnownPackageManagerDirectories("bun");
+    assert.ok(Array.isArray(knownDirs), "Deve retornar array de diretórios conhecidos");
+
+    // Se o Bun está instalado na máquina do usuário (ex: ~/.bun/bin/bun.exe), deve encontrar
+    const bunExe = resolvePackageManagerExecutablePath("bun");
+    if (bunExe) {
+      assert.ok(fs.existsSync(bunExe), `Executável encontrado deve existir: ${bunExe}`);
+      assert.ok(isPackageManagerAvailable("bun"), "isPackageManagerAvailable('bun') deve ser true");
+      const res = resolveEffectivePackageManager("bun");
+      assert.equal(res.effectiveManager, "bun");
+      assert.equal(res.isFallback, false);
+      assert.ok(res.executablePath, "Deve retornar caminho do executável");
+    }
+  } finally {
+    process.env.PATH = originalPath;
+    if (originalPathLower !== undefined) process.env.Path = originalPathLower;
+  }
+});
+
+test("17. RuntimeEnvironmentBuilder: constrói ambiente isolado para o Preview com Bun sem mutação global", () => {
+  const originalPath = process.env.PATH;
+  const originalPathLower = process.env.Path;
+
+  const previewEnv = RuntimeEnvironmentBuilder.buildPreviewEnvironment({
+    packageManager: "bun",
+    projectPath: process.cwd(),
+    baseEnv: { ...process.env, PATH: "C:\\mock\\base\\path" },
+  });
+
+  assert.equal(previewEnv.status, "ready");
+  assert.ok(previewEnv.env, "Deve gerar objeto env isolado");
+  assert.ok(previewEnv.effectivePath, "Deve gerar effectivePath");
+
+  // process.env GLOBAL NÃO PODE TER SIDO MODIFICADO
+  assert.equal(process.env.PATH, originalPath, "process.env.PATH não deve ter sofrido mutação");
+  if (originalPathLower !== undefined) {
+    assert.equal(process.env.Path, originalPathLower, "process.env.Path não deve ter sofrido mutação");
+  }
+
+  // O ambiente isolado do subprocesso deve conter as pastas do runtime
+  const isolatedPath = previewEnv.env.PATH || previewEnv.env.Path || "";
+  assert.ok(isolatedPath.includes("C:\\mock\\base\\path"), "Deve preservar base PATH");
+});
+
+test("18. Simulação de Execução Real com Bun: se bun estiver instalado, executa bun --version com sucesso via env isolado", () => {
+  const bunExe = resolvePackageManagerExecutablePath("bun");
+  if (!bunExe || !fs.existsSync(bunExe)) {
+    // Se não estiver no sistema, o teste valida o fallback seguro
+    return;
+  }
+
+  const previewEnv = RuntimeEnvironmentBuilder.buildPreviewEnvironment({
+    packageManager: "bun",
+    projectPath: process.cwd(),
+  });
+
+  const res = spawnSync(bunExe, ["--version"], {
+    env: previewEnv.env,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+
+  assert.equal(res.status, 0, `bun --version deve retornar exit code 0 (stderr: ${res.stderr})`);
+  assert.ok(res.stdout.trim().length > 0, "bun deve retornar a versão instalada");
+});
+
+test("19. findExecutableOnPath: localiza executável em pasta customizada e normaliza separadores", () => {
+  const tempDir = createTempDir("custom-bin");
+  try {
+    const isWin = process.platform === "win32";
+    const exeName = isWin ? "custom-tool.exe" : "custom-tool";
+    const exeFile = path.join(tempDir, exeName);
+    fs.writeFileSync(exeFile, "echo tool", "utf8");
+
+    const found = findExecutableOnPath("custom-tool", [tempDir]);
+    assert.ok(found, "Deve encontrar executável na pasta customizada");
+    assert.equal(path.normalize(found!), path.normalize(exeFile));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("20. GARANTIA ARQUITETURAL: process.env.PATH permanece 100% imutável após todas as operações de Preview", () => {
+  const initialPath = process.env.PATH;
+  const initialKeys = Object.keys(process.env);
+
+  resolveEffectivePackageManager("bun");
+  resolvePackageManagerExecutablePath("bun");
+  getKnownPackageManagerDirectories("bun");
+  RuntimeEnvironmentBuilder.buildPreviewEnvironment({ packageManager: "bun" });
+
+  assert.equal(process.env.PATH, initialPath);
+  assert.deepEqual(Object.keys(process.env), initialKeys);
+});

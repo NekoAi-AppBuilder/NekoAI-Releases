@@ -34,6 +34,7 @@ import { appPreferencesManager, isValidDirectory } from "./app-preferences-manag
 import { thumbnailService } from "./thumbnail-service";
 import { sessionParentMap, registerSessionParent, resolveRootSessionId as resolveRootFromTree, clearSessionTree } from "./session-tree";
 import { runtimeManager } from "./runtime/runtime-manager";
+import { RuntimeEnvironmentBuilder } from "./runtime/runtime-environment";
 import { RuntimeRequirement } from "./runtime/runtime-types";
 import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTimeoutDiagnostic } from "./opencode-diagnostics";
 import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
@@ -4541,11 +4542,17 @@ async function runCommand(command: string, args: string[], cwd: string, label: s
   return new Promise<void>((resolve, reject) => {
     let runtimeInfo: NodeRuntimeDescriptor | null = null;
     try { runtimeInfo = resolveNodeRuntime(); } catch {}
-    const envPath = getEmbeddedRuntimeEnv().PATH;
+    const previewEnv = RuntimeEnvironmentBuilder.buildPreviewEnvironment({
+      packageManager: command,
+      projectPath: cwd,
+      baseEnv: process.env
+    });
+    const envPath = previewEnv.effectivePath || getEmbeddedRuntimeEnv().PATH;
     console.log(`[PreviewRuntime] runtime=${runtimeInfo?.isBundled ? "node-embedded" : "system"} nodePath=${runtimeInfo?.nodePath ?? "-"} npmPath=${runtimeInfo?.npmPath ?? "-"} npxPath=${runtimeInfo?.npxPath ?? "-"} packageManager=${command} workingDirectory=${cwd} PATH=${envPath}`);
 
     const child = spawnNodeTool(command, args, {
       cwd,
+      env: previewEnv.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
 
@@ -5081,12 +5088,18 @@ function captureProjectPreviewThumbnail(projectPath: string, url: string, force 
 async function launchPreviewProcess(projectPath: string, info: any, packageManager: string, port: number) {
   let runtimeInfo: NodeRuntimeDescriptor | null = null;
   try { runtimeInfo = resolveNodeRuntime(); } catch {}
-  const envPath = getEmbeddedRuntimeEnv().PATH;
+  const previewEnv = RuntimeEnvironmentBuilder.buildPreviewEnvironment({
+    packageManager,
+    projectPath,
+    baseEnv: process.env
+  });
+  const envPath = previewEnv.effectivePath || getEmbeddedRuntimeEnv().PATH;
   console.log(`[PreviewRuntime] runtime=${runtimeInfo?.isBundled ? "node-embedded" : "system"} nodePath=${runtimeInfo?.nodePath ?? "-"} npmPath=${runtimeInfo?.npmPath ?? "-"} npxPath=${runtimeInfo?.npxPath ?? "-"} packageManager=${packageManager} workingDirectory=${projectPath} PATH=${envPath}`);
 
   const args = previewArgs(info.framework, port, info.devScript);
   const processRef = spawnNodeTool(packageManagerExecutable(packageManager), args, {
     cwd: projectPath,
+    env: previewEnv.env,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -7665,10 +7678,16 @@ async function runValidationBuild(projectPath: string) {
   const effectiveResolution = resolveEffectivePackageManager(info.packageManager || "npm");
   const manager = effectiveResolution.effectiveManager;
   const command = packageManagerExecutable(manager);
+  const previewEnv = RuntimeEnvironmentBuilder.buildPreviewEnvironment({
+    packageManager: manager,
+    projectPath: root,
+    baseEnv: process.env
+  });
 
   const result = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawnNodeTool(command, ["run", "build"], {
       cwd: root,
+      env: previewEnv.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "", stderr = "";

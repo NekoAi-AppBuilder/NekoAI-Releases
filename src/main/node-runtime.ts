@@ -28,58 +28,10 @@ export function clearGitRuntimeCache(): void {
   cachedGitRuntime = null;
 }
 
+import { findExecutableOnPath } from "./preview-package-manager";
+
 export function resolveExecutableFromPath(name: string): string | null {
-  if (process.platform === "win32") {
-    try {
-      const res = spawnSync("where.exe", [name], { windowsHide: true, encoding: "utf8" });
-      if (res.status === 0 && res.stdout) {
-        const lines = res.stdout
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter((l) => Boolean(l) && fs.existsSync(l));
-
-        if (lines.length > 0) {
-          const exeMatch = lines.find((l) => l.toLowerCase().endsWith(".exe"));
-          if (exeMatch) return exeMatch;
-
-          const cmdMatch = lines.find((l) => l.toLowerCase().endsWith(".cmd"));
-          if (cmdMatch) return cmdMatch;
-
-          const batMatch = lines.find((l) => l.toLowerCase().endsWith(".bat"));
-          if (batMatch) return batMatch;
-
-          for (const line of lines) {
-            const potentialCmd = `${line}.cmd`;
-            if (fs.existsSync(potentialCmd)) return potentialCmd;
-            const potentialExe = `${line}.exe`;
-            if (fs.existsSync(potentialExe)) return potentialExe;
-          }
-
-          return lines[0];
-        }
-      }
-    } catch {}
-  }
-
-  const pathEnv = process.env.PATH || "";
-  const pathDirs = pathEnv.split(path.delimiter);
-  const extensions = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
-
-  for (const ext of extensions) {
-    for (const dir of pathDirs) {
-      if (!dir) continue;
-      const candidate = path.join(dir, ext ? `${name}${ext}` : name);
-      if (fs.existsSync(candidate)) {
-        try {
-          const stat = fs.statSync(candidate);
-          if (stat.isFile()) {
-            return candidate;
-          }
-        } catch {}
-      }
-    }
-  }
-  return null;
+  return findExecutableOnPath(name);
 }
 
 export function resolveNodeRuntime(forceRefresh = false): NodeRuntimeDescriptor {
