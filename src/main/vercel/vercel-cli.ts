@@ -3,6 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import { VercelCliCommand } from "./vercel-types";
+import { resolveNodeRuntime, getEmbeddedRuntimeEnv } from "../node-runtime";
 
 const VERCEL_CLI_VERSION = "58.5.1";
 const ANSI_SEQUENCE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -57,6 +58,14 @@ export const formatVercelErrorMessage = (rawError?: string): string => {
 
 
 const executableDirectories = (): string[] => {
+  let bundledBinDir: string | null = null;
+  try {
+    const runtime = resolveNodeRuntime();
+    if (runtime?.binDir) {
+      bundledBinDir = runtime.binDir;
+    }
+  } catch {}
+
   const pathEnv = process.env.PATH ?? "";
   const separator = process.platform === "win32" ? ";" : ":";
   const systemDrive = process.env.SystemDrive || "C:";
@@ -65,6 +74,9 @@ const executableDirectories = (): string[] => {
   const defaultDirs =
     process.platform === "win32"
       ? [
+          bundledBinDir || "",
+          path.resolve(__dirname, "..", "..", "tools", "node"),
+          path.resolve(process.cwd(), "tools", "node"),
           path.join(localAppData, "Microsoft", "WindowsApps"),
           path.join(appData, "npm"),
           path.join(localAppData, "Programs"),
@@ -76,12 +88,30 @@ const executableDirectories = (): string[] => {
       : ["/usr/local/bin", "/usr/bin", "/bin"];
 
   const dirs = pathEnv.split(separator).filter(Boolean);
-  return [...dirs, ...defaultDirs].filter(
+  return [bundledBinDir || "", ...dirs, ...defaultDirs].filter(
     (value, index, values) => Boolean(value) && values.indexOf(value) === index
   );
 };
 
 export const resolveExecutable = async (names: string[]): Promise<string | null> => {
+  const extensions = process.platform === "win32" ? [".cmd", ".exe", ".bat"] : [""];
+
+  // 1. Search executableDirectories (which prioritizes embedded Node runtime) first
+  for (const directory of executableDirectories()) {
+    for (const name of names) {
+      const candidates = path.extname(name)
+        ? [path.join(directory, name)]
+        : extensions.map((extension) => path.join(directory, name + extension));
+
+      for (const candidate of candidates) {
+        try {
+          if (fsSync.existsSync(candidate)) return candidate;
+        } catch {}
+      }
+    }
+  }
+
+  // 2. Fallback to system where.exe search
   if (process.platform === "win32") {
     for (const name of names) {
       try {
@@ -96,20 +126,6 @@ export const resolveExecutable = async (names: string[]): Promise<string | null>
     }
   }
 
-  const extensions = process.platform === "win32" ? [".cmd", ".exe", ".bat"] : [""];
-  for (const directory of executableDirectories()) {
-    for (const name of names) {
-      const candidates = path.extname(name)
-        ? [path.join(directory, name)]
-        : extensions.map((extension) => path.join(directory, name + extension));
-
-      for (const candidate of candidates) {
-        try {
-          if (fsSync.existsSync(candidate)) return candidate;
-        } catch {}
-      }
-    }
-  }
   return null;
 };
 
@@ -131,7 +147,7 @@ export class VercelCli {
   }
 
   public getCliEnvironment(): NodeJS.ProcessEnv {
-    const environment: NodeJS.ProcessEnv = { ...process.env };
+    const environment = getEmbeddedRuntimeEnv();
     for (const name of Object.keys(environment)) {
       if (name.toUpperCase().startsWith("VERCEL_")) delete environment[name];
     }

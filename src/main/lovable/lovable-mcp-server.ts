@@ -62,10 +62,42 @@ export async function writeLovableOpenCodeConfig(
 
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+  await writeLovableSkill(root).catch(() => {});
   return configPath;
 }
 
+export async function writeLovableSkill(root: string): Promise<string> {
+  const skillDir = path.join(root, ".opencode", "skills", "neko-lovable-cloud");
+  const skillPath = path.join(skillDir, "SKILL.md");
+  const content = `---
+name: neko-lovable-cloud
+description: Use when any task involves Lovable Cloud database schema, SQL queries, or data mutations in this project.
+---
+
+# Lovable Cloud Database
+
+This project is connected to Lovable Cloud database through MCP server \`neko_lovable_cloud\`.
+
+- Use \`ver_estrutura_do_banco\` to inspect existing tables and schema before modifying.
+- Use \`consultar_dados\` for SELECT queries (somente leitura).
+- Use \`alterar_banco\` for DDL, CREATE TABLE, ALTER TABLE, INSERT, UPDATE, DELETE or any schema mutation.
+- When applying database changes, NekoAI automatically presents a Database Migration Card to the user for explicit review and approval prior to execution.
+- MANDATORY: Never execute database schema changes or SQL mutations via shell scripts, file creation hacks, or terminal commands. Always use \`alterar_banco\` to ensure proper user authorization.
+`;
+  await fs.mkdir(skillDir, { recursive: true });
+  await fs.writeFile(skillPath, content, "utf8");
+  return skillPath;
+}
+
+export async function removeLovableSkill(root: string): Promise<void> {
+  const skillDir = path.join(root, ".opencode", "skills", "neko-lovable-cloud");
+  try {
+    await fs.rm(skillDir, { recursive: true, force: true });
+  } catch {}
+}
+
 export async function removeLovableOpenCodeConfig(root: string): Promise<void> {
+  await removeLovableSkill(root).catch(() => {});
   const configPath = findOpenCodeConfigPath(root);
   if (!fsSync.existsSync(configPath)) return;
   try {
@@ -739,7 +771,11 @@ export class LovableMcpServer {
               skipReadOnlyCheck: true
             });
 
-            await migrationManager.notifyToolCompleted(proposalResult.proposalId, true);
+            await migrationManager.notifyToolCompleted(proposalResult.proposalId, true, undefined, {
+              remoteApplied: true,
+              providerConfirmed: true,
+              structuredResult: execRes
+            });
             console.log(`[Neko/LovableMCP] Execução de alteração concluída com sucesso rowsCount=${execRes.rowCount}`);
 
             let returnMsg = `Alteração executada no Lovable Cloud com sucesso. ${execRes.rowCount} linha(s) afetada(s).`;
@@ -762,7 +798,10 @@ export class LovableMcpServer {
             };
           } catch (execErr: any) {
             const safeErr = sanitizeErrorMessage(getUserFacingError(execErr, "Falha ao executar alteração no Lovable Cloud."));
-            await migrationManager.notifyToolCompleted(proposalResult.proposalId, false, safeErr);
+            await migrationManager.notifyToolCompleted(proposalResult.proposalId, false, safeErr, {
+              remoteApplied: false,
+              stderr: safeErr
+            });
             console.log(`[Neko/LovableMCP] Erro na execução real no Lovable Cloud: ${safeErr}`);
             return {
               jsonrpc: "2.0",

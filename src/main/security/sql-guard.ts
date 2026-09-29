@@ -514,3 +514,32 @@ export function sanitizeSqlForDisplay(sql: string): string {
     .trim();
 }
 
+/**
+ * Identifica se uma mensagem ou saída de ferramenta contém padrão de erro de migração SQL/CLI/API.
+ */
+export function isMigrationErrorText(text?: string): boolean {
+  if (!text || typeof text !== "string") return false;
+  const lower = text.toLowerCase();
+  return [
+    "error:",
+    "fatal:",
+    "failed to apply",
+    "failed to execute",
+    "syntax error at or near",
+    "relation already exists",
+    "column does not exist",
+    "table does not exist",
+    "permission denied",
+    "connection refused",
+    "unauthorized",
+    "invalid token",
+    "project not found",
+    "no project ref",
+    "nenhum projeto",
+    "exit code 1",
+    "exit code 2",
+    "exit status 1",
+    "exit status 2"
+  ].some(marker => lower.includes(marker));
+}
+

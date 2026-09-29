@@ -66,3 +66,14 @@ export interface MigrationExecutionResult {
   affectedTables?: string[];
   executionTimeMs?: number;
 }
+
+export interface MigrationExecutionMeta {
+  remoteApplied?: boolean;
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  structuredResult?: any;
+  toolName?: string;
+  providerConfirmed?: boolean;
+}
+

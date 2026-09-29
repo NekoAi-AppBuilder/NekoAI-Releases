@@ -158,20 +158,29 @@ async function rejectPendingFallbackPermissions(
   } catch {}
 }
 
-function friendlyFallbackError(reason: string): string {
+export function friendlyFallbackError(reason: string, details?: { providerName?: string; modelName?: string; status?: number }): string {
   switch (reason) {
     case "provider-unavailable":
-      return "O Vision Fallback não está disponível porque o OpenCode Zen (MiMo V2.5 Free) não está configurado. Conecte o OpenCode Zen nas configurações de provedores ou envie a mensagem sem imagem.";
+    case "provider-not-connected":
+      return "O Vision Fallback utiliza o OpenCode Zen. Conecte o OpenCode Zen nas configurações de provedores ou selecione um modelo com suporte a imagens.";
+    case "auth-failed":
+      return "Falha de autenticação ao conectar com o serviço de Vision Fallback do OpenCode. Verifique as credenciais do OpenCode Zen ou utilize um modelo com suporte a imagens.";
+    case "network-error":
+    case "connection-failed":
+      return "Não foi possível conectar ao serviço de Vision Fallback do OpenCode devido a uma falha de rede. Verifique sua conexão e tente novamente.";
+    case "no-fallback-model":
+    case "model-unavailable":
+      return "Este modelo não oferece suporte a imagens e nenhum modelo compatível de Vision Fallback foi encontrado no catálogo do OpenCode. Selecione um modelo com suporte a imagens ou envie a mensagem sem imagem.";
     case "session-create-failed":
-      return "Não foi possível preparar o Vision Fallback. Tente novamente em instantes.";
+      return "Não foi possível preparar o Vision Fallback no OpenCode. Tente novamente em instantes.";
     case "timeout":
-      return "A análise da imagem demorou demais. O Vision Fallback foi interrompido. Tente novamente.";
+      return "A análise da imagem pelo Vision Fallback demorou demais e foi interrompida. Tente novamente ou utilize um modelo com suporte nativo a visão.";
     case "empty-response":
       return "O Vision Fallback não conseguiu produzir uma análise da imagem. Tente novamente.";
     case "rejected":
-      return "A solicitação de análise visual foi recusada pelo serviço. Tente novamente.";
+      return "A solicitação de análise visual foi recusada pelo serviço. Tente novamente ou utilize um modelo com suporte nativo a visão.";
     default:
-      return "Não foi possível analisar a imagem porque o Vision Fallback está temporariamente indisponível.";
+      return "Este modelo não oferece suporte a imagens e o Vision Fallback do OpenCode não está disponível no momento.";
   }
 }
 
@@ -204,7 +213,9 @@ export async function analyzeImagesWithMiMo(opts: {
       signal: abort.signal
     });
     if (!createResponse.ok) {
-      return { ok: false, reason: "session-create-failed", userMessage: friendlyFallbackError("session-create-failed") };
+      const status = createResponse.status;
+      const reason = status === 401 || status === 403 ? "auth-failed" : "session-create-failed";
+      return { ok: false, reason, userMessage: friendlyFallbackError(reason) };
     }
     const created: any = await createResponse.json();
     fallbackSessionId = String(created?.id ?? created?.data?.id ?? "");
@@ -214,14 +225,16 @@ export async function analyzeImagesWithMiMo(opts: {
     console.log(`[Vision] fallback-session-created sessionId=${fallbackSessionId.slice(0, 16)}`);
   } catch (error: any) {
     if (abort.signal.aborted) return { ok: false, cancelled: true, reason: "cancelled", userMessage: "" };
-    return { ok: false, reason: "session-create-failed", userMessage: friendlyFallbackError("session-create-failed") };
+    const isNetwork = error?.name === "FetchError" || error?.code === "ENOTFOUND" || error?.code === "ECONNREFUSED" || error?.message?.includes("fetch failed");
+    const reason = isNetwork ? "network-error" : "session-create-failed";
+    return { ok: false, reason, userMessage: friendlyFallbackError(reason) };
   }
 
   activeVisionFallbacks.set(mainSessionId, { fallbackSessionId, abort });
   fallbackSessionIds.add(fallbackSessionId);
 
   try {
-    // 2. Ask MiMo to interpret the images. Free model only, single call,
+    // 2. Ask Vision Fallback model to interpret the images. Free model only, single call,
     //    all images in one request.
     console.log(`[Vision] fallback-prompt-sent sessionId=${fallbackSessionId.slice(0, 16)} provider=${model.providerID} model=${model.modelID} images=${images.length}`);
     images.forEach((image, index) => {
@@ -247,8 +260,15 @@ export async function analyzeImagesWithMiMo(opts: {
 
     if (!promptResponse.ok) {
       const status = promptResponse.status;
-      const reason = status === 401 || status === 403 ? "provider-unavailable" : "rejected";
-      return { ok: false, reason, userMessage: friendlyFallbackError(reason) };
+      let reason = "rejected";
+      if (status === 401 || status === 403) {
+        reason = "auth-failed";
+      } else if (status === 404) {
+        reason = "model-unavailable";
+      } else if (status >= 500) {
+        reason = "provider-unavailable";
+      }
+      return { ok: false, reason, userMessage: friendlyFallbackError(reason, { status, modelName: model.modelID }) };
     }
 
     // 3. Wait for the engine to finish the analysis. Hard deadline; no retries.
@@ -296,7 +316,7 @@ export async function analyzeImagesWithMiMo(opts: {
       // fast instead of burning the full deadline.
       if (!sawEngineActivity && Date.now() - promptAcceptedAt >= VISION_FALLBACK_STALL_MS) {
         console.log(`[Vision] fallback-stalled sessionId=${fallbackSessionId.slice(0, 16)} provider=${model.providerID} model=${model.modelID}`);
-        return { ok: false, reason: "provider-unavailable", userMessage: friendlyFallbackError("provider-unavailable") };
+        return { ok: false, reason: "model-unavailable", userMessage: friendlyFallbackError("model-unavailable") };
       }
     }
 

@@ -22,16 +22,21 @@ import { updaterManager } from "./updater";
 import { lovableCloudManager } from "./lovable/lovable-cloud-manager";
 import { lovableMcpServer, writeLovableOpenCodeConfig, removeLovableOpenCodeConfig } from "./lovable/lovable-mcp-server";
 import { detectDatabaseIntent } from "./lovable/lovable-intent-detector";
-import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES } from "../shared/vision";
+import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES, VISION_FALLBACK_MODEL_CANDIDATES, resolveVisionFallbackTarget, type VisionFallbackTarget } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
-import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession } from "./vision-fallback";
+import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession, friendlyFallbackError } from "./vision-fallback";
 import { discoverPreviewRoutes, routeFromUrl, normalizeRoutePath, isDynamicSegment, type PreviewRoute } from "./preview-routes";
 import { analyzeSite, cancelAllSiteClones, importSiteAssets, type SiteCloneAnalysis, type SiteCloneLimits } from "./site-clone";
 import { captureSiteChromium } from "./site-capture";
+import { resolveNodeRuntime, resolveGitRuntime, getEmbeddedRuntimeEnv, clearNodeRuntimeCache, clearGitRuntimeCache, resolveExecutableFromPath, spawnNodeTool, type NodeRuntimeDescriptor, type GitRuntimeDescriptor } from "./node-runtime";
 import { recentProjectsManager, detectProjectTechnology, checkProjectExistsOnDisk, normalizeProjectPath, deleteProjectToTrash } from "./recent-projects-manager";
 import { appPreferencesManager, isValidDirectory } from "./app-preferences-manager";
 import { thumbnailService } from "./thumbnail-service";
 import { sessionParentMap, registerSessionParent, resolveRootSessionId as resolveRootFromTree, clearSessionTree } from "./session-tree";
+import { runtimeManager } from "./runtime/runtime-manager";
+import { RuntimeRequirement } from "./runtime/runtime-types";
+import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTimeoutDiagnostic } from "./opencode-diagnostics";
+import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -344,13 +349,11 @@ const providerCatalogCache = new Map<string, { attachment: boolean }>();
 
 // Resolves the REAL provider id for the Vision Fallback model against the
 // catalog cache. The catalog of OpenCode 1.18.x exposes OpenCode Zen as
-// `opencode` (historically `opencode-zen`); candidates are checked in order
-// so both catalogs keep working. No providers:list request is made here.
+// `opencode` (historically `opencode-zen`); dynamic resolution verifies
+// capability and candidates against the cache.
 function resolveVisionFallbackProvider(): string {
-  for (const candidate of VISION_FALLBACK_PROVIDER_CANDIDATES) {
-    if (providerCatalogCache.has(`${candidate}:${VISION_FALLBACK_MODEL.modelID}`)) return candidate;
-  }
-  return VISION_FALLBACK_MODEL.providerID;
+  const target = resolveVisionFallbackTarget(providerCatalogCache);
+  return target ? target.providerID : VISION_FALLBACK_MODEL.providerID;
 }
 
 function logTask(event: string, taskId: string, sessionId: string, extra = "") {
@@ -1742,44 +1745,10 @@ async function githubApi(pathname: string, init: RequestInit = {}) {
 
 
 function getGitExecutablePath(): string {
-  // 1) Explicit override via environment variable
-  if (process.env.NEKO_GIT_PATH) {
-    const override = path.resolve(process.env.NEKO_GIT_PATH);
-    if (fs.existsSync(override)) return override;
-    console.warn("[Neko/Git] NEKO_GIT_PATH foi configurado mas não existe:", override);
+  const runtime = resolveGitRuntime();
+  if (runtime?.gitPath) {
+    return runtime.gitPath;
   }
-
-  const candidateRelativePaths = process.platform === "win32"
-    ? [
-        path.join("tools", "git", "cmd", "git.exe"),
-        path.join("tools", "git", "mingw64", "bin", "git.exe"),
-        path.join("tools", "git", "git.exe"),
-        path.join("tools", "git.exe")
-      ]
-    : [
-        path.join("tools", "git", "bin", "git"),
-        path.join("tools", "git", "git")
-      ];
-
-  // 2) Source / development build: <project>/tools/git/cmd/git.exe
-  for (const rel of candidateRelativePaths) {
-    const projectTools = path.resolve(__dirname, "..", "..", rel);
-    if (fs.existsSync(projectTools)) return projectTools;
-  }
-
-  // 3) Packaged Electron app: process.resourcesPath/tools/git/cmd/git.exe
-  if (process.resourcesPath) {
-    for (const rel of candidateRelativePaths) {
-      const packagedTools = path.join(process.resourcesPath, rel);
-      if (fs.existsSync(packagedTools)) return packagedTools;
-    }
-  }
-
-  // 4) Development fallback: search system PATH
-  const resolved = resolveExecutableFromPath("git");
-  if (resolved) return resolved;
-
-  // 5) Default fallback
   return "git";
 }
 
@@ -2313,70 +2282,13 @@ async function getOpencodeClient() {
   });
 }
 
-function resolveExecutableFromPath(name: string): string | null {
-  if (process.platform === "win32") {
-    try {
-      const res = spawnSync("where.exe", [name], { windowsHide: true, encoding: "utf8" });
-      if (res.status === 0 && res.stdout) {
-        const lines = res.stdout
-          .split(/\r?\n/)
-          .map(l => l.trim())
-          .filter(l => Boolean(l) && fs.existsSync(l));
-
-        if (lines.length > 0) {
-          // 1. Prefer binary executable if available (.exe)
-          const exeMatch = lines.find(l => l.toLowerCase().endsWith(".exe"));
-          if (exeMatch) return exeMatch;
-
-          // 2. Prefer Windows cmd launcher (.cmd)
-          const cmdMatch = lines.find(l => l.toLowerCase().endsWith(".cmd"));
-          if (cmdMatch) return cmdMatch;
-
-          // 3. Prefer batch file (.bat)
-          const batMatch = lines.find(l => l.toLowerCase().endsWith(".bat"));
-          if (batMatch) return batMatch;
-
-          // 4. If an extensionless file is matched (e.g. npm bash wrapper), check if corresponding .cmd exists
-          for (const line of lines) {
-            const potentialCmd = `${line}.cmd`;
-            if (fs.existsSync(potentialCmd)) return potentialCmd;
-            const potentialExe = `${line}.exe`;
-            if (fs.existsSync(potentialExe)) return potentialExe;
-          }
-
-          // Fallback to first line if nothing else matched
-          return lines[0];
-        }
-      }
-    } catch {}
-  }
-
-  const pathEnv = process.env.PATH || "";
-  const pathDirs = pathEnv.split(path.delimiter);
-  const extensions = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
-
-  for (const ext of extensions) {
-    for (const dir of pathDirs) {
-      if (!dir) continue;
-      const candidate = path.join(dir, ext ? `${name}${ext}` : name);
-      if (fs.existsSync(candidate)) {
-        try {
-          const stat = fs.statSync(candidate);
-          if (stat.isFile()) {
-            if (process.platform === "win32" && !ext) {
-              const cmdSibling = `${candidate}.cmd`;
-              if (fs.existsSync(cmdSibling)) return cmdSibling;
-              const exeSibling = `${candidate}.exe`;
-              if (fs.existsSync(exeSibling)) return exeSibling;
-            }
-            return candidate;
-          }
-        } catch {}
-      }
-    }
-  }
-  return null;
-}
+export {
+  resolveNodeRuntime,
+  getEmbeddedRuntimeEnv,
+  clearNodeRuntimeCache,
+  resolveExecutableFromPath,
+  type NodeRuntimeDescriptor,
+} from "./node-runtime";
 
 function getOpencodePath(): string {
   // 1) Explicit override remains supported for development/troubleshooting.
@@ -2532,6 +2444,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     ? ["/d", "/s", "/c", windowsCommandLine(executable, rawArgs)]
     : rawArgs;
 
+  const runtimeEnv = await runtimeManager.getOpenCodeScopedEnv(safeProjectPath);
   const child = spawn(
     spawnExecutable,
     spawnArgs,
@@ -2542,7 +2455,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
       // Enable the native plan_exit tool in OpenCode 1.18.23.
       // OPENCODE_CLIENT defaults to "cli" (required for plan_exit to be registered).
       // OPENCODE_EXPERIMENTAL is NOT set here — only the specific plan mode flag is enabled.
-      env: { ...process.env, OPENCODE_EXPERIMENTAL_PLAN_MODE: "true" }
+      env: { ...runtimeEnv, OPENCODE_EXPERIMENTAL_PLAN_MODE: "true" }
     }
   );
 
@@ -2563,14 +2476,14 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     const text = chunk.toString();
     console.log("[Neko/OpenCode]", text);
     if (stdoutLogs.length < 20) stdoutLogs.push(text.trim());
-    mainWindow?.webContents.send("preview:event", { type: "terminal.output", properties: { stream: "stdout", text, source: "Neko" } });
+    mainWindow?.webContents.send("opencode:event", { type: "opencode.output", properties: { stream: "stdout", text, source: "Neko" } });
   });
 
   processRef.stderr?.on("data", chunk => {
     const text = chunk.toString();
     console.error("[Neko/OpenCode]", text);
     if (stderrLogs.length < 20) stderrLogs.push(text.trim());
-    mainWindow?.webContents.send("preview:event", { type: "terminal.output", properties: { stream: "stderr", text, source: "Neko" } });
+    mainWindow?.webContents.send("opencode:event", { type: "opencode.output", properties: { stream: "stderr", text, source: "Neko" } });
     if (/ServeError|Error:|Unexpected error|EADDRINUSE|address already in use/i.test(text)) {
       exitMessage = text.trim();
     }
@@ -2591,8 +2504,13 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
   processRef.on("exit", (code, signal) => {
     exited = true;
     if (!exitMessage) {
-      const details = stderrLogs.join(" | ") || stdoutLogs.join(" | ");
-      exitMessage = `OpenCode encerrou (código ${code}, ${signal ?? "sem sinal"}). Executável: ${executable}.${details ? ` Detalhes: ${details}` : ""}`;
+      exitMessage = formatProcessExitDiagnostic({
+        code,
+        signal,
+        executable,
+        stdoutLogs,
+        stderrLogs
+      });
     }
     if (typeof transitionGen === "number" && activeWorkspace && activeWorkspace.generation !== transitionGen) {
       console.log(`[OpenCode] stale process exit ignored { generation: ${transitionGen}, activeGeneration: ${activeWorkspace.generation} }`);
@@ -2621,7 +2539,14 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
 
     while (Date.now() - startedAt < timeout) {
       if (exited) {
-        throw new Error(`OpenCode não conseguiu iniciar. ${exitMessage}`.trim());
+        const exitDiag = exitMessage || formatProcessExitDiagnostic({
+          code: processRef.exitCode,
+          signal: processRef.signalCode,
+          executable,
+          stdoutLogs,
+          stderrLogs
+        });
+        throw new Error(`OpenCode não conseguiu iniciar. ${exitDiag}`.trim());
       }
 
       try {
@@ -2652,13 +2577,37 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
         }
         lastError = `HTTP ${response.status}`;
       } catch (error: any) {
-        lastError = String(error?.message ?? error);
+        const diag = extractFetchErrorDetails(error);
+        lastError = diag.formatted;
+      }
+
+      if (exited) {
+        const exitDiag = exitMessage || formatProcessExitDiagnostic({
+          code: processRef.exitCode,
+          signal: processRef.signalCode,
+          executable,
+          stdoutLogs,
+          stderrLogs
+        });
+        throw new Error(`OpenCode não conseguiu iniciar. ${exitDiag}`.trim());
       }
 
       await new Promise(resolve => setTimeout(resolve, 250));
     }
 
-    throw new Error(`OpenCode não iniciou em ${opencodeUrl}. ${lastError}`.trim());
+    const elapsedMs = Date.now() - startedAt;
+    const isAlive = Boolean(processRef && !exited && !processRef.killed);
+    const timeoutDiag = formatStartupTimeoutDiagnostic({
+      opencodeUrl,
+      pid: processRef?.pid,
+      isAlive,
+      elapsedMs,
+      lastConnectionError: lastError,
+      stdoutLogs,
+      stderrLogs
+    });
+    console.error("[Neko/OpenCode] startup timeout diagnostic:", timeoutDiag);
+    throw new Error(timeoutDiag);
   })();
 
   serviceStartPromise = startPromise;
@@ -2672,8 +2621,17 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
 async function startOpenCode(projectPath: string) {
   await stopOpenCode();
   await stopPreview();
-  void supabaseManager.setProject(projectPath);
-  void vercelManager.setProject(projectPath);
+  await supabaseManager.setProject(projectPath);
+  await lovableCloudManager.setProject(projectPath);
+  await vercelManager.setProject(projectPath);
+
+  // Skill & MCP config isolation by active workspace identity
+  const lovableState = lovableCloudManager.getState();
+  const isLovableCloud = Boolean(lovableState.isLovableProject && (lovableState.hasLovableCloud === true || lovableState.lovableCloudConnected));
+  if (!isLovableCloud) {
+    await removeLovableOpenCodeConfig(projectPath).catch(() => {});
+  }
+
   return startOpenCodeInternal(projectPath);
 }
 
@@ -2721,6 +2679,39 @@ async function stopOpenCode() {
   } finally {
     isStoppingOpencodeIntentionally = false;
   }
+}
+
+export function normalizeMigrationToolResult(output: any, isError: boolean, errorMsg?: string): {
+  toolSuccess: boolean;
+  remoteApplied: boolean;
+  effectiveErrorMsg?: string;
+} {
+  let remoteApplied = false;
+  let toolSuccess = !isError;
+  let effectiveErrorMsg = errorMsg;
+
+  if (typeof output === "object" && output !== null) {
+    if (output.isError === true || output.success === false) {
+      toolSuccess = false;
+      remoteApplied = false;
+      effectiveErrorMsg = effectiveErrorMsg || String(output.error || output.message || "Erro retornado pela ferramenta de banco de dados.");
+    } else if (output.localOnly === true) {
+      remoteApplied = false;
+    } else {
+      remoteApplied = !isError;
+    }
+  } else if (typeof output === "string") {
+    const lower = output.toLowerCase();
+    if (lower.includes("local only")) {
+      remoteApplied = false;
+    } else {
+      remoteApplied = !isError;
+    }
+  } else {
+    remoteApplied = !isError;
+  }
+
+  return { toolSuccess, remoteApplied, effectiveErrorMsg };
 }
 
 async function subscribeEvents(gen?: number) {
@@ -2819,13 +2810,31 @@ async function subscribeEvents(gen?: number) {
                 if (targetProposal && (targetProposal.status === "APPROVED" || targetProposal.status === "EXECUTING")) {
                   const state = part?.state;
                   const status = state?.status;
+                  const output = state?.output ?? part?.output;
+                  const isError = status === "error" || Boolean(state?.error);
+                  const errorMsg = isError ? String(state?.error?.message ?? state?.error ?? "Erro ao executar ferramenta de migração.") : undefined;
+
+                  const norm = normalizeMigrationToolResult(output, isError, errorMsg);
+
                   if (status === "running" && targetProposal.status === "APPROVED") {
                     migrationManager.notifyToolExecuting(targetProposal.id);
                   } else if (status === "completed" || status === "done" || status === "success") {
-                    void migrationManager.notifyToolCompleted(targetProposal.id, true);
+                    void migrationManager.notifyToolCompleted(targetProposal.id, norm.toolSuccess && norm.remoteApplied, norm.effectiveErrorMsg, {
+                      remoteApplied: norm.remoteApplied,
+                      exitCode: norm.toolSuccess ? 0 : 1,
+                      stdout: typeof output === "string" ? output : JSON.stringify(output || {}),
+                      stderr: norm.effectiveErrorMsg,
+                      structuredResult: typeof output === "object" ? output : null,
+                      toolName
+                    });
                   } else if (status === "error") {
-                    const errorMsg = String(state?.error?.message ?? state?.error ?? "Erro ao executar ferramenta de migração.");
-                    void migrationManager.notifyToolCompleted(targetProposal.id, false, errorMsg);
+                    const errorNorm = normalizeMigrationToolResult(output, true, errorMsg);
+                    void migrationManager.notifyToolCompleted(targetProposal.id, false, errorNorm.effectiveErrorMsg || errorMsg, {
+                      remoteApplied: false,
+                      exitCode: 1,
+                      stderr: errorNorm.effectiveErrorMsg || errorMsg,
+                      toolName
+                    });
                   }
                 }
               }
@@ -2852,9 +2861,21 @@ async function subscribeEvents(gen?: number) {
                 const executingProposal = (callId && migrationManager.findProposal(callId)) || migrationManager.getExecutingOrApprovedProposalForSession(perfSessionId);
                 if (executingProposal && (executingProposal.status === "EXECUTING" || executingProposal.status === "APPROVED")) {
                   const state = props?.state ?? props?.part?.state;
-                  const isError = state?.status === "error" || props?.error || state?.error;
+                  const output = props?.output ?? props?.result ?? state?.output;
+                  const exitCode = props?.exitCode ?? props?.code ?? state?.exitCode;
+                  const isError = state?.status === "error" || Boolean(props?.error || state?.error);
                   const errorMsg = isError ? String(props?.error ?? state?.error?.message ?? state?.error ?? "Erro ao executar ferramenta de migração.") : undefined;
-                  void migrationManager.notifyToolCompleted(executingProposal.id, !isError, errorMsg);
+
+                  const norm = normalizeMigrationToolResult(output, isError, errorMsg);
+
+                  void migrationManager.notifyToolCompleted(executingProposal.id, norm.toolSuccess && norm.remoteApplied, norm.effectiveErrorMsg, {
+                    remoteApplied: norm.remoteApplied,
+                    exitCode: typeof exitCode === "number" ? exitCode : (norm.toolSuccess ? 0 : 1),
+                    stdout: typeof output === "string" ? output : JSON.stringify(output || {}),
+                    stderr: norm.effectiveErrorMsg,
+                    structuredResult: typeof output === "object" ? output : null,
+                    toolName
+                  });
                 }
               }
             }
@@ -3191,14 +3212,45 @@ async function subscribeEvents(gen?: number) {
             // [Supabase Migration Card Interception]
             // If the permission request is for Supabase apply_migration or execute_sql, route to MigrationManager
             // and show DatabaseMigrationCard instead of generic permission prompt.
-            const isSupabaseMigration =
+            const isMigrationToolPermission =
               permissionType.includes("apply_migration") ||
               permissionType.includes("execute_sql") ||
-              (permissionType.startsWith("neko_supabase_") && permissionType.endsWith("_apply_migration"));
+              permissionType.includes("alterar_banco") ||
+              (permissionType.startsWith("neko_supabase_") && permissionType.endsWith("_apply_migration")) ||
+              (permissionType.startsWith("neko_lovable_") && permissionType.endsWith("_alterar_banco")) ||
+              permissionType.startsWith("neko_lovable_cloud");
 
-            if (isSupabaseMigration && (permissionSessionId || rootSessionId)) {
+            if (isMigrationToolPermission && (permissionSessionId || rootSessionId)) {
               const targetSession = permissionSessionId || rootSessionId || "";
-              const activeRef = supabaseManager.getState().projectRef || "";
+
+              // [DETERMINISTIC BACKEND IDENTITY RESOLUTION]:
+              // Workspace/Project Binding is the SOLE authority for provider identity.
+              // Tool Name (e.g. alterar_banco vs apply_migration) is NEVER used as provider identity.
+              const supabaseRef = supabaseManager.getState().projectRef || "";
+              const lovableState = lovableCloudManager.getState();
+              const isLovableCloudWorkspace = Boolean(lovableState.isLovableProject && (lovableState.hasLovableCloud === true || lovableState.lovableCloudConnected));
+
+              let provider: "supabase" | "lovable" = "supabase";
+              let activeRef = "";
+
+              if (isLovableCloudWorkspace) {
+                provider = "lovable";
+                activeRef = lovableState.projectId || lovableState.lovableProjectId || "lovable_cloud";
+              } else if (supabaseRef) {
+                provider = "supabase";
+                activeRef = supabaseRef;
+              } else {
+                // Safe default fallback when no workspace binding is set in vault:
+                // NEVER derive 'lovable' from tool name (alterar_banco). Safe default is ALWAYS 'supabase'.
+                provider = "supabase";
+                if (permissionType.startsWith("neko_supabase_")) {
+                  const match = permissionType.match(/neko_supabase_([a-zA-Z0-9_-]+)/);
+                  if (match) activeRef = match[1];
+                }
+                if (!activeRef) activeRef = supabaseRef || "supabase";
+              }
+
+              const isLovableProvider = provider === "lovable";
 
               // Extract SQL candidate safely with strict scoping (callId / permissionId / inline props ONLY)
               let resolvedInputKey = "none";
@@ -3278,7 +3330,11 @@ async function subscribeEvents(gen?: number) {
                 let finalName = initialName;
 
                 // [Strict Operation Matching]: Determine the exact tool expected for this permission
-                const expectedTool = permissionType.includes("apply_migration") ? "apply_migration" : "execute_sql";
+                const expectedTool = permissionType.includes("alterar_banco")
+                  ? "alterar_banco"
+                  : permissionType.includes("apply_migration")
+                  ? "apply_migration"
+                  : "execute_sql";
 
                 if (!finalSql) {
                   // ONLY query message parts that strictly match the current permission's expected tool
@@ -3293,8 +3349,8 @@ async function subscribeEvents(gen?: number) {
                 if (finalSql && activeRef) {
                   // [READ-ONLY vs MUTATION]: If execute_sql is a SELECT or read-only statement,
                   // do NOT create a MigrationProposal or ask for approval. Let OpenCode proceed directly.
-                  if (permissionType.includes("execute_sql") && isReadOnlySql(finalSql)) {
-                    console.log(`[Neko/Migration] READ-ONLY query detected for execute_sql (permissionId=${permissionId}). Bypassing migration card.`);
+                  if ((permissionType.includes("execute_sql") || permissionType.includes("consultar_dados")) && isReadOnlySql(finalSql)) {
+                    console.log(`[Neko/Migration] READ-ONLY query detected for execute_sql/consultar_dados (permissionId=${permissionId}). Bypassing migration card.`);
                     // Auto-release permission as read-only allow if needed or let default permission handler proceed
                     try {
                       const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
@@ -3325,6 +3381,8 @@ async function subscribeEvents(gen?: number) {
                       projectRef: activeRef,
                       name: finalName,
                       sql: finalSql,
+                      provider: isLovableProvider ? "lovable" : "supabase",
+                      lovableProjectId: isLovableProvider ? activeRef : undefined,
                       projectRoot: currentProject || undefined
                     });
 
@@ -3985,13 +4043,6 @@ async function detectProject(projectPath: string) {
   };
 }
 
-function packageManagerExecutable(packageManager: string) {
-  if (packageManager === "pnpm") return process.platform === "win32" ? "pnpm.cmd" : "pnpm";
-  if (packageManager === "yarn") return process.platform === "win32" ? "yarn.cmd" : "yarn";
-  if (packageManager === "bun") return process.platform === "win32" ? "bun.exe" : "bun";
-  return process.platform === "win32" ? "npm.cmd" : "npm";
-}
-
 const STATIC_MIME_TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
   ".htm": "text/html; charset=utf-8",
@@ -4340,10 +4391,10 @@ async function removeNodeModules(projectPath: string): Promise<void> {
   console.log(`[Preview/Cleanup] completed (final attempt finished)`);
 }
 
-async function verifyRuntimeDependency(projectPath: string, info: any, packageManagerName?: string) {
+export async function verifyRuntimeDependency(projectPath: string, info: any, packageManagerName?: string) {
   console.log(`[Preview/Install] validation started`);
-  const pm = packageManagerName || info.packageManager || "npm";
-  const entry = info.runtimeEntry || (info.framework === "Vite" ? "vite" : null);
+  const pm = packageManagerName || info?.packageManager || "npm";
+  const entry = info?.runtimeEntry || (info?.framework === "Vite" ? "vite" : null);
   
   // 1. Basic node_modules check
   const nmPath = path.join(projectPath, "node_modules");
@@ -4370,38 +4421,18 @@ async function verifyRuntimeDependency(projectPath: string, info: any, packageMa
     return;
   }
 
-  // 2. Fast check: package directory exists inside node_modules
-  const pkgDir = path.join(nmPath, entry);
-  const pkgDirExists = await fs.promises.stat(pkgDir).then(s => s.isDirectory()).catch(() => false);
-  if (!pkgDirExists) {
-    console.warn(`[Preview/Install] validation failed: Pacote runtime '${entry}' não encontrado em node_modules.`);
-    logPreviewLifecycle("dependency validation", {
-      packageManager: pm,
-      nodeModulesExists: true,
-      viteResolvable: false,
-      runtimeValid: false
-    });
-    throw new Error(`Pacote runtime '${entry}' não encontrado em node_modules.`);
-  }
-
-  // 3. Deep runtime validation via Node process (testing both CommonJS createRequire and ESM import)
-  const script = `import { createRequire } from 'module';
-const require = createRequire(process.cwd() + '/package.json');
-try {
-  require.resolve(${JSON.stringify(entry)});
-} catch (e) {
-  console.error('CJS resolution failed for ' + ${JSON.stringify(entry)} + ':', e?.message || e);
-  process.exit(1);
-}
-import(${JSON.stringify(entry)}).then(() => {
-  process.exit(0);
-}).catch((err) => {
-  console.error('ESM import failed for ' + ${JSON.stringify(entry)} + ':', err?.message || err);
-  process.exit(1);
-});`;
+  // 2. Validate package.json metadata for specified runtime entry
+  const pkgJsonPath = path.join(nmPath, entry, "package.json");
   try {
-    await runNodeCommand(projectPath, ["--input-type=module", "-e", script], "Dependency-Check");
-    console.log(`[Preview/Install] validation passed`);
+    const rawContent = await fs.promises.readFile(pkgJsonPath, "utf8");
+    const pkgJson = JSON.parse(rawContent);
+    if (!pkgJson || typeof pkgJson !== "object" || Array.isArray(pkgJson)) {
+      throw new Error(`Arquivo package.json de '${entry}' é inválido.`);
+    }
+    if (typeof pkgJson.name !== "string" || !pkgJson.name.trim()) {
+      throw new Error(`Arquivo package.json de '${entry}' não possui um campo 'name' válido.`);
+    }
+    console.log(`[Preview/Install] validation passed (${entry} verified via package.json metadata)`);
     logPreviewLifecycle("dependency validation", {
       packageManager: pm,
       nodeModulesExists: true,
@@ -4409,14 +4440,14 @@ import(${JSON.stringify(entry)}).then(() => {
       runtimeValid: true
     });
   } catch (err: any) {
-    console.warn(`[Preview/Install] validation failed: erro ao resolver '${entry}':`, err?.message || err);
+    console.warn(`[Preview/Install] validation failed: erro ao resolver pacote '${entry}':`, err?.message || err);
     logPreviewLifecycle("dependency validation", {
       packageManager: pm,
       nodeModulesExists: true,
       viteResolvable: false,
       runtimeValid: false
     });
-    throw new Error(`Validação de integridade do runtime '${entry}' falhou.`);
+    throw new Error(`Pacote runtime '${entry}' não encontrado ou inválido em node_modules.`);
   }
 }
 
@@ -4450,10 +4481,24 @@ function extractErrorDetails(stderr: string, stdout: string): string {
 
 async function runNodeCommand(cwd: string, args: string[], label: string) {
   return new Promise<void>((resolve, reject) => {
-    const isWindows = process.platform === "win32";
-    const executable = isWindows ? "node.exe" : "node";
+    let executable = process.platform === "win32" ? "node.exe" : "node";
+    let envPath = process.env.PATH;
+    try {
+      const runtime = resolveNodeRuntime();
+      executable = runtime.nodePath;
+      if (runtime.binDir) {
+        envPath = `${runtime.binDir}${path.delimiter}${process.env.PATH || ""}`;
+      }
+    } catch {}
+
     console.log(`[Neko/Preview/${label}] Executando diretamente (sem cmd.exe): ${executable} ${args[0]} -e <script>`);
-    const child = spawn(executable, args, { cwd, windowsHide: true, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(executable, args, {
+      cwd,
+      windowsHide: true,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PATH: envPath }
+    });
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", chunk => {
@@ -4487,21 +4532,23 @@ function quoteWindowsArg(value: string) {
 }
 
 function windowsCommandLine(command: string, args: string[]) {
-  return [command, ...args].map((value, index) => {
-    return index === 0 ? value : quoteWindowsArg(value);
+  return [command, ...args].map((value) => {
+    return quoteWindowsArg(value);
   }).join(" ");
 }
 
 async function runCommand(command: string, args: string[], cwd: string, label: string) {
   return new Promise<void>((resolve, reject) => {
-    const isWindows = process.platform === "win32";
-    const executable = isWindows ? (process.env.ComSpec || "cmd.exe") : command;
-    const childArgs = isWindows
-      ? ["/d", "/s", "/c", windowsCommandLine(command, args)]
-      : args;
-    const displayCmd = isWindows ? windowsCommandLine(command, args) : [command, ...args].join(" ");
-    console.log(`[Preview Install] Running ${label}: ${displayCmd}`);
-    const child = spawn(executable, childArgs, { cwd, windowsHide: true, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    let runtimeInfo: NodeRuntimeDescriptor | null = null;
+    try { runtimeInfo = resolveNodeRuntime(); } catch {}
+    const envPath = getEmbeddedRuntimeEnv().PATH;
+    console.log(`[PreviewRuntime] runtime=${runtimeInfo?.isBundled ? "node-embedded" : "system"} nodePath=${runtimeInfo?.nodePath ?? "-"} npmPath=${runtimeInfo?.npmPath ?? "-"} npxPath=${runtimeInfo?.npxPath ?? "-"} packageManager=${command} workingDirectory=${cwd} PATH=${envPath}`);
+
+    const child = spawnNodeTool(command, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", chunk => {
@@ -4620,36 +4667,44 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
   let primaryPassed = false;
   let primaryErrorMsg = "";
 
-  // Step 1: Attempt installation with preferred package manager (e.g. Bun)
-  try {
-    emitPreview("preview.installing", {
-      status: "installing",
-      phase: "installing_dependencies",
-      packageManager: preferredManager,
-      framework: info.framework,
-      message: `Instalando dependências com ${preferredManager}...`
-    });
-    const executedCmd = await installDependencies(projectPath, preferredManager);
-    attemptsLog.push({ manager: preferredManager, command: executedCmd, status: "passed" });
+  const preferredAvailable = isPackageManagerAvailable(preferredManager);
 
-    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
-    if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
-
-    await waitForFilesystemSettling(projectPath, info);
+  // Step 1: Attempt installation with preferred package manager (e.g. Bun) IF available
+  if (preferredAvailable) {
     try {
-      await verifyRuntimeDependency(projectPath, info, preferredManager);
-      console.log(`[Preview Install] Dependencies validated successfully with ${preferredManager}`);
-      primaryPassed = true;
-      return preferredManager;
-    } catch (valErr: any) {
-      const valErrMsg = `As dependências foram instaladas com ${preferredManager}, mas a validação do runtime '${info?.runtimeEntry || info?.framework || "desconhecido"}' falhou: ${valErr?.message || valErr}`;
-      console.warn(`[Preview Install] ${valErrMsg}`);
-      primaryErrorMsg = valErrMsg;
-      attemptsLog.push({ manager: preferredManager, command: `validação de runtime (${preferredManager})`, status: "failed", error: valErrMsg });
+      emitPreview("preview.installing", {
+        status: "installing",
+        phase: "installing_dependencies",
+        packageManager: preferredManager,
+        framework: info.framework,
+        message: `Instalando dependências com ${preferredManager}...`
+      });
+      const executedCmd = await installDependencies(projectPath, preferredManager);
+      attemptsLog.push({ manager: preferredManager, command: executedCmd, status: "passed" });
+
+      if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
+      if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+
+      await waitForFilesystemSettling(projectPath, info);
+      try {
+        await verifyRuntimeDependency(projectPath, info, preferredManager);
+        console.log(`[Preview Install] Dependencies validated successfully with ${preferredManager}`);
+        primaryPassed = true;
+        return preferredManager;
+      } catch (valErr: any) {
+        const valErrMsg = `As dependências foram instaladas com ${preferredManager}, mas a validação do runtime '${info?.runtimeEntry || info?.framework || "desconhecido"}' falhou: ${valErr?.message || valErr}`;
+        console.warn(`[Preview Install] ${valErrMsg}`);
+        primaryErrorMsg = valErrMsg;
+        attemptsLog.push({ manager: preferredManager, command: `validação de runtime (${preferredManager})`, status: "failed", error: valErrMsg });
+      }
+    } catch (primaryErr: any) {
+      primaryErrorMsg = String(primaryErr?.message || primaryErr);
+      console.warn(`[Preview Install] Instalação com ${preferredManager} falhou:`, primaryErrorMsg);
+      attemptsLog.push({ manager: preferredManager, command: preferredManager, status: "failed", error: primaryErrorMsg });
     }
-  } catch (primaryErr: any) {
-    primaryErrorMsg = String(primaryErr?.message || primaryErr);
-    console.warn(`[Preview Install] Instalação com ${preferredManager} falhou:`, primaryErrorMsg);
+  } else {
+    primaryErrorMsg = `O gerenciador de pacotes '${preferredManager}' não está disponível no sistema.`;
+    console.log(`[Preview Install] ${primaryErrorMsg}`);
     attemptsLog.push({ manager: preferredManager, command: preferredManager, status: "failed", error: primaryErrorMsg });
   }
 
@@ -4669,18 +4724,31 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
   }
 
   // Step 2: Single bounded fallback to npm (when preferredManager is bun, pnpm, yarn)
-  console.log(`[Preview Install] Falling back to npm (reason: ${preferredManager} failed)`);
+  console.log(`[Preview Install] Falling back to npm (reason: ${primaryErrorMsg})`);
   logPreviewLifecycle("recovery:clean-start", { packageManager: "npm", reason: primaryErrorMsg, recoveryAttempt: 1 });
   emitPreview("preview.installing", {
     status: "installing",
     phase: "installing_dependencies",
     packageManager: "npm",
     framework: info.framework,
-    message: `Não foi possível iniciar com ${preferredManager}. Preparando o ambiente com npm...`
+    message: preferredAvailable
+      ? `Não foi possível iniciar com ${preferredManager}. Preparando o ambiente com npm...`
+      : `O gerenciador ${preferredManager} não está instalado. Preparando o ambiente com npm...`
   });
 
   try {
-    await removeNodeModules(projectPath);
+    const hasNM = await hasDependencies(projectPath);
+    if (hasNM) {
+      try {
+        await verifyRuntimeDependency(projectPath, info, "npm");
+        logPreviewLifecycle("recovery:clean-complete", { packageManager: "npm", recoveryAttempt: 0 });
+        console.log(`[Preview Install] Dependências existentes já válidas para npm. Reutilizando node_modules.`);
+        return "npm";
+      } catch {
+        await removeNodeModules(projectPath);
+      }
+    }
+
     if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
     if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
@@ -4789,7 +4857,11 @@ async function waitForHttp(url: string, timeout = 90000, processRef?: ChildProce
       throw new Error("Troca de projeto cancelou o aguardo HTTP.");
     }
     if (processRef && processRef.exitCode !== null) {
-      throw new Error("O servidor encerrou antes de ficar disponível.");
+      const alive = await isHttpAlive(url);
+      if (!alive) {
+        logPreviewLifecycle("error", { stage: "server", message: "process exited before HTTP available", exitCode: processRef.exitCode });
+        throw new Error("O servidor encerrou antes de ficar disponível.");
+      }
     }
     try {
       const response = await fetch(url, { redirect: "manual" });
@@ -5007,18 +5079,14 @@ function captureProjectPreviewThumbnail(projectPath: string, url: string, force 
 }
 
 async function launchPreviewProcess(projectPath: string, info: any, packageManager: string, port: number) {
-  const executable = packageManagerExecutable(packageManager);
-  const args = previewArgs(info.framework, port, info.devScript);
-  const previewIsWindows = process.platform === "win32";
-  const previewSpawnExecutable = previewIsWindows ? (process.env.ComSpec || "cmd.exe") : executable;
-  const previewSpawnArgs = previewIsWindows
-    ? ["/d", "/s", "/c", windowsCommandLine(executable, args)]
-    : args;
+  let runtimeInfo: NodeRuntimeDescriptor | null = null;
+  try { runtimeInfo = resolveNodeRuntime(); } catch {}
+  const envPath = getEmbeddedRuntimeEnv().PATH;
+  console.log(`[PreviewRuntime] runtime=${runtimeInfo?.isBundled ? "node-embedded" : "system"} nodePath=${runtimeInfo?.nodePath ?? "-"} npmPath=${runtimeInfo?.npmPath ?? "-"} npxPath=${runtimeInfo?.npxPath ?? "-"} packageManager=${packageManager} workingDirectory=${projectPath} PATH=${envPath}`);
 
-  const processRef = spawn(previewSpawnExecutable, previewSpawnArgs, {
+  const args = previewArgs(info.framework, port, info.devScript);
+  const processRef = spawnNodeTool(packageManagerExecutable(packageManager), args, {
     cwd: projectPath,
-    windowsHide: true,
-    shell: false,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -5151,7 +5219,24 @@ function logPreviewLifecycle(phase: string, details: Record<string, any> = {}) {
 async function startPreviewInternal(projectRoot: string, info: any, sessionId: number, targetGen: number): Promise<PreviewManagerState> {
   if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
 
-  let packageManager = (info as any).packageManager ?? "npm";
+  const rawPackageManager = (info as any).packageManager ?? "npm";
+  const resolvedPM = resolveEffectivePackageManager(rawPackageManager);
+  let packageManager = resolvedPM.effectiveManager;
+
+  if (resolvedPM.isFallback) {
+    console.log(`[Neko/Preview] Gerenciador '${rawPackageManager}' indisponível no ambiente. Alternando para '${packageManager}'.`);
+    logPreviewLifecycle("package-manager-fallback", { detected: rawPackageManager, effective: packageManager, reason: resolvedPM.reason });
+  }
+
+  if (previewState.status === "ready" && previewPort && previewState.url && previewProjectPath === projectRoot) {
+    const alive = await isHttpAlive(previewState.url);
+    if (alive) {
+      console.log(`[Preview] Servidor já ativo e saudável em ${previewState.url}`);
+      logPreviewLifecycle("server already active and healthy", { url: previewState.url, projectPath: projectRoot });
+      mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: previewState });
+      return previewState;
+    }
+  }
 
   emitPreview("preview.detected", {
     status: "detecting",
@@ -5164,6 +5249,13 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
   if (!info.devScript) {
     logPreviewLifecycle("error", { stage: "detect", message: "no dev script found in package.json" });
     emitPreview("preview.unsupported", { status: "idle", phase: "unsupported", framework: info.framework, message: "Crie ou abra um projeto que nós cuidamos das dependências e preview" });
+    return previewState;
+  }
+
+  if (!isPackageManagerAvailable(packageManager)) {
+    const errorMsg = `Não foi possível iniciar o Preview: o gerenciador de pacotes '${rawPackageManager}' não está disponível no sistema.`;
+    logPreviewLifecycle("error", { stage: "runtime", message: errorMsg });
+    emitPreview("preview.error", { status: "error", phase: "error", message: errorMsg, port: null, url: null });
     return previewState;
   }
 
@@ -5262,19 +5354,19 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
     } catch (error: any) {
       const output = launch.getOutput();
       const message = String(error?.message ?? error);
+      const isDependencyFailure = dependencyResolutionFailure(output) || dependencyResolutionFailure(message);
 
-      // Clean recovery cycle: if server failed to start due to dependency resolution error or early crash
-      // Limit to ONE fallback repair with npm
-      if (packageManager !== "npm" && (dependencyResolutionFailure(output) || dependencyResolutionFailure(message) || (processRef.exitCode !== null && processRef.exitCode !== 0))) {
+      // Clean recovery cycle: only if server failed specifically due to dependency resolution error
+      if (packageManager !== "npm" && isDependencyFailure) {
         await stopPreviewProcessOnly();
-        console.log(`[Preview/Fallback] npm started`);
-        logPreviewLifecycle("recovery:clean-start", { packageManager: "npm", reason: "runtime fallback" });
+        console.log(`[Preview/Fallback] npm started (reason: dependency resolution failure)`);
+        logPreviewLifecycle("recovery:clean-start", { packageManager: "npm", reason: "dependency resolution failure" });
         emitPreview("preview.installing", {
           status: "installing",
           phase: "installing_dependencies",
           packageManager: "npm",
           framework: info.framework,
-          message: `Não foi possível iniciar com ${packageManager}. Preparando o ambiente com npm...`
+          message: `Falha na resolução de módulos com ${packageManager}. Preparando o ambiente com npm...`
         });
         try {
           await removeNodeModules(projectRoot);
@@ -5346,7 +5438,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
           emitPreview("preview.error", {
             status: "error",
             phase: "error",
-            message: "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido.",
+            message: "Falha ao instalar dependências. O node_modules permaneceu inválido.",
             port: null,
             url: null
           });
@@ -5355,8 +5447,8 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
       }
 
       await stopPreviewProcessOnly();
-      const sanitizedErrorMsg = dependencyResolutionFailure(output)
-        ? "Falha ao instalar dependências. A instalação foi tentada com Bun e npm, mas o node_modules permaneceu inválido."
+      const sanitizedErrorMsg = isDependencyFailure
+        ? "Falha ao resolver dependências do projeto."
         : message;
       logPreviewLifecycle("error", { stage: "server", message: sanitizedErrorMsg });
       emitPreview("preview.error", {
@@ -5530,7 +5622,7 @@ async function getProviders() {
         providerCatalogCache.set(key, { attachment: (model as any)?.attachment === true });
 
         // Central eligibility filter: Only models eligible for Chat/Agent/Plan/Build are exposed to NekoAI
-        const eligible = isModelEligibleForNeko(model as any, providerID);
+        const eligible = isModelEligibleForNeko({ id: modelID, modelID, ...(model as any) }, providerID);
         if (!eligible) {
           filteredCount++;
           continue;
@@ -5575,9 +5667,11 @@ async function getProviders() {
           label: method.label ?? method.type
         })) : [];
       }
-    } catch {}
+    } catch (authError: any) {
+      console.warn("[Providers] client.provider.auth() falhou:", logSafeText(authError?.message ?? authError));
+    }
 
-    const managedModels = models.filter(m => m.connected && m.catalogEnabled);
+    const managedModels = models.filter(m => m.catalogEnabled);
     const activeModels = managedModels.filter(m => m.enabled);
 
     logService("providers:list completed");
@@ -7462,8 +7556,9 @@ async function readConnectedProviderIDs(): Promise<Set<string>> {
     const data = (result as any)?.data ?? result ?? {};
     const connected = Array.isArray(data.connected) ? data.connected : [];
     return new Set(connected.map((value: unknown) => String(value)));
-  } catch {
-    return new Set();
+  } catch (error: any) {
+    console.warn("[Providers] readConnectedProviderIDs falhou:", logSafeText(error?.message ?? error));
+    throw error;
   }
 }
 
@@ -7478,7 +7573,12 @@ ipcMain.handle("provider:connect", async (_event, payload: { providerID: string;
   const key = String(payload?.key || "").trim();
   if (!id || !key) throw new Error("Provedor ou chave de API não informados.");
 
-  const connectedBefore = await readConnectedProviderIDs();
+  let connectedBefore = new Set<string>();
+  try {
+    connectedBefore = await readConnectedProviderIDs();
+  } catch (err: any) {
+    console.warn("[Providers] Não foi possível verificar se o provedor já estava conectado antes:", logSafeText(err?.message ?? err));
+  }
   if (connectedBefore.has(id)) {
     // Connecting an already-connected provider must be idempotent. In
     // particular, never overwrite its credential just because the user
@@ -7509,8 +7609,15 @@ ipcMain.handle("provider:disconnect", async (_event, providerID: string) => {
   const id = String(providerID || "").trim();
   if (!id) throw new Error("Provedor não informado.");
 
-  const connectedBefore = await readConnectedProviderIDs();
-  if (!connectedBefore.has(id)) {
+  let connectedBefore = new Set<string>();
+  let checkedBefore = false;
+  try {
+    connectedBefore = await readConnectedProviderIDs();
+    checkedBefore = true;
+  } catch (err: any) {
+    console.warn("[Providers] Não foi possível verificar se o provedor estava conectado antes da desconexão:", logSafeText(err?.message ?? err));
+  }
+  if (checkedBefore && !connectedBefore.has(id)) {
     await disposeOpenCodeInstance();
     return { ok: true, alreadyDisconnected: true };
   }
@@ -7533,9 +7640,14 @@ ipcMain.handle("provider:disconnect", async (_event, providerID: string) => {
 
   // Verify the state after cache invalidation. This prevents the renderer from
   // reporting success while OpenCode still thinks the provider is connected.
-  const connectedAfter = await readConnectedProviderIDs();
-  if (connectedAfter.has(id)) {
-    throw new Error("O OpenCode ainda informa que este provedor está conectado. Tente novamente.");
+  try {
+    const connectedAfter = await readConnectedProviderIDs();
+    if (connectedAfter.has(id)) {
+      throw new Error("O OpenCode ainda informa que este provedor está conectado. Tente novamente.");
+    }
+  } catch (err: any) {
+    if (err?.message?.includes("O OpenCode ainda informa")) throw err;
+    console.warn("[Providers] Não foi possível verificar estado após desconexão:", logSafeText(err?.message ?? err));
   }
 
   return { ok: true, alreadyDisconnected: false };
@@ -7550,13 +7662,15 @@ async function runValidationBuild(projectPath: string) {
   if (!info.pkg?.scripts?.build) {
     return { ok: true, skipped: true, message: "Este projeto não possui script de build.", output: "" };
   }
-  const manager = info.packageManager || "npm";
+  const effectiveResolution = resolveEffectivePackageManager(info.packageManager || "npm");
+  const manager = effectiveResolution.effectiveManager;
   const command = packageManagerExecutable(manager);
+
   const result = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
-    const isWindows = process.platform === "win32";
-    const executable = isWindows ? (process.env.ComSpec || "cmd.exe") : command;
-    const args = isWindows ? ["/d", "/s", "/c", windowsCommandLine(command, ["run", "build"])] : ["run", "build"];
-    const child = spawn(executable, args, { cwd: root, windowsHide: true, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawnNodeTool(command, ["run", "build"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
     let stdout = "", stderr = "";
     child.stdout?.on("data", chunk => { const text = chunk.toString(); stdout += text; mainWindow?.webContents.send("preview:event", { type: "preview.output", properties: { stream: "stdout", text, source: "Build" } }); });
     child.stderr?.on("data", chunk => { const text = chunk.toString(); stderr += text; mainWindow?.webContents.send("preview:event", { type: "preview.output", properties: { stream: "stderr", text, source: "Build" } }); });
@@ -7765,13 +7879,14 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   perfMark("uploadReady", payload.sessionId);
 
   // ============================================================
-  // VISION CAPABILITY / FALLBACK (MiMo V2.5 Free)
+  // VISION CAPABILITY / FALLBACK (OpenCode Vision Fallback)
   // ------------------------------------------------------------
   // Decided once per prompt, from the cached provider catalog. Never
   // triggers a new providers:list request and never changes the user's
   // selected model. When the main model accepts images, images flow to it
-  // directly. Otherwise MiMo V2.5 Free (free tier, auxiliary session)
-  // interprets the images and the resulting text context is injected into
+  // directly. Otherwise, the dynamically-resolved OpenCode Vision Fallback model
+  // (MiMo-V2.6-Flash Free / active candidate) interprets the images on an
+  // auxiliary session and the resulting text context is injected into
   // the main prompt with zero instruction authority.
   // ============================================================
   let userRequestText = payload.text;
@@ -7780,21 +7895,24 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
     const modelId = payload.model?.modelID ?? "";
     const catalogMeta = payload.model ? providerCatalogCache.get(`${providerId}:${modelId}`) : undefined;
     const capabilities = getModelCapabilities(providerId, modelId, catalogMeta);
-    console.log(`[Vision] capability-check provider=${providerId || "default"} model=${modelId || "default"} imageInput=${capabilities.imageInput} images=${imageAttachments.length}`);
+    console.log(`[VisionFallback] capability-check primaryProvider=${providerId || "default"} primaryModel=${modelId || "default"} imageInput=${capabilities.imageInput} images=${imageAttachments.length}`);
     if (capabilities.imageInput) {
       contextParts.push(...imageAttachments);
-      console.log(`[Vision] direct-send provider=${providerId || "default"} model=${modelId || "default"} images=${imageAttachments.length}`);
+      console.log(`[VisionFallback] direct-send primaryProvider=${providerId || "default"} primaryModel=${modelId || "default"} images=${imageAttachments.length}`);
     } else {
-      const fallbackProviderID = resolveVisionFallbackProvider();
-      console.log(`[Vision] fallback-required provider=${providerId || "default"} model=${modelId || "default"} reason=image-input-unsupported images=${imageAttachments.length}`);
-      console.log(`[Vision] fallback-start model=${fallbackProviderID}/${VISION_FALLBACK_MODEL.modelID} images=${imageAttachments.length}`);
+      const fallbackTarget = resolveVisionFallbackTarget(providerCatalogCache);
+      if (!fallbackTarget) {
+        console.log(`[VisionFallback] primaryModel=${modelId || "default"} primaryProvider=${providerId || "default"} reason=unsupported-image-input status=no-fallback-target`);
+        throw new Error(friendlyFallbackError("no-fallback-model"));
+      }
+      console.log(`[VisionFallback] primaryModel=${modelId || "default"} primaryProvider=${providerId || "default"} fallbackProvider=${fallbackTarget.providerID} fallbackModel=${fallbackTarget.modelID} reason=unsupported-image-input status=starting`);
       const fallback = await analyzeImagesWithMiMo({
         mainSessionId: payload.sessionId,
         opencodeUrl,
         headers: opencodeRequestHeaders(),
         images: imageAttachments,
         userPrompt: payload.text || "Analise a imagem anexada.",
-        model: { providerID: fallbackProviderID, modelID: VISION_FALLBACK_MODEL.modelID }
+        model: { providerID: fallbackTarget.providerID, modelID: fallbackTarget.modelID }
       });
       // STOP during the fallback: never send the main prompt, never throw a
       // technical error — the renderer keeps the cancelled state untouched.
@@ -7806,10 +7924,10 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
         return { cancelled: true };
       }
       if (!fallback.ok) {
-        console.log(`[Vision] fallback-error reason=${fallback.reason}`);
+        console.log(`[VisionFallback] primaryModel=${modelId || "default"} primaryProvider=${providerId || "default"} fallbackProvider=${fallbackTarget.providerID} fallbackModel=${fallbackTarget.modelID} reason=${fallback.reason} status=error`);
         throw new Error(fallback.userMessage);
       }
-      console.log(`[Vision] fallback-success images=${imageAttachments.length} chars=${fallback.analysis.length}`);
+      console.log(`[VisionFallback] primaryModel=${modelId || "default"} primaryProvider=${providerId || "default"} fallbackProvider=${fallbackTarget.providerID} fallbackModel=${fallbackTarget.modelID} status=success images=${imageAttachments.length} chars=${fallback.analysis.length}`);
       userRequestText = buildVisionContext(fallback.analysis, imageAttachments.length, payload.text);
     }
   }
@@ -8199,7 +8317,7 @@ ipcMain.handle("preview:routes", async (_event, payload?: { force?: boolean }) =
 // preserving the origin and never adding artificial query parameters.
 ipcMain.handle("preview:navigate", async (_event, routePath: string) => {
   const normalized = normalizeRoutePath(routePath);
-  if (normalized === "/" || !normalized) throw new Error("Rota de Preview inválida.");
+  if (!normalized) throw new Error("Rota de Preview inválida.");
   // Dynamic detail routes (/equipamentos/:id) cannot be opened without real
   // parameters. Never invent them: open the static prefix instead (safe).
   let openable = normalized;
@@ -8451,23 +8569,29 @@ ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
   console.log(`[Preview] external open requested rawUrl=${sanitizeExternalPreviewUrl(rawUrl)} previewState.url=${sanitizeExternalPreviewUrl(previewState.url || "")} previewState.status=${previewState.status}`);
   const currentPreviewUrl = typeof previewState.url === "string" ? previewState.url : "";
   let value = "";
-
-  // Prefer the CURRENT route of the internal preview WebContents: if the user
-  // navigated internally to /dashboard, "Abrir em nova janela" must open
-  // /dashboard — not the server root. Otherwise fall back to the renderer
-  // provided URL and then to the server base.
-  try {
-    const internal = internalPreviewView;
-    if (internal && !internal.webContents.isDestroyed()) {
-      const internalCurrent = internal.webContents.getURL();
-      if (internalCurrent && isLocalhostPreviewUrl(internalCurrent) && currentPreviewUrl && previewServerOriginMatches(internalCurrent, currentPreviewUrl)) {
-        value = internalCurrent;
+  const requested = String(rawUrl || "").trim();
+  if (requested && currentPreviewUrl && previewServerOriginMatches(requested, currentPreviewUrl)) {
+    try {
+      const parsedReq = new URL(requested);
+      if (parsedReq.pathname && parsedReq.pathname !== "/") {
+        value = requested;
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   if (!value) {
-    const requested = String(rawUrl || "").trim();
+    try {
+      const internal = internalPreviewView;
+      if (internal && !internal.webContents.isDestroyed()) {
+        const internalCurrent = internal.webContents.getURL();
+        if (internalCurrent && isLocalhostPreviewUrl(internalCurrent) && currentPreviewUrl && previewServerOriginMatches(internalCurrent, currentPreviewUrl)) {
+          value = internalCurrent;
+        }
+      }
+    } catch {}
+  }
+
+  if (!value) {
     if (requested && currentPreviewUrl && previewServerOriginMatches(requested, currentPreviewUrl)) {
       value = requested;
     } else if (currentPreviewUrl && previewState.status === "ready") {
@@ -8600,6 +8724,10 @@ ipcMain.handle("supabase:select-project", async (_event, ref: string) => {
 
 ipcMain.handle("supabase:disconnect", async () => {
   return await supabaseManager.disconnect();
+});
+
+ipcMain.handle("supabase:cancel-auth", async () => {
+  return await supabaseManager.cancelOAuth();
 });
 
 ipcMain.handle("supabase:unlink", async () => {
@@ -9468,6 +9596,64 @@ app.whenReady().then(() => {
 
   ipcMain.handle("lovable:test-connection", async () => {
     return await lovableCloudManager.testConnection();
+  });
+
+  ipcMain.handle("runtime:get-requirements", async (_event, projectPath?: string) => {
+    const target = projectPath || currentProject;
+    if (!target) return { requirements: [], cardData: [] };
+    try {
+      const safePath = assertProjectRootSafe(target, "runtime-read");
+      const requirements = await runtimeManager.evaluateProjectRequirements(safePath);
+      const cardData = requirements
+        .filter((r) => r.state === "requires-authorization")
+        .map((r) => runtimeManager.getLifecycleManager().buildPermissionCardData(r))
+        .filter(Boolean);
+      return { requirements, cardData };
+    } catch (err: any) {
+      return { requirements: [], cardData: [], error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle("runtime:authorize", async (_event, payload: { runtimeId: string; version: string; approved: boolean; reason?: string }) => {
+    const runtimeId = String(payload?.runtimeId || "").trim().toLowerCase();
+    const version = String(payload?.version || "").trim();
+    const approved = Boolean(payload?.approved);
+    const reason = payload?.reason ? String(payload.reason) : undefined;
+
+    if (!runtimeId || !version) {
+      return { status: "failed", error: "INVALID_IPC_PAYLOAD: 'runtimeId' e 'version' são obrigatórios." };
+    }
+
+    const provider = runtimeManager.getProvider(runtimeId);
+    if (!provider) {
+      return { status: "failed", error: `PROVIDER_NOT_FOUND: Nenhum provider cadastrado para '${runtimeId}'.` };
+    }
+
+    const req: RuntimeRequirement = {
+      technology: provider.name,
+      runtimeId,
+      version,
+      reason: reason || "Autorização enviada via UI/IPC",
+      confidence: "high",
+      evidence: "user-ui",
+      detectedFrom: "user-ui",
+      state: approved ? "requires-authorization" : "not-installed",
+    };
+
+    return await runtimeManager.authorizeAndProvision(req, {
+      approved,
+      source: "user",
+      reason,
+    });
+  });
+
+  // Encaminhar eventos de ciclo de vida de runtime aos renderers ativos
+  runtimeManager.getLifecycleManager().subscribeEvents((event) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      try {
+        win.webContents.send("runtime:lifecycle-event", event);
+      } catch {}
+    });
   });
 
   // Verificação automática silenciosa em segundo plano após inicialização da janela

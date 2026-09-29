@@ -60,6 +60,8 @@ export interface SupabaseState {
   pendingRuntimeSetup?: boolean;
   recentCreatedNotice?: string | null;
   usedProjectRefs?: string[];
+  oauthUrl?: string | null;
+  oauthOpened?: boolean;
   error: string | null;
   structuredError?: SupabaseStructuredError | null;
 }
@@ -103,5 +105,7 @@ export const EMPTY_SUPABASE_STATE: SupabaseState = {
   region: null,
   pendingRuntimeSetup: false,
   usedProjectRefs: [],
+  oauthUrl: null,
+  oauthOpened: false,
   error: null,
 };

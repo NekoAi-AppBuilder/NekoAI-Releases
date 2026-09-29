@@ -37,7 +37,8 @@ export function normalizeOpenCodeEvent(event: any) {
     };
   }
 
-  const path = props?.path ?? props?.filePath ?? (typeof props?.file === "string" ? props.file : props?.file?.path);
+  const input = props?.input ?? props?.part?.state?.input ?? props?.part?.input ?? {};
+  const path = props?.path ?? props?.filePath ?? props?.filepath ?? (typeof props?.file === "string" ? props.file : props?.file?.path) ?? input?.filePath ?? input?.filepath ?? input?.path ?? input?.file ?? input?.filename;
   if (path && shouldIgnoreEventPath(path)) return null;
 
   const sessionID = props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? event?.sessionID ?? event?.sessionId;

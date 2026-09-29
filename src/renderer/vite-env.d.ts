@@ -213,6 +213,9 @@ interface Window {
     lovableCancelJit(reason?: string): Promise<{ ok: boolean }>;
     onLovableJitRequired(callback: (data: any) => void): () => void;
     onLovableStateChange(callback: (state: any) => void): () => void;
+    runtimeGetRequirements?(projectPath?: string): Promise<{ requirements: any[]; cardData: any[] }>;
+    runtimeAuthorize?(payload: { runtimeId: string; version: string; approved: boolean; reason?: string }): Promise<any>;
+    onRuntimeLifecycleEvent?(callback: (event: any) => void): () => void;
   };
 }
 

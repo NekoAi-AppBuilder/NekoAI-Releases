@@ -105,6 +105,8 @@ contextBridge.exposeInMainWorld("neko", {
   supabaseCreateProject: (payload: { name: string; orgId: string; dbPassword: string; region: string }) => ipcRenderer.invoke("supabase:create-project", payload),
   supabaseSelectProject: (ref: string) => ipcRenderer.invoke("supabase:select-project", ref),
   supabaseDisconnect: () => ipcRenderer.invoke("supabase:disconnect"),
+  supabaseCancelAuth: () => ipcRenderer.invoke("supabase:cancel-auth"),
+  openExternal: (url: string) => ipcRenderer.invoke("app:openExternal", url),
   supabaseUnlink: () => ipcRenderer.invoke("supabase:unlink"),
   supabaseOpenTokenPage: () => ipcRenderer.invoke("supabase:open-token-page"),
   supabaseOpenDashboard: () => ipcRenderer.invoke("supabase:open-dashboard"),
@@ -169,6 +171,13 @@ contextBridge.exposeInMainWorld("neko", {
     const listener = (_event: Electron.IpcRendererEvent, isMaximized: boolean) => callback(isMaximized);
     ipcRenderer.on("window:maximized-change", listener);
     return () => ipcRenderer.removeListener("window:maximized-change", listener);
+  },
+  runtimeGetRequirements: (projectPath?: string) => ipcRenderer.invoke("runtime:get-requirements", projectPath),
+  runtimeAuthorize: (payload: { runtimeId: string; version: string; approved: boolean; reason?: string }) => ipcRenderer.invoke("runtime:authorize", payload),
+  onRuntimeLifecycleEvent: (callback: (event: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
+    ipcRenderer.on("runtime:lifecycle-event", listener);
+    return () => ipcRenderer.removeListener("runtime:lifecycle-event", listener);
   }
 });
 

@@ -9,6 +9,9 @@ const BEARER_AUTH_REGEX = /\b(?:Authorization:\s*Bearer\s+|Authorization:\s*|Bea
 const GITHUB_TOKEN_REGEX = /\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[a-zA-Z0-9_]{10,}\b/gi;
 const SUPABASE_TOKEN_REGEX = /\bsbp_[a-zA-Z0-9_]{10,}\b/gi;
 const OPENAI_KEY_REGEX = /\bsk-[a-zA-Z0-9_-]{15,}\b/gi;
+const GROQ_KEY_REGEX = /\bgsk_[a-zA-Z0-9_-]{15,}\b/gi;
+const GEMINI_KEY_REGEX = /\bAIza[0-9A-Za-z-_]{35}\b/g;
+const NVIDIA_KEY_REGEX = /\bnvapi-[a-zA-Z0-9_-]{20,}\b/gi;
 const JWT_REGEX = /\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\b/g;
 const URL_CREDENTIALS_REGEX = /(https?:\/\/)(?:[^:\s\/]+):(?:[^@\s\/]+)@/gi;
 const DB_CREDENTIALS_REGEX = /((?:postgres|postgresql|mysql|mongodb):\/\/)(?:[^:\s\/]+):(?:[^@\s\/]+)@/gi;
@@ -29,6 +32,9 @@ export function sanitizeErrorMessage(text: string): string {
     .replace(GITHUB_TOKEN_REGEX, "[TOKEN_GITHUB]")
     .replace(SUPABASE_TOKEN_REGEX, "[TOKEN_SUPABASE]")
     .replace(OPENAI_KEY_REGEX, "[API_KEY]")
+    .replace(GROQ_KEY_REGEX, "[API_KEY]")
+    .replace(GEMINI_KEY_REGEX, "[API_KEY]")
+    .replace(NVIDIA_KEY_REGEX, "[API_KEY]")
     .replace(JWT_REGEX, "[JWT_TOKEN]")
     // 4. Parâmetros de query sensíveis (token=..., password=..., secret=..., apiKey=...)
     .replace(/([?&](?:token|password|secret|apiKey|api_key|access_token|key)=)[^&\s]+/gi, "$1[REDACTED]")

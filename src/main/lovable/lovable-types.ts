@@ -82,3 +82,11 @@ export const EMPTY_LOVABLE_STATE: LovableState = {
 export const LOVABLE_PROJECT_ID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const LOVABLE_URL_PROJECT_ID_REGEX = /^https:\/\/(?:www\.)?lovable\.dev\/projects\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
 
+export function shouldShowLovableOnboardingModal(
+  state: Partial<LovableState> | null | undefined
+): boolean {
+  if (!state) return false;
+  return Boolean(state.isLovableProject === true && state.lovableCloudConnected !== true);
+}
+
+

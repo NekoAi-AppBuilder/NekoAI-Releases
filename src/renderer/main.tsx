@@ -13,7 +13,7 @@ import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
 import { nextChatMode, chatModeLabel, CHAT_MODES, type ChatMode } from "../shared/chat-mode";
-import { getUserFacingError } from "../shared/error-extractor";
+import { getUserFacingError, sanitizeErrorMessage } from "../shared/error-extractor";
 import { shouldShowLovableOnboardingModal } from "../main/lovable/lovable-types";
 import { getNekoTutorials, type NekoTutorial } from "./tutorials";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
@@ -343,6 +343,11 @@ function isModelFree(model: Model | undefined): boolean {
     if (model.cost.input === 0 && model.cost.output === 0) return true;
   }
   return false;
+}
+
+function isProviderFullyFree(provider: Provider | undefined): boolean {
+  if (!provider || !Array.isArray(provider.models) || provider.models.length === 0) return false;
+  return provider.models.every(m => isModelFree(m));
 }
 
 function getProviderPricingLabel(models: Model[] | undefined): "Grátis" | "Pago" | "Gratuito/Pago" {
@@ -1049,7 +1054,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.91");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.92");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1199,7 +1204,7 @@ function App() {
   const [vercelProjectName, setVercelProjectName] = React.useState("");
   const [vercelSwitchMode, setVercelSwitchMode] = React.useState(false);
   const [supabaseState, setSupabaseState] = React.useState<{
-    status: "disconnected" | "checking" | "authorizing" | "selecting" | "validating" | "installing" | "connected" | "error";
+    status: "disconnected" | "checking" | "authorizing" | "verifying" | "selecting" | "validating" | "installing" | "connected" | "error";
     configured: boolean;
     projects: Array<{ id: string; ref: string; name: string; region: string; status: string }>;
     organizations: Array<{ id: string; name: string }>;
@@ -1210,6 +1215,8 @@ function App() {
     pendingRuntimeSetup?: boolean;
     recentCreatedNotice?: string | null;
     usedProjectRefs?: string[];
+    oauthUrl?: string | null;
+    oauthOpened?: boolean;
     error: string | null;
   }>({
     status: "disconnected",
@@ -1222,9 +1229,12 @@ function App() {
     pendingRuntimeSetup: false,
     recentCreatedNotice: null,
     usedProjectRefs: [],
+    oauthUrl: null,
+    oauthOpened: false,
     error: null,
   });
   const [supabaseBusy, setSupabaseBusy] = React.useState(false);
+  const [copiedSupabaseOauth, setCopiedSupabaseOauth] = React.useState(false);
   const [supabaseToken, setSupabaseToken] = React.useState("");
   const [supabaseError, setSupabaseError] = React.useState("");
   const [supabaseView, setSupabaseView] = React.useState<"auto" | "connected" | "projects" | "create" | "connect">("auto");
@@ -1630,6 +1640,9 @@ function App() {
   // Preview Page Selector: rotas reais descobertas no projeto ativo.
   const [previewRoutes, setPreviewRoutes] = React.useState<{ path: string; label: string }[]>([]);
   const [previewCurrentRoute, setPreviewCurrentRoute] = React.useState<string>("/");
+  const [previewSearchQuery, setPreviewSearchQuery] = React.useState<string>("");
+  const previewRoutesSeqRef = React.useRef(0);
+  const previewSearchInputRef = React.useRef<HTMLInputElement | null>(null);
   const previewEffectiveUrl = React.useMemo(() => {
     if (!previewUrl) return "";
     if (!previewCurrentRoute || previewCurrentRoute === "/") return previewUrl;
@@ -1717,6 +1730,7 @@ function App() {
   const [isCreatingBranch, setIsCreatingBranch] = React.useState(false);
   const [newBranchInput, setNewBranchInput] = React.useState("");
   const [pendingTargetBranch, setPendingTargetBranch] = React.useState<string | null>(null);
+  const branchRefreshRequestIdRef = React.useRef(0);
   const [showBranchDiffList, setShowBranchDiffList] = React.useState(false);
   const [branchCommitMessage, setBranchCommitMessage] = React.useState("WIP: alterações antes de trocar de branch");
   const [branchActionBusy, setBranchActionBusy] = React.useState(false);
@@ -1764,7 +1778,7 @@ function App() {
   const modelGroups = React.useMemo(() => {
     const map = new Map<string, { providerID: string; providerName: string; models: Model[] }>();
     for (const m of models) {
-      if (!m.enabled) continue;
+      if (!m.enabled || !m.connected) continue;
       if (!map.has(m.providerID)) map.set(m.providerID, { providerID: m.providerID, providerName: m.providerName, models: [] });
       map.get(m.providerID)!.models.push(m);
     }
@@ -1772,15 +1786,6 @@ function App() {
     const groups = Array.from(map.values())
       .filter(g => g.models.length > 0)
       .filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
-
-    // Order: Connected providers first, then unconnected providers
-    groups.sort((a, b) => {
-      const aConn = a.models.some(m => m.connected);
-      const bConn = b.models.some(m => m.connected);
-      if (aConn && !bConn) return -1;
-      if (!aConn && bConn) return 1;
-      return 0;
-    });
 
     // The provider of the currently selected model is ALWAYS first
     if (selectedModel?.providerID) {
@@ -1808,15 +1813,16 @@ function App() {
     const q = modelSearch.toLowerCase();
     const filtered = Array.from(map.values()).filter(g => !q || g.models.some(m => m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q)) || g.providerName.toLowerCase().includes(q));
 
-    // Order: Connected providers first, then free model providers, then others
+    // Order: Connected providers first, then fully free providers, then others
     const connectedGroups: typeof filtered = [];
     const freeProviders: typeof filtered = [];
     const paidProviders: typeof filtered = [];
     for (const group of filtered) {
-      const isConnected = providers.some(p => p.id === group.providerID && p.connected);
+      const p = providers.find(prov => prov.id === group.providerID);
+      const isConnected = Boolean(p?.connected);
       if (isConnected) {
         connectedGroups.push(group);
-      } else if (group.models.some(isModelFree)) {
+      } else if (p && isProviderFullyFree(p)) {
         freeProviders.push(group);
       } else {
         paidProviders.push(group);
@@ -1830,40 +1836,25 @@ function App() {
     return q ? providers.filter(p => p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)) : providers;
   }, [providers, providerSearch]);
 
-  const availableFreeModels = React.useMemo(() => {
-    const q = providerSearch.toLowerCase();
-    const list: Model[] = [];
-    for (const p of filteredProviders) {
-      if (p.connected) continue;
-      for (const m of (p.models || [])) {
-        if (isModelFree(m)) {
-          if (!q || m.name.toLowerCase().includes(q) || m.modelID.toLowerCase().includes(q) || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)) {
-            list.push(m);
-          }
-        }
-      }
-    }
-    return list;
-  }, [filteredProviders, providerSearch]);
-
   const POPULAR_PROVIDER_IDS = React.useMemo(() => new Set([
-    "openai", "anthropic", "google", "deepseek", "xai", "mistral", "groq", "opencode"
+    "openai", "anthropic", "google", "deepseek", "xai", "groq", "mistral", "openrouter", "alibaba", "togetherai", "cohere", "perplexity", "github-models", "huggingface"
   ]), []);
 
-  const popularProviders = React.useMemo(
-    () => filteredProviders.filter(p => POPULAR_PROVIDER_IDS.has(p.id)),
-    [filteredProviders, POPULAR_PROVIDER_IDS]
-  );
-
   const connectedProviderList = React.useMemo(() => {
-    const q = providerSearch.toLowerCase();
-    return providers.filter(p => p.connected && (!q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)));
-  }, [providers, providerSearch]);
+    return filteredProviders.filter(p => p.connected);
+  }, [filteredProviders]);
 
-  const otherProviders = React.useMemo(
-    () => filteredProviders.filter(p => !p.connected && !popularProviders.some(pp => pp.id === p.id)),
-    [filteredProviders, popularProviders]
-  );
+  const freeProviderList = React.useMemo(() => {
+    return filteredProviders.filter(p => !p.connected && isProviderFullyFree(p));
+  }, [filteredProviders]);
+
+  const popularProviderList = React.useMemo(() => {
+    return filteredProviders.filter(p => !p.connected && !isProviderFullyFree(p) && POPULAR_PROVIDER_IDS.has(p.id));
+  }, [filteredProviders, POPULAR_PROVIDER_IDS]);
+
+  const otherProviderList = React.useMemo(() => {
+    return filteredProviders.filter(p => !p.connected && !isProviderFullyFree(p) && !POPULAR_PROVIDER_IDS.has(p.id));
+  }, [filteredProviders, POPULAR_PROVIDER_IDS]);
 
   const availableSupabaseProjects = React.useMemo(() => {
     if (!supabaseState.projects || supabaseState.projects.length === 0) return [];
@@ -2271,7 +2262,9 @@ function App() {
   const appendTerminalLine = React.useCallback((kind: "log" | "console" | "error", text: unknown, source = "Neko") => {
     const raw = stripAnsiCodes(String(text ?? "")).trim();
     if (!raw) return;
-    let clean = raw
+    const sanitized = sanitizeErrorMessage(raw);
+    if (!sanitized) return;
+    let clean = sanitized
       .replace(/\bOpenCode\b/gi, "Neko")
       .replace(/\bMCP\b/gi, "serviço interno")
       .replace(/OPENCODE_SERVER_PASSWORD[^\n]*/gi, "Configuração interna do serviço")
@@ -2306,11 +2299,13 @@ function App() {
   const pushConsoleEntry = React.useCallback((level: ConsoleLevel, message: string, source?: string, url?: string) => {
     const text = stripAnsiCodes(String(message ?? "")).trim();
     if (!text) return;
+    const clean = sanitizeErrorMessage(text);
+    if (!clean) return;
     setConsoleEntries(prev => {
       const entry: PreviewConsoleEntry = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         level,
-        message: text,
+        message: clean,
         source: source || undefined,
         url,
         ts: Date.now()
@@ -2416,6 +2411,15 @@ function App() {
     return () => { window.removeEventListener("pointerdown", unlock); window.removeEventListener("keydown", unlock); };
   }, []);
 
+  // Preview Page Selector: rotas filtradas pela pesquisa em tempo real
+  const filteredPreviewRoutes = React.useMemo(() => {
+    const q = previewSearchQuery.trim().toLowerCase();
+    if (!q) return previewRoutes;
+    return previewRoutes.filter(r =>
+      r.label.toLowerCase().includes(q) || r.path.toLowerCase().includes(q)
+    );
+  }, [previewRoutes, previewSearchQuery]);
+
   // Preview Page Selector keyboard navigation (arrows/Enter/Escape). Never
   // captures Tab — a future Build/Plan feature uses it.
   React.useEffect(() => {
@@ -2424,7 +2428,7 @@ function App() {
       return;
     }
     const onKey = (e: KeyboardEvent) => {
-      const len = previewRoutes.length;
+      const len = filteredPreviewRoutes.length;
       if (e.key === "Escape") {
         void setPreviewRouteMenuOpen(false);
         return;
@@ -2439,15 +2443,20 @@ function App() {
         if (len > 0) setPreviewRouteMenuFocus(f => (f <= 0 ? len - 1 : f - 1));
         return;
       }
-      if ((e.key === "Enter" || e.key === " ") && previewRouteMenuFocus >= 0 && previewRoutes[previewRouteMenuFocus]) {
-        e.preventDefault();
-        void goToPreviewRoute(previewRoutes[previewRouteMenuFocus].path);
+      if (e.key === "Enter" && len > 0) {
+        const targetRoute = previewRouteMenuFocus >= 0 && filteredPreviewRoutes[previewRouteMenuFocus]
+          ? filteredPreviewRoutes[previewRouteMenuFocus]
+          : filteredPreviewRoutes[0];
+        if (targetRoute) {
+          e.preventDefault();
+          void goToPreviewRoute(targetRoute.path);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [previewRouteOpen, previewRoutes, previewRouteMenuFocus]);
+  }, [previewRouteOpen, filteredPreviewRoutes, previewRouteMenuFocus]);
 
   // Fecha o seletor ao clicar fora dele.
   const previewRouteRootRef = React.useRef<HTMLDivElement | null>(null);
@@ -2531,7 +2540,7 @@ function App() {
   // the task that produced them (idle of task A never concludes task B).
   const currentTaskIdRef = React.useRef<string | null>(null);
   // True while the main process is running the Vision Fallback analysis
-  // (MiMo V2.5 Free) BEFORE the main prompt is accepted. While pending, the
+  // (OpenCode Vision Fallback / MiMo-V2.6-Flash Free) BEFORE the main prompt is accepted. While pending, the
   // session is intentionally idle and the fallback watchdog must never
   // conclude the task.
   const visionFallbackPendingRef = React.useRef(false);
@@ -3164,6 +3173,14 @@ function App() {
     return p.split("/").some((segment) => segment === ".neko");
   }, []);
 
+  const sanitizeTimelineDetail = React.useCallback((text: unknown): string => {
+    if (!text) return "";
+    let str = String(text);
+    str = str.replace(/(?:Bearer|token|key|secret|password|passwd|auth)[\s:=]+['"]?([a-zA-Z0-9_\-\.]{12,})['"]?/gi, (m, p1) => m.replace(p1, "[REDACTED]"));
+    str = str.replace(/\b(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|sbp_[a-zA-Z0-9]{20,}|ey[a-zA-Z0-9_\-]{25,}\.[a-zA-Z0-9_\-]{25,})/g, "[REDACTED]");
+    return str.trim();
+  }, []);
+
   const describeToolActivity = React.useCallback((toolValue: unknown, inputValue?: unknown) => {
     const tool = String(toolValue ?? "").toLowerCase();
     const input = (inputValue && typeof inputValue === "object") ? inputValue as Record<string, unknown> : {};
@@ -3171,20 +3188,24 @@ function App() {
     const pathText = file ? displayPath(file) : "";
 
     if (["edit", "write", "patch", "apply_patch", "multiedit"].some(name => tool.includes(name))) {
+      if (tool.includes("write") && pathText) return `Criando ${pathText}...`;
       return pathText ? `Editando ${pathText}...` : "Editando arquivos do projeto...";
     }
     if (["read", "cat", "view"].some(name => tool === name || tool.includes(name))) {
       return pathText ? `Lendo ${pathText}...` : "Lendo arquivos do projeto...";
     }
     if (["grep", "search", "glob", "find", "ls", "list"].some(name => tool.includes(name))) {
+      const searchTarget = input.pattern || input.query || input.search;
+      if (searchTarget) return `Procurando "${sanitizeTimelineDetail(searchTarget).slice(0, 30)}"...`;
       return pathText ? `Procurando em ${pathText}...` : "Procurando arquivos relevantes...";
     }
     if (["bash", "shell", "terminal", "command", "exec", "run_command"].some(name => tool.includes(name))) {
-      const command = String(input.command ?? input.cmd ?? "").trim();
+      const command = sanitizeTimelineDetail(String(input.command ?? input.cmd ?? ""));
       const cmdLower = command.toLowerCase();
       if (/\b(test|vitest|jest|playwright|cypress)\b/.test(cmdLower)) return "Executando os testes...";
       if (/\b(build|tsc|vite build|npm run build)\b/.test(cmdLower)) return "Executando npm run build...";
       if (/\b(install|npm i|pnpm i|yarn add|bun add)\b/.test(cmdLower)) return "Configurando dependências...";
+      if (/\b(git status|git diff|git log)\b/.test(cmdLower)) return `Executando ${command.slice(0, 30)}...`;
       if (command) {
         const shortCmd = command.length > 35 ? command.slice(0, 32) + "..." : command;
         return `Executando ${shortCmd}...`;
@@ -3196,7 +3217,7 @@ function App() {
     if (tool.includes("migration") || tool.includes("sql")) return "Preparando migração do banco...";
     if (tool.includes("task") || tool.includes("agent")) return "Executando etapa do projeto...";
     return "Pensando...";
-  }, [displayPath]);
+  }, [displayPath, sanitizeTimelineDetail]);
 
   const getEffectiveModel = React.useCallback((base: { providerID: string; modelID: string } | undefined) => {
     if (!base) return undefined;
@@ -3441,7 +3462,7 @@ function App() {
     try {
       const result = await Promise.race([
         window.neko.providers(),
-        new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 7000))
+        new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 12000))
       ]);
       if (!result || pGen !== providersGenerationRef.current) {
         console.log(`[Providers] response-dropped requestId=${requestId} source=${source} reason=${!result ? "timeout" : "stale-generation"}`);
@@ -3511,10 +3532,23 @@ function App() {
         }
       }
       return result;
-    } catch {
+    } catch (error: any) {
+      console.warn(`[Providers] loadProviders failed source=${source} requestId=${requestId}:`, error?.message || error);
       return null;
     }
   }, []);
+
+  // Recarrega defensivamente o catálogo caso a modal de Modelos ou Provedores
+  // seja aberta com projeto ativo mas com catálogo ainda não carregado.
+  // Não realiza polling nem recarrega se o catálogo já possuir itens.
+  React.useEffect(() => {
+    if ((modal === "models" || modal === "providers") && projectRef.current) {
+      if (models.length === 0 || providers.length === 0) {
+        console.log(`[Providers] modal-open defensive reload triggered for modal=${modal}`);
+        void loadProviders("modal-open");
+      }
+    }
+  }, [modal, models.length, providers.length, loadProviders]);
 
   const formatTaskDuration = React.useCallback((durationMs: number) => {
     const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
@@ -3525,9 +3559,10 @@ function App() {
   }, []);
 
   const syncSessionOutput = React.useCallback(async () => {
-    if (!sessionId) return;
+    const activeSessionId = sessionIdRef.current;
+    if (!activeSessionId) return;
     try {
-      const history = await window.neko.messages(sessionId);
+      const history = await window.neko.messages(activeSessionId);
       const entries = Array.isArray(history) ? history : [];
       const assistantEntries = entries.filter((entry: any) => entry?.info?.role === "assistant" || entry?.role === "assistant");
       const latest = assistantEntries[assistantEntries.length - 1];
@@ -3564,7 +3599,7 @@ function App() {
       const nextTree = await window.neko.tree();
       setTree(nextTree);
     } catch {}
-  }, [sessionId, sanitizeUserFacingText]);
+  }, [sanitizeUserFacingText]);
 
   // Bounded auto-repair dispatch. It owns the full task lifecycle (busy,
   // in-flight, taskId correlation) so the completion protocol can always
@@ -3776,6 +3811,8 @@ function App() {
     console.log(`[TaskLifecycle] concludeCurrentTask called state=${state} taskId=${currentTaskIdRef.current ?? "-"} phase-before=${beforePhase} phase-after=${state} -> renderer:setBusy(false)`);
     if (state === "completed") {
       void syncSessionOutput();
+      // Atualiza o catálogo de rotas do Preview para refletir páginas criadas/modificadas durante a tarefa
+      void loadPreviewRoutes(true);
       // Final validation is a wrap-up, NOT a gate: the UI is already in the
       // concluded state. It manages its own busy and may trigger bounded
       // auto-repair.
@@ -4110,14 +4147,16 @@ function App() {
           const actType = props?.actionType === "created" ? "Criando" : props?.actionType === "deleted" ? "Removendo" : "Editando";
           const title = `${actType} ${cleanPath}`;
           if (isTaskRunning()) setWorkingStatus(`${title}...`);
+          const fileItemId = callId ? `file:${callId}` : `file:${props?.actionType || "edit"}:${cleanPath}`;
           upsertActivity({
-            id: callId || `file:${cleanPath}`,
+            id: fileItemId,
             type: "edit",
             icon: "file",
             title,
             detail: cleanPath,
             state: "done"
           });
+          appendTerminalLine("log", `${actType} ${cleanPath}`, "Projeto");
           window.neko.tree().then(setTree).catch(() => {});
           setCodeChangedFile(cleanPath);
           if (activeFile?.path === cleanPath) {
@@ -4138,34 +4177,60 @@ function App() {
           } else if (["read", "cat", "view", "grep", "search", "glob", "find", "ls", "list"].some(n => toolLower.includes(n))) {
             itemType = "read";
           } else if (["bash", "shell", "terminal", "command", "exec", "run_command"].some(n => toolLower.includes(n))) {
-            itemType = "command";
+            const cmdLower = String(command ?? "").toLowerCase();
+            if (/\b(build|test|vitest|jest|tsc|lint|preview|check)\b/.test(cmdLower)) {
+              itemType = "validation";
+            } else {
+              itemType = "command";
+            }
           } else if (toolLower.includes("question")) {
             itemType = "question";
           } else if (toolLower.includes("plan_exit")) {
             itemType = "analysis";
           }
 
+          const toolItemId = callId ? `tool:${callId}` : `tool:${tool}:${sessionIdRef.current || "current"}`;
+          const isDone = status === "completed";
+          const isErr = status === "error";
+
           upsertActivity({
-            id: callId || `tool:${tool}:${Date.now()}`,
+            id: toolItemId,
             type: itemType,
-            icon: itemType === "edit" ? "file" : itemType === "command" ? "command" : "tool",
+            icon: itemType === "edit" ? "file" : itemType === "command" ? "command" : itemType === "validation" ? "check" : "tool",
             title: toolDesc.replace(/\.\.\.$/, ""),
-            detail: filePath ? displayPath(filePath) : (command || String(tool)),
-            state: status === "error" ? "error" : status === "completed" ? "done" : "running"
+            detail: sanitizeTimelineDetail(filePath ? displayPath(filePath) : (command || String(tool))),
+            state: isErr ? "error" : isDone ? "done" : "running",
+            completedAt: isDone || isErr ? Date.now() : undefined
           });
+
+          if (isErr) {
+            appendTerminalLine("error", `Falha em ${tool}: ${error || "Erro na execução"}`, "Neko");
+          } else if (isDone) {
+            appendTerminalLine("log", `Concluído: ${tool}${filePath ? " (" + displayPath(filePath) + ")" : ""}`, "Neko");
+          } else if (stage === "before" || status === "running") {
+            appendTerminalLine("log", `Executando ${tool}${filePath ? " em " + displayPath(filePath) : ""}`, "Neko");
+          }
         } else if (action === "command" && command) {
           retryActiveRef.current = false;
-          const shortCmd = String(command).trim();
+          const shortCmd = sanitizeTimelineDetail(String(command).trim());
           const title = shortCmd.length > 35 ? `Executando ${shortCmd.slice(0, 32)}...` : `Executando ${shortCmd}`;
           if (isTaskRunning()) setWorkingStatus(title);
+          const cmdItemId = callId ? `cmd:${callId}` : `cmd:${Date.now()}`;
           upsertActivity({
-            id: callId || `cmd:${Date.now()}`,
+            id: cmdItemId,
             type: "command",
             icon: "command",
             title,
             detail: shortCmd,
             state: "done"
           });
+          appendTerminalLine("log", `CMD: ${shortCmd}`, "Neko");
+        }
+      }
+      if (type === "opencode.output") {
+        const text = String(props?.text || "");
+        if (text) {
+          appendTerminalLine("log", text, props?.source || "Neko");
         }
       }
       if (type === "session.status") {
@@ -4173,8 +4238,73 @@ function App() {
         if (statusType === "retry") appendTerminalLine("log", "Neko está ajustando a execução.", "Neko");
         if (statusType === "idle") appendTerminalLine("log", "Neko terminou a etapa atual.", "Neko");
       }
-      if (type === "tool.execute.before") appendTerminalLine("log", "Neko está executando uma ação no projeto.", "Neko");
-      if (type === "command.executed") appendTerminalLine("log", "Verificação do projeto concluída.", "Neko");
+      if (type === "tool.execute.before") {
+        if (!isTaskRunning()) return;
+        retryActiveRef.current = false;
+        const tool = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
+        const toolName = typeof tool === "string" ? tool : (tool?.name ?? "");
+        const callId = String(props?.callID ?? props?.callId ?? props?.id ?? "");
+        const toolInput = props?.input ?? props?.part?.state?.input ?? {};
+        const detail = describeToolActivity(toolName, toolInput);
+        setWorkingStatus(detail);
+        if (toolName) {
+          const toolItemId = callId ? `tool:${callId}` : `tool:${toolName}:${sessionIdRef.current || "current"}`;
+          let itemType: TimelineItemType = "status";
+          const toolLower = toolName.toLowerCase();
+          if (["edit", "write", "patch", "apply_patch", "multiedit"].some(n => toolLower.includes(n))) itemType = "edit";
+          else if (["read", "cat", "view", "grep", "search", "glob", "find", "ls", "list"].some(n => toolLower.includes(n))) itemType = "read";
+          else if (["bash", "shell", "terminal", "command", "exec", "run_command"].some(n => toolLower.includes(n))) {
+            const cmdLower = String(toolInput.command ?? toolInput.cmd ?? "").toLowerCase();
+            if (/\b(build|test|vitest|jest|tsc|lint|preview|check)\b/.test(cmdLower)) itemType = "validation";
+            else itemType = "command";
+          } else if (toolLower.includes("question")) itemType = "question";
+          else if (toolLower.includes("plan_exit")) itemType = "analysis";
+
+          const filePath = toolInput.filePath ?? toolInput.filepath ?? toolInput.path ?? toolInput.filename ?? toolInput.file;
+          const command = toolInput.command ?? toolInput.cmd;
+
+          upsertActivity({
+            id: toolItemId,
+            type: itemType,
+            icon: itemType === "edit" ? "file" : itemType === "command" ? "command" : itemType === "validation" ? "check" : "tool",
+            title: detail.replace(/\.\.\.$/, ""),
+            detail: sanitizeTimelineDetail(filePath ? displayPath(filePath) : (command || String(toolName))),
+            state: "running"
+          });
+        }
+      }
+      if (type === "tool.execute.after") {
+        if (!isTaskRunning()) return;
+        const tool = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
+        const toolName = typeof tool === "string" ? tool : (tool?.name ?? "");
+        const callId = String(props?.callID ?? props?.callId ?? props?.id ?? "");
+        const state = props?.state ?? props?.part?.state;
+        const isError = state?.status === "error" || Boolean(props?.error);
+        if (isError) {
+          setWorkingStatus("Corrigindo o que foi necessário...");
+        } else {
+          setWorkingStatus("Neko está trabalhando...");
+        }
+        if (callId || toolName) {
+          const toolItemId = callId ? `tool:${callId}` : `tool:${toolName}:${sessionIdRef.current || "current"}`;
+          const toolInput = props?.input ?? props?.part?.state?.input ?? {};
+          const filePath = toolInput.filePath ?? toolInput.filepath ?? toolInput.path ?? toolInput.filename ?? toolInput.file;
+          const command = toolInput.command ?? toolInput.cmd;
+          const detail = describeToolActivity(toolName, toolInput);
+          upsertActivity({
+            id: toolItemId,
+            title: detail.replace(/\.\.\.$/, ""),
+            detail: sanitizeTimelineDetail(filePath ? displayPath(filePath) : (command || String(toolName))),
+            state: isError ? "error" : "done",
+            completedAt: Date.now()
+          });
+        }
+      }
+      if (type === "command.executed") {
+        appendTerminalLine("log", "Verificação do projeto concluída.", "Neko");
+        retryActiveRef.current = false;
+        if (isTaskRunning()) setWorkingStatus("Verificando as alterações...");
+      }
       if (type === "file.edited") {
         const file = props?.file ?? props?.path ?? props?.filePath ?? "arquivo do projeto";
         appendTerminalLine("log", `Arquivo atualizado: ${displayPath(file)}`, "Projeto");
@@ -4197,30 +4327,6 @@ function App() {
         const seconds = Math.ceil(delay / 1000);
         setWorkingStatus(`Falha temporária. Tentando novamente em ${seconds}s...`);
         upsertActivity({ id: "agent-retry", icon: "status", title: "Tentando novamente", detail: `Tentativa ${attempt}. O Neko preservou a tarefa e continuará automaticamente.`, state: "running" });
-      }
-      if (type === "preview.output") {
-        const text = String(props?.text || "");
-        if (text) {
-          const kind = props?.stream === "stderr" ? "error" : "log";
-          appendTerminalLine(kind, text, "Preview");
-        }
-      }
-      if (type === "preview.console") {
-        const rawLevel = props?.level;
-        const numeric = typeof rawLevel === "string" ? ({ verbose: 0, info: 1, warning: 2, warn: 2, error: 3 } as Record<string, number>)[rawLevel.toLowerCase()] ?? 1 : Number(rawLevel ?? 0);
-        const level: ConsoleLevel = numeric >= 3 ? "error" : numeric === 2 ? "warn" : numeric === 0 ? "debug" : "log";
-        const text = String(props?.message || "");
-        if (text) {
-          if (numeric >= 3) previewRuntimeErrorRef.current = text;
-          // Console do projeto: vai somente para a aba Console.
-          const sourceId = String(props?.sourceId || props?.url || "");
-          const line = Number(props?.lineNumber) > 0 ? Number(props?.lineNumber) : undefined;
-          pushConsoleEntry(level, text, shortConsoleSource(sourceId, line), sourceId || undefined);
-        }
-      }
-      if (type === "preview.error") {
-        const text = String(props?.message || "Erro no Preview");
-        appendTerminalLine("error", text, "Preview");
       }
       if (type === "session.status") {
         const t = String(props?.status?.type ?? props?.status ?? "").toLowerCase();
@@ -4257,37 +4363,50 @@ function App() {
         // late/duplicate idle events are harmless.
         console.log(`[TaskLifecycle] session.idle received (state machine owns conclusion) taskId=${String(props?.taskId ?? "-")} phase=${taskPhaseRef.current}`);
       }
-      if (type === "tool.execute.before") {
-        if (!isTaskRunning()) return;
-        retryActiveRef.current = false;
-        const tool = props?.tool ?? props?.name ?? props?.part?.tool ?? "";
-        const toolName = typeof tool === "string" ? tool : (tool?.name ?? "");
-        const detail = describeToolActivity(toolName, props?.input ?? props?.part?.state?.input);
-        setWorkingStatus(detail);
-        upsertActivity({ id: "current-tool", icon: "tool", title: detail.replace(/\.\.\.$/, ""), detail: toolName ? String(toolName) : undefined, state: "running" });
-      }
-      if (type === "tool.execute.after") {
-        if (!isTaskRunning()) return;
-        const state = props?.state ?? props?.part?.state;
-        if (state?.status === "error") {
-          setWorkingStatus("Corrigindo o que foi necessário...");
-        } else {
-          setWorkingStatus("Neko está trabalhando...");
-        }
-      }
-      // Some OpenCode versions expose live tool lifecycle through
-      // message.part.updated instead of tool.execute.before/after. Use the
-      // same Neko-facing status for both paths.
       if (type === "message.part.updated") {
         const part = props?.part;
         if (part?.type === "tool") {
           const state = part?.state ?? {};
+          const toolName = String(part.tool ?? "");
+          const callId = String(part.callID ?? part.callId ?? part.id ?? "");
+          const toolInput = state.input ?? part.input ?? {};
+          const detail = describeToolActivity(toolName, toolInput);
+
           if (state?.status === "running" && isTaskRunning()) {
-            setWorkingStatus(describeToolActivity(part.tool, state.input));
+            setWorkingStatus(detail);
           } else if (state?.status === "error" && isTaskRunning()) {
             setWorkingStatus("Corrigindo o que foi necessário...");
           } else if ((state?.status === "completed" || state?.status === "done" || state?.status === "success") && isTaskRunning()) {
             setWorkingStatus("Neko está trabalhando...");
+          }
+
+          if (toolName && (callId || isTaskRunning())) {
+            const toolItemId = callId ? `tool:${callId}` : `tool:${toolName}:${sessionIdRef.current || "current"}`;
+            let itemType: TimelineItemType = "status";
+            const toolLower = toolName.toLowerCase();
+            if (["edit", "write", "patch", "apply_patch", "multiedit"].some(n => toolLower.includes(n))) itemType = "edit";
+            else if (["read", "cat", "view", "grep", "search", "glob", "find", "ls", "list"].some(n => toolLower.includes(n))) itemType = "read";
+            else if (["bash", "shell", "terminal", "command", "exec", "run_command"].some(n => toolLower.includes(n))) {
+              const cmdLower = String(toolInput.command ?? toolInput.cmd ?? "").toLowerCase();
+              if (/\b(build|test|vitest|jest|tsc|lint|preview|check)\b/.test(cmdLower)) itemType = "validation";
+              else itemType = "command";
+            } else if (toolLower.includes("question")) itemType = "question";
+            else if (toolLower.includes("plan_exit")) itemType = "analysis";
+
+            const filePath = toolInput.filePath ?? toolInput.filepath ?? toolInput.path ?? toolInput.filename ?? toolInput.file;
+            const command = toolInput.command ?? toolInput.cmd;
+            const isError = state?.status === "error";
+            const isDone = state?.status === "completed" || state?.status === "done" || state?.status === "success";
+
+            upsertActivity({
+              id: toolItemId,
+              type: itemType,
+              icon: itemType === "edit" ? "file" : itemType === "command" ? "command" : itemType === "validation" ? "check" : "tool",
+              title: detail.replace(/\.\.\.$/, ""),
+              detail: sanitizeTimelineDetail(filePath ? displayPath(filePath) : (command || String(toolName))),
+              state: isError ? "error" : isDone ? "done" : "running",
+              completedAt: isDone || isError ? Date.now() : undefined
+            });
           }
         }
       }
@@ -4295,10 +4414,12 @@ function App() {
         const file = props?.file ?? props?.path ?? props?.file?.path ?? props?.filePath ?? "arquivo do projeto";
         if (isNekoInternalPath(file)) return;
         retryActiveRef.current = false;
-        // Vite/HMR and filesystem watchers update the file tree, never the
-        // task state: the status text only changes while the task is running.
-        if (isTaskRunning()) setWorkingStatus(`Criando/editando ${displayPath(file)}...`);
-        upsertActivity({ id: `file:${displayPath(file)}`, icon: "file", title: "Arquivo atualizado", detail: displayPath(file), state: "done" });
+        // File watcher and project changed update the tree/activeFile/recentProjects but DO NOT emit generic "Arquivo atualizado"
+        if (type === "file.edited" && isTaskRunning()) {
+          const cleanPath = displayPath(file);
+          setWorkingStatus(`Editando ${cleanPath}...`);
+          upsertActivity({ id: `file:edit:${cleanPath}`, icon: "file", title: `Editando ${cleanPath}`, detail: cleanPath, state: "done" });
+        }
         window.neko.tree().then(setTree).catch(() => {});
         setCodeChangedFile(displayPath(file));
         if (activeFile?.path === displayPath(file)) {
@@ -4307,10 +4428,14 @@ function App() {
         if (project) {
           touchRecentProject(project, true);
         }
-      }
-      if (type === "command.executed") {
-        retryActiveRef.current = false;
-        if (isTaskRunning()) setWorkingStatus("Verificando as alterações...");
+        const normFile = String(file).toLowerCase().replace(/\\/g, "/");
+        if (
+          normFile.includes("/pages/") || normFile.includes("/routes/") || normFile.includes("/views/") ||
+          normFile.includes("/screens/") || normFile.includes("neko-pages") || normFile.includes("router.") ||
+          normFile.includes("routes.") || normFile.endsWith("app.tsx") || normFile.endsWith("app.jsx")
+        ) {
+          void loadPreviewRoutes(true);
+        }
       }
       if (type === "permission.asked") {
         if (isTaskTerminal()) return;
@@ -4325,11 +4450,21 @@ function App() {
         setBusy(false);
         setWorkingStatus("Neko está aguardando sua aprovação");
         notifyOnce("approval", `per:${String(permission?.id || "ask")}`);
-        upsertActivity({ id: `permission:${permission.id}`, icon: "wait", title: "Aguardando sua autorização", detail: "O Neko precisa de acesso para continuar.", state: "running" });
+        upsertActivity({ id: `permission:${permission.id}`, type: "permission", icon: "wait", title: "Aguardando sua autorização", detail: sanitizeTimelineDetail(permission.permission || "O Neko precisa de acesso para continuar."), state: "running" });
       }
       if (type === "permission.replied") {
         const permission = props as any;
         if (permission?.id) {
+          const isApproved = permission?.response === "once" || permission?.response === "always" || permission?.response === "allow";
+          upsertActivity({
+            id: `permission:${permission.id}`,
+            type: "permission",
+            icon: isApproved ? "check" : "error",
+            title: isApproved ? "Acesso autorizado" : "Autorização recusada",
+            detail: isApproved ? "Autorização concedida" : "Autorização negada pelo usuário",
+            state: isApproved ? "done" : "error",
+            completedAt: Date.now()
+          });
           setPendingPermissions(prev => {
             const updated = prev.filter(p => p.id !== permission.id);
             // Only transition back to running if no more permissions are pending
@@ -4402,10 +4537,21 @@ function App() {
     });
     const unsubscribePreview = window.neko.onPreviewEvent((event) => {
       const props = event?.properties ?? {};
-      if (event?.type === "preview.output") {
+      if (event?.type === "preview.console") {
+        const rawLevel = props?.level;
+        const numeric = typeof rawLevel === "string" ? ({ verbose: 0, info: 1, warning: 2, warn: 2, error: 3 } as Record<string, number>)[rawLevel.toLowerCase()] ?? 1 : Number(rawLevel ?? 0);
+        const level: ConsoleLevel = numeric >= 3 ? "error" : numeric === 2 ? "warn" : numeric === 0 ? "debug" : "log";
+        const text = String(props?.message || "");
+        if (text) {
+          if (numeric >= 3) previewRuntimeErrorRef.current = text;
+          const sourceId = String(props?.sourceId || props?.url || "");
+          const line = Number(props?.line ?? props?.lineNumber) > 0 ? Number(props?.line ?? props?.lineNumber) : undefined;
+          pushConsoleEntry(level, text, shortConsoleSource(sourceId, line), sourceId || undefined);
+        }
+      } else if (event?.type === "preview.output") {
         const text = String(props?.text || "");
         if (text) {
-          const kind = props?.stream === "stderr" && /error|failed|fatal|exception|cannot|unable/i.test(text) ? "error" : "log";
+          const kind = props?.stream === "stderr" && /fatal error|uncaught exception|panic:/i.test(text) ? "error" : "log";
           appendTerminalLine(kind, text, props?.source || "Preview");
         }
       } else if (event?.type?.startsWith("preview.")) {
@@ -4450,7 +4596,11 @@ function App() {
         }
         if (["preview.exit", "preview.stopped", "preview.unsupported"].includes(event.type)) { setPreviewUrl(null); setPreviewFrameReady(false); setPreviewLoading(false); }
         if (["preview.starting", "preview.installing", "preview.detecting"].includes(event.type)) setPreviewLoading(true);
-        if (event.type === "preview.error") setPreviewLoading(false);
+        if (event.type === "preview.error") {
+          setPreviewLoading(false);
+          const text = String(props?.message || "Erro no Preview");
+          appendTerminalLine("error", text, "Preview");
+        }
         if (event.type === "preview.frame-error") {
           const errDesc = props.errorDescription || props.errorCode || "unknown";
           const errUrl = props.url || "";
@@ -5342,6 +5492,15 @@ function App() {
           console.log(`[Question] answer dispatched taskId=${result.taskId} questionId=${question.questionId}`);
         }
       }
+      upsertActivity({
+        id: `question:${question.questionId}`,
+        type: "question",
+        icon: "check",
+        title: "Informação respondida",
+        detail: sanitizeTimelineDetail(value),
+        state: "done",
+        completedAt: Date.now()
+      });
     } catch (error) {
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
@@ -5350,7 +5509,7 @@ function App() {
       setWorkingStatus("");
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
     }
-  }, [sessionId, pendingQuestion, selectedModel, getEffectiveModel, sanitizeUserFacingText]);
+  }, [sessionId, pendingQuestion, selectedModel, getEffectiveModel, sanitizeUserFacingText, upsertActivity, sanitizeTimelineDetail]);
 
   const rejectQuestion = React.useCallback(async (questionParam?: AgentQuestion | null) => {
     const question = questionParam || pendingQuestion;
@@ -5377,6 +5536,15 @@ function App() {
           currentTaskIdRef.current = String(result.taskId);
         }
       }
+      upsertActivity({
+        id: `question:${question.questionId}`,
+        type: "question",
+        icon: "check",
+        title: "Informação ignorada",
+        detail: "O Neko prosseguiu sem resposta",
+        state: "done",
+        completedAt: Date.now()
+      });
     } catch (error) {
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
@@ -5385,7 +5553,7 @@ function App() {
       setWorkingStatus("");
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
     }
-  }, [sessionId, pendingQuestion, selectedModel, getEffectiveModel, sanitizeUserFacingText]);
+  }, [sessionId, pendingQuestion, selectedModel, getEffectiveModel, sanitizeUserFacingText, upsertActivity]);
 
   const replyPermission = React.useCallback(async (response: "once" | "always" | "reject") => {
     if (!sessionId || pendingPermissions.length === 0) return;
@@ -5474,45 +5642,79 @@ function App() {
 
   const refreshGithubBranches = React.useCallback(async () => {
     if (!githubLinkStatus.initialized || githubBranchBusy || githubBranchRefreshing) return;
+    const currentRequestId = ++branchRefreshRequestIdRef.current;
     setGithubBranchRefreshing(true);
     setGithubBranchError("");
     try {
       const names = await window.neko.githubListBranches(githubLinkStatus.linkedRepo || "");
-      const filtered = Array.from(new Set(names.filter((name: string) => name && name !== "origin" && name !== "HEAD" && name !== "origin/HEAD")));
-      setGithubBranches(filtered.length ? filtered : [githubLinkStatus.branch || "main"]);
+      if (currentRequestId !== branchRefreshRequestIdRef.current) {
+        return;
+      }
+      const filtered = Array.from(new Set((names || []).filter((name: string) => name && name !== "origin" && name !== "HEAD" && name !== "origin/HEAD")));
+      setGithubBranches(prev => {
+        if (currentRequestId !== branchRefreshRequestIdRef.current) return prev;
+        const currentActive = githubLinkStatus.branch;
+        const merged = new Set<string>(filtered);
+        if (currentActive) merged.add(currentActive);
+        for (const p of prev) {
+          if (filtered.includes(p)) merged.add(p);
+        }
+        const result = Array.from(merged).sort((a, b) => a.localeCompare(b));
+        return result.length ? result : (currentActive ? [currentActive] : ["main"]);
+      });
     } catch (error) {
       console.warn("[GithubBranches] refresh failed", String((error as Error)?.message ?? error));
     } finally {
-      setGithubBranchRefreshing(false);
+      if (currentRequestId === branchRefreshRequestIdRef.current) {
+        setGithubBranchRefreshing(false);
+      }
     }
   }, [githubLinkStatus.initialized, githubLinkStatus.linkedRepo, githubLinkStatus.branch, githubBranchBusy, githubBranchRefreshing]);
 
   const chooseGithubBranch = React.useCallback(async (branch: string) => {
-    if (!branch || githubBranchBusy) return;
+    if (!branch || githubBranchBusy || githubBranchRefreshing) return;
+    if (githubLinkStatus.branch === branch) {
+      setGithubBranchMenuOpen(false);
+      return;
+    }
+
+    if (githubLinkStatus.dirty) {
+      setPendingTargetBranch(branch);
+      setBranchActionError("");
+      setGithubBranchMenuOpen(false);
+      setModal("branchChanges");
+      return;
+    }
+
     setGithubBranchBusy(true);
     setGithubBranchError("");
     setGithubBranchMenuOpen(false);
     try {
+      branchRefreshRequestIdRef.current++;
       await window.neko.githubCheckoutBranch(branch);
       const git = await window.neko.githubGitStatus();
       setGithubLinkStatus(git);
       if (git.branch) {
         setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
       }
+      showToast(`Alternado para a branch "${git.branch || branch}"`);
     } catch (error: any) {
-      setGithubBranchError(error?.message || `Erro ao trocar para branch "${branch}".`);
+      const errMsg = error?.message || `Erro ao trocar para branch "${branch}".`;
+      setGithubBranchError(errMsg);
+      showToast(errMsg);
       console.warn("[GithubBranch] checkout failed", String((error as Error)?.message ?? error));
     } finally {
       setGithubBranchBusy(false);
     }
-  }, [githubBranchBusy]);
+  }, [githubBranchBusy, githubBranchRefreshing, githubLinkStatus.dirty, githubLinkStatus.branch, showToast]);
 
   const createGithubBranch = React.useCallback(async (name: string) => {
     const trimmed = (name || "").trim();
-    if (!trimmed || githubBranchBusy) return;
+    if (!trimmed || githubBranchBusy || githubBranchRefreshing) return;
     setGithubBranchBusy(true);
     setGithubBranchError("");
     try {
+      branchRefreshRequestIdRef.current++;
       const baseBranch = githubLinkStatus.branch || undefined;
       await window.neko.githubCreateBranch(trimmed, baseBranch);
       const git = await window.neko.githubGitStatus();
@@ -5525,12 +5727,14 @@ function App() {
       setGithubBranchMenuOpen(false);
       showToast(`Branch "${git.branch || trimmed}" criada com sucesso!`);
     } catch (error: any) {
-      setGithubBranchError(error?.message || `Erro ao criar branch "${trimmed}".`);
+      const errMsg = error?.message || `Erro ao criar branch "${trimmed}".`;
+      setGithubBranchError(errMsg);
+      showToast(errMsg);
       console.warn("[GithubBranch] create failed", String((error as Error)?.message ?? error));
     } finally {
       setGithubBranchBusy(false);
     }
-  }, [githubBranchBusy, githubLinkStatus.branch, showToast]);
+  }, [githubBranchBusy, githubBranchRefreshing, githubLinkStatus.branch, showToast]);
 
   // ===== Modal functions =====
 
@@ -5901,15 +6105,23 @@ function App() {
     if (!pendingTargetBranch || branchActionBusy) return;
     setBranchActionBusy(true);
     setBranchActionError("");
+    const target = pendingTargetBranch;
     try {
+      branchRefreshRequestIdRef.current++;
       await window.neko.githubDiscardChanges();
-      await window.neko.githubCheckoutBranch(pendingTargetBranch);
+      await window.neko.githubCheckoutBranch(target);
       const git = await window.neko.githubGitStatus();
       setGithubLinkStatus(git);
+      if (git.branch) {
+        setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
+      }
       setModal(null);
       setPendingTargetBranch(null);
-    } catch (error) {
-      setBranchActionError(getUserFacingError(error, "Erro ao descartar e trocar de branch."));
+      showToast(`Alterações descartadas e alternado para "${git.branch || target}" com sucesso!`);
+    } catch (error: any) {
+      const errMsg = getUserFacingError(error, "Erro ao descartar e trocar de branch.");
+      setBranchActionError(errMsg);
+      showToast(errMsg);
       console.warn("[Branch] discard+checkout failed", String((error as Error)?.message ?? error));
     } finally {
       setBranchActionBusy(false);
@@ -5920,15 +6132,23 @@ function App() {
     if (!pendingTargetBranch || !branchCommitMessage.trim() || branchActionBusy) return;
     setBranchActionBusy(true);
     setBranchActionError("");
+    const target = pendingTargetBranch;
     try {
+      branchRefreshRequestIdRef.current++;
       await window.neko.githubCommitPush(branchCommitMessage.trim());
-      await window.neko.githubCheckoutBranch(pendingTargetBranch);
+      await window.neko.githubCheckoutBranch(target);
       const git = await window.neko.githubGitStatus();
       setGithubLinkStatus(git);
+      if (git.branch) {
+        setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
+      }
       setModal(null);
       setPendingTargetBranch(null);
-    } catch (error) {
-      setBranchActionError(getUserFacingError(error, "Erro ao salvar e trocar de branch."));
+      showToast(`Commit realizado e alternado para "${git.branch || target}" com sucesso!`);
+    } catch (error: any) {
+      const errMsg = getUserFacingError(error, "Erro ao salvar e trocar de branch.");
+      setBranchActionError(errMsg);
+      showToast(errMsg);
       console.warn("[Branch] commit+checkout failed", String((error as Error)?.message ?? error));
     } finally {
       setBranchActionBusy(false);
@@ -5983,14 +6203,33 @@ function App() {
   async function selectSupabaseProject(ref: string) {
     if (supabaseBusy) return;
     setSupabaseBusy(true);
+    setCopiedSupabaseOauth(false);
     try {
       await window.neko.supabaseSelectProject(ref);
       setSupabaseView("auto");
-    } catch (error) {
-      setSupabaseError(getUserFacingError(error, "Erro ao selecionar projeto."));
-      console.warn("[Supabase] selectProject failed", String((error as Error)?.message ?? error));
+    } catch (error: any) {
+      if (error?.cancelled || /cancelad[oa]/i.test(error?.message || "")) {
+        console.log("[Supabase] seleção de projeto cancelada pelo usuário.");
+      } else {
+        setSupabaseError(getUserFacingError(error, "Erro ao selecionar projeto."));
+        console.warn("[Supabase] selectProject failed", String((error as Error)?.message ?? error));
+      }
     } finally {
       setSupabaseBusy(false);
+      setCopiedSupabaseOauth(false);
+    }
+  }
+
+  async function cancelSupabaseAuth() {
+    try {
+      if ((window.neko as any)?.supabaseCancelAuth) {
+        await (window.neko as any).supabaseCancelAuth();
+      }
+    } catch (error) {
+      console.warn("[Supabase] cancelSupabaseAuth failed", String((error as Error)?.message ?? error));
+    } finally {
+      setSupabaseBusy(false);
+      setCopiedSupabaseOauth(false);
     }
   }
 
@@ -6140,13 +6379,18 @@ function App() {
   }
 
   // Preview Page Selector: discover routes of the ACTIVE project. Guarded to
-  // prevent concurrent scans and React re-render loops. Only setState when the
-  // list actually changed.
-  async function loadPreviewRoutes(force = false) {    if (!projectRef.current || previewRouteLoadingRef.current) return;
-    if (!force && previewRoutesProjectRef.current === projectRef.current && previewRoutes.length > 0) return;
+  // prevent concurrent scans, race conditions and React re-render loops. Only
+  // setState when the list actually changed.
+  async function loadPreviewRoutes(force = false) {
+    if (!projectRef.current) return;
+    const reqSeq = ++previewRoutesSeqRef.current;
+    const currentProject = projectRef.current;
+    if (!force && previewRoutesProjectRef.current === currentProject && previewRoutes.length > 0) return;
+    if (previewRouteLoadingRef.current && !force) return;
     previewRouteLoadingRef.current = true;
     try {
       const result = await window.neko.previewRoutes({ force });
+      if (reqSeq !== previewRoutesSeqRef.current) return;
       if (!result?.routes || result.projectPath !== projectRef.current) return;
       const next = result.routes.filter((r: any) => r && typeof r.path === "string").map((r: any) => ({ path: r.path, label: r.label ?? r.path }));
       previewRoutesProjectRef.current = result.projectPath;
@@ -6157,7 +6401,9 @@ function App() {
     } catch (error) {
       console.warn("[Preview Routes] load failed", String((error as Error)?.message ?? error));
     } finally {
-      previewRouteLoadingRef.current = false;
+      if (reqSeq === previewRoutesSeqRef.current) {
+        previewRouteLoadingRef.current = false;
+      }
     }
   }
 
@@ -6166,13 +6412,20 @@ function App() {
   // nunca consegue ficar acima de um WebContentsView; esconder a view é a
   // única forma estrutural do dropdown aparecer por cima do Preview.
   async function setPreviewRouteMenuOpen(open: boolean) {
+    if (!open) {
+      setPreviewSearchQuery("");
+      setPreviewRouteMenuFocus(-1);
+    }
     setPreviewRouteOpen(open);
   }
 
   async function openPreviewRouteMenu() {
     if (!previewRouteOpen) {
+      setPreviewSearchQuery("");
+      setPreviewRouteMenuFocus(0);
       await loadPreviewRoutes(true);
       await setPreviewRouteMenuOpen(true);
+      setTimeout(() => previewSearchInputRef.current?.focus(), 50);
     } else {
       await setPreviewRouteMenuOpen(false);
     }
@@ -6180,6 +6433,7 @@ function App() {
 
   async function goToPreviewRoute(routePath: string) {
     if (!routePath || !project) return;
+    setPreviewSearchQuery("");
     await setPreviewRouteMenuOpen(false);
     const normalized = routePath === "/" ? "/" : routePath.replace(/\/+$/, "") || "/";
     setPreviewCurrentRoute(normalized);
@@ -6227,23 +6481,51 @@ function App() {
         {previewRouteOpen && (
             <div className="preview-page-menu" role="listbox" aria-label="Páginas do projeto">
               <div className="preview-page-menu-label">Páginas do projeto</div>
-              {previewRoutes.length === 0 && <div className="preview-page-empty">Detectando páginas…</div>}
-              {previewRoutes.map((route, index) => (
-                <button
-                  key={route.path}
-                  role="option"
-                  aria-selected={route.path === previewCurrentRoute}
-                  className={`preview-page-item ${route.path === previewCurrentRoute ? "selected" : ""} ${previewRouteMenuFocus === index ? "hovered" : ""}`}
-                  onClick={() => void goToPreviewRoute(route.path)}
-                  onMouseEnter={() => setPreviewRouteMenuFocus(index)}
-                  tabIndex={-1}
-                >
-                  <span className="preview-page-check">{route.path === previewCurrentRoute ? <Check size={13}/> : null}</span>
-                  <span className="preview-page-item-text">{route.label}</span>
-                  {route.path !== "/" && <span className="preview-page-item-path">{route.path}</span>}
-                </button>
-                  ))}
+              <div className="preview-page-search-wrap">
+                <Search size={12} className="preview-page-search-icon" />
+                <input
+                  ref={previewSearchInputRef}
+                  type="text"
+                  className="preview-page-search"
+                  placeholder="Pesquisar páginas..."
+                  aria-label="Pesquisar páginas"
+                  value={previewSearchQuery}
+                  onChange={(e) => {
+                    setPreviewSearchQuery(e.target.value);
+                    setPreviewRouteMenuFocus(0);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      void setPreviewRouteMenuOpen(false);
+                    }
+                  }}
+                />
               </div>
+              <div className="preview-page-list">
+                {filteredPreviewRoutes.length === 0 && (
+                  <div className="preview-page-empty">
+                    {previewSearchQuery.trim() ? "Nenhuma página encontrada" : "Detectando páginas…"}
+                  </div>
+                )}
+                {filteredPreviewRoutes.map((route, index) => (
+                  <button
+                    key={route.path}
+                    role="option"
+                    aria-selected={route.path === previewCurrentRoute}
+                    className={`preview-page-item ${route.path === previewCurrentRoute ? "selected" : ""} ${previewRouteMenuFocus === index ? "hovered" : ""}`}
+                    onClick={() => void goToPreviewRoute(route.path)}
+                    onMouseEnter={() => setPreviewRouteMenuFocus(index)}
+                    tabIndex={-1}
+                  >
+                    <span className="preview-page-check">{route.path === previewCurrentRoute ? <Check size={13}/> : null}</span>
+                    <span className="preview-page-item-text">{route.label}</span>
+                    {route.path !== "/" && <span className="preview-page-item-path">{route.path}</span>}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
       </div>
     );
@@ -6272,7 +6554,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.91"}</span>
+                  <span>Versão {appVersion || "0.4.92"}</span>
                 </div>
                 <button
                   type="button"
@@ -6827,22 +7109,22 @@ function App() {
                   }
                 }}
                 disabled={githubBranchBusy}
-                title={`Branch atual: ${githubLinkStatus.branch || "main"}`}
+                title={githubLinkStatus.branch ? `Branch atual: ${githubLinkStatus.branch}` : githubLinkStatus.initialized ? "HEAD destacada (sem branch ativa)" : "Repositório não inicializado"}
               >
                 {githubBranchBusy ? <Loader2 size={13} className="spin"/> : <GitBranch size={13}/>}
-                <span className="top-branch-name">{githubLinkStatus.branch || "main"}</span>
-                <ChevronDown size={13}/>
+                <span className="top-branch-name">{githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")}</span>
+                {githubBranchRefreshing ? <Loader2 size={11} className="spin" style={{ opacity: 0.7 }} /> : <ChevronDown size={13}/>}
               </button>
               {githubBranchMenuOpen ? <div className="top-branch-menu">
                 <div className="top-branch-list">
-                  {Array.from(new Set(githubBranches.length ? githubBranches : [githubLinkStatus.branch || "main"])).map(branch =>
+                  {Array.from(new Set(githubBranches.length ? githubBranches : [githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")])).map(branch =>
                     <button
                       key={branch}
-                      disabled={githubBranchBusy}
-                      className={`top-branch-item ${branch === githubLinkStatus.branch ? "active" : ""}`}
-                      onClick={() => { if (!githubBranchBusy) void chooseGithubBranch(branch); }}
+                      disabled={githubBranchBusy || githubBranchRefreshing}
+                      className={`top-branch-item ${branch === (githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")) ? "active" : ""}`}
+                      onClick={() => { if (!githubBranchBusy && !githubBranchRefreshing && branch !== "HEAD destacada") void chooseGithubBranch(branch); }}
                     >
-                      {branch === githubLinkStatus.branch ? <Check size={12}/> : <span className="branch-placeholder"/>}
+                      {branch === (githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")) ? <Check size={12}/> : <span className="branch-placeholder"/>}
                       <span>{branch}</span>
                       {githubBranchBusy && branch !== githubLinkStatus.branch ? <Loader2 size={10} className="spin branch-item-spin"/> : null}
                     </button>
@@ -6853,7 +7135,7 @@ function App() {
                 {!isCreatingBranch ? (
                   <button
                     className="top-branch-create-btn"
-                    disabled={githubBranchBusy}
+                    disabled={githubBranchBusy || githubBranchRefreshing}
                     onClick={() => {
                       setIsCreatingBranch(true);
                       setNewBranchInput("");
@@ -6866,7 +7148,7 @@ function App() {
                 ) : (
                   <div className="top-branch-create-panel" onClick={e => e.stopPropagation()}>
                     <div className="top-branch-create-origin">
-                      Origem: <b>{githubLinkStatus.branch || "main"}</b>
+                      Origem: <b>{githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")}</b>
                     </div>
                     <input
                       type="text"
@@ -6874,7 +7156,7 @@ function App() {
                       placeholder="Nome da nova branch..."
                       value={newBranchInput}
                       autoFocus
-                      disabled={githubBranchBusy}
+                      disabled={githubBranchBusy || githubBranchRefreshing}
                       onChange={e => setNewBranchInput(e.target.value)}
                       onKeyDown={e => {
                         if (e.key === "Enter") {
@@ -6891,7 +7173,7 @@ function App() {
                       <button
                         type="button"
                         className="top-branch-cancel-btn"
-                        disabled={githubBranchBusy}
+                        disabled={githubBranchBusy || githubBranchRefreshing}
                         onClick={() => {
                           setIsCreatingBranch(false);
                           setNewBranchInput("");
@@ -6902,7 +7184,7 @@ function App() {
                       <button
                         type="button"
                         className="top-branch-confirm-btn"
-                        disabled={githubBranchBusy || !newBranchInput.trim()}
+                        disabled={githubBranchBusy || githubBranchRefreshing || !newBranchInput.trim()}
                         onClick={() => void createGithubBranch(newBranchInput)}
                       >
                         {githubBranchBusy ? <Loader2 size={12} className="spin"/> : "Criar"}
@@ -7740,15 +8022,16 @@ function App() {
         <div className="modal-search-wrap"><Search size={15}/><input className="modal-search" value={modelSearch} onChange={e => setModelSearch(e.target.value)} placeholder="Buscar modelos" autoFocus/></div>
         <div className="modal-scroll-body models-scroll-body">
           {managedModelGroups.length ? managedModelGroups.map(group => {
-            const provider = connectedProviders.find(p => p.id === group.providerID);
-            const isEnabled = provider ? provider.enabled : true;
+            const provider = providers.find(p => p.id === group.providerID);
+            const isConnected = Boolean(provider?.connected);
+            const isEnabled = isConnected && Boolean(provider?.enabled);
             const isSearching = modelSearch.trim().length > 0;
             const isExpanded = isSearching || expandedManagedProviders.has(group.providerID);
             const availableCount = group.models.length;
             const activeCount = group.models.filter((m: Model) => m.enabled).length;
             const pricingLabel = getProviderPricingLabel(group.models);
 
-            return <section className={`model-provider-card ${isEnabled ? "" : "disabled"} ${isExpanded ? "expanded" : "collapsed"}`} key={group.providerID}>
+            return <section className={`model-provider-card ${!isConnected ? "unconfigured" : isEnabled ? "" : "disabled"} ${isExpanded ? "expanded" : "collapsed"}`} key={group.providerID}>
               <div
                 className="model-provider-title accordion-title"
                 role="button"
@@ -7780,12 +8063,12 @@ function App() {
                       <b>{group.providerName}</b>
                       <span className={`provider-pricing-tag ${pricingLabel === "Grátis" ? "free" : pricingLabel === "Pago" ? "paid" : "mixed"}`}>{pricingLabel}</span>
                     </div>
-                    <small>{availableCount} {availableCount === 1 ? "modelo disponível" : "modelos disponíveis"} • {activeCount} {activeCount === 1 ? "ativo" : "ativos"}</small>
+                    <small>{availableCount} {availableCount === 1 ? "modelo disponível" : "modelos disponíveis"}{isConnected ? ` • ${activeCount} ${activeCount === 1 ? "ativo" : "ativos"}` : ""}</small>
                   </div>
                 </div>
                 <div className="model-provider-controls" onClick={e => e.stopPropagation()}>
-                  <span className={`provider-status ${isEnabled ? "active" : "off"}`}>{isEnabled ? "Ativo" : "Desativado"}</span>
-                  {provider ? (
+                  <span className={`provider-status ${isConnected ? (isEnabled ? "active" : "off") : "unconfigured"}`}>{isConnected ? (isEnabled ? "Ativo" : "Desativado") : "Não conectado"}</span>
+                  {isConnected && provider ? (
                     <button
                       className={`toggle provider-toggle ${isEnabled ? "on" : ""}`}
                       aria-pressed={isEnabled}
@@ -7819,10 +8102,12 @@ function App() {
                           <span>{m.modelID}</span>
                         </div>
                         <button
-                          className={`toggle ${m.enabled ? "on" : ""}`}
-                          aria-pressed={m.enabled}
+                          className={`toggle ${m.enabled && isConnected ? "on" : ""}`}
+                          aria-pressed={m.enabled && isConnected}
+                          disabled={!isConnected}
                           onClick={async (e) => {
                             e.stopPropagation();
+                            if (!isConnected) return;
                             try {
                               const result = await window.neko.setModelEnabled(m.providerID, m.modelID, !m.enabled);
                               setModels(result.models || []);
@@ -7833,7 +8118,7 @@ function App() {
                         ><i/></button>
                       </div>
                     );
-                  }) : <div className="provider-disabled-message">{!isEnabled ? "Este provider está desativado. Ative-o para disponibilizar seus modelos." : "Este provedor está conectado, mas não possui modelos de texto/chat compatíveis com o NekoAI."}</div>}
+                  }) : <div className="provider-disabled-message">{!isConnected ? "Este provedor não está conectado. Conecte-o para gerenciar seus modelos." : !isEnabled ? "Este provider está desativado. Ative-o para disponibilizar seus modelos." : "Este provedor está conectado, mas não possui modelos de texto/chat compatíveis com o NekoAI."}</div>}
                 </div>
               )}
             </section>;
@@ -7880,46 +8165,54 @@ function App() {
             </div>
           </section> : null}
 
-          {/* 2. Modelos gratuitos */}
-          {availableFreeModels.length ? <section className="provider-section provider-free-models-section">
-            <div className="provider-section-title"><span>Modelos gratuitos</span><small>Modelos gratuitos disponíveis para conexão</small></div>
+          {/* 2. Provedores gratuitos */}
+          {freeProviderList.length ? <section className="provider-section provider-free-section">
+            <div className="provider-section-title"><span>Provedores gratuitos</span><small>Provedores 100% gratuitos disponíveis para conexão</small></div>
             <div className="provider-list">
-              {availableFreeModels.map(m => {
-                const parentProvider = providers.find(p => p.id === m.providerID);
+              {freeProviderList.map(p => (
+                <div className="provider-line" key={p.id}>
+                  <button className="provider-line-main" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}>
+                    <span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span>
+                    <div className="provider-line-info">
+                      <div className="provider-line-title">
+                        <b>{p.name}</b>
+                        <span className="provider-pricing-tag free">Grátis</span>
+                      </div>
+                      <small>{p.id}</small>
+                    </div>
+                  </button>
+                  <div className="provider-line-actions">
+                    <button className="provider-connect-action" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}>
+                      <Link2 size={13}/> Conectar
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section> : null}
+
+          {/* 3. Mais populares */}
+          {popularProviderList.length ? <section className="provider-section provider-popular">
+            <div className="provider-section-title"><span>Mais populares</span><small>Conecte rapidamente os providers mais usados</small></div>
+            <div className="provider-list">
+              {popularProviderList.map(p => {
+                const pricingLabel = getProviderPricingLabel(p.models);
                 return (
-                  <div className="provider-line free-model-line" key={`${m.providerID}:${m.modelID}`}>
-                    <button
-                      className="provider-line-main"
-                      onClick={() => {
-                        if (parentProvider) {
-                          setSelectedProvider(parentProvider);
-                          setApiKey("");
-                          setAuthError("");
-                          setModal("providerAuth");
-                        }
-                      }}
-                    >
-                      <span className="provider-line-icon"><ProviderIcon id={m.providerID} size={19}/></span>
+                  <div className="provider-line" key={p.id}>
+                    <button className="provider-line-main" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}>
+                      <span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span>
                       <div className="provider-line-info">
                         <div className="provider-line-title">
-                          <b>{m.name}</b>
-                          <span className="model-tag free">Gratuito</span>
+                          <b>{p.name}</b>
+                          <span className={`provider-pricing-tag ${pricingLabel === "Grátis" ? "free" : pricingLabel === "Pago" ? "paid" : "mixed"}`}>{pricingLabel}</span>
                         </div>
-                        <small>{m.providerName} • {m.modelID}</small>
+                        <small>{p.id}</small>
                       </div>
                     </button>
                     <div className="provider-line-actions">
-                      <button
-                        className="provider-connect-action"
-                        onClick={() => {
-                          if (parentProvider) {
-                            setSelectedProvider(parentProvider);
-                            setApiKey("");
-                            setAuthError("");
-                            setModal("providerAuth");
-                          }
-                        }}
-                      ><Link2 size={13}/> Conectar</button>
+                      <button className="provider-connect-action" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}>
+                        <Link2 size={13}/> Conectar
+                      </button>
                     </div>
                   </div>
                 );
@@ -7927,27 +8220,34 @@ function App() {
             </div>
           </section> : null}
 
-          {/* 3. Mais populares */}
-          {popularProviders.filter(p => !p.connected && filteredProviders.some(x => x.id === p.id)).length ? <section className="provider-section provider-popular">
-            <div className="provider-section-title"><span>Mais populares</span><small>Conecte rapidamente os providers mais usados</small></div>
-            <div className="provider-list">
-              {popularProviders.filter(p => !p.connected && filteredProviders.some(x => x.id === p.id)).map(p => <div className="provider-line" key={p.id}>
-                <button className="provider-line-main" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}><span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span><span><b>{p.name}</b><small>{p.id}</small></span></button>
-                <div className="provider-line-actions"><button className="provider-connect-action" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}><Link2 size={13}/> Conectar</button></div>
-              </div>)}
-            </div>
-          </section> : null}
-
           {/* 4. Outros providers */}
-          <section className="provider-section">
+          {otherProviderList.length ? <section className="provider-section provider-others-section">
             <div className="provider-section-title"><span>Outros providers</span><small>Todos os providers disponíveis para conexão</small></div>
             <div className="provider-list">
-              {otherProviders.map(p => <div className="provider-line" key={p.id}>
-                <button className="provider-line-main" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}><span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span><span><b>{p.name}</b><small>{p.id}</small></span></button>
-                <div className="provider-line-actions"><button className="provider-connect-action" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}><Link2 size={13}/> Conectar</button></div>
-              </div>)}
+              {otherProviderList.map(p => {
+                const pricingLabel = getProviderPricingLabel(p.models);
+                return (
+                  <div className="provider-line" key={p.id}>
+                    <button className="provider-line-main" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}>
+                      <span className="provider-line-icon"><ProviderIcon id={p.id} size={19}/></span>
+                      <div className="provider-line-info">
+                        <div className="provider-line-title">
+                          <b>{p.name}</b>
+                          <span className={`provider-pricing-tag ${pricingLabel === "Grátis" ? "free" : pricingLabel === "Pago" ? "paid" : "mixed"}`}>{pricingLabel}</span>
+                        </div>
+                        <small>{p.id}</small>
+                      </div>
+                    </button>
+                    <div className="provider-line-actions">
+                      <button className="provider-connect-action" onClick={() => { setSelectedProvider(p); setApiKey(""); setAuthError(""); setModal("providerAuth"); }}>
+                        <Link2 size={13}/> Conectar
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-          </section>
+          </section> : null}
         </div>
       </>}
 
@@ -8637,14 +8937,17 @@ function App() {
             </div>
             <button
               className="close-btn"
-              disabled={supabaseBusy}
               onClick={() => {
                 console.log("[SupabaseUI] closing modal");
+                if (supabaseBusy || supabaseState.status === "authorizing") {
+                  void cancelSupabaseAuth();
+                }
                 setModal(null);
                 setSupabaseView("auto");
                 setSupabaseError("");
                 setNewSupabaseProjectError("");
                 setNewSupabaseProjectStructuredError(null);
+                setCopiedSupabaseOauth(false);
               }}
               aria-label="Fechar"
             >
@@ -8659,7 +8962,7 @@ function App() {
                 {supabaseState.status === "checking"
                   ? "Preparando integração"
                   : supabaseState.status === "authorizing"
-                  ? "Conclua a autorização no navegador"
+                  ? (supabaseState.oauthUrl ? "Conclua a autorização no navegador" : "Iniciando autorização")
                   : supabaseState.status === "verifying"
                   ? "Verificando autorização"
                   : supabaseState.status === "selecting"
@@ -8674,7 +8977,11 @@ function App() {
                 {supabaseState.status === "checking"
                   ? "Verificando o Supabase CLI."
                   : supabaseState.status === "authorizing"
-                  ? "O navegador oficial foi aberto para autorizar o OpenCode no Supabase."
+                  ? (supabaseState.oauthUrl
+                      ? (supabaseState.oauthOpened
+                          ? "O navegador oficial foi aberto para autorizar o OpenCode no Supabase. Se a página não abriu automaticamente, use os botões abaixo:"
+                          : "Link de autorização pronto. Abra no navegador para autorizar o OpenCode:")
+                      : "Obtendo link de autorização do OpenCode no Supabase...")
                   : supabaseState.status === "verifying"
                   ? "Confirmando as credenciais e status de conexão do MCP no OpenCode."
                   : supabaseState.status === "selecting"
@@ -8685,6 +8992,52 @@ function App() {
                   ? "O NekoAI está configurando o SDK, o ambiente e as ferramentas do OpenCode."
                   : "Aguarde a conclusão da operação."}
               </span>
+
+              {supabaseState.status === "authorizing" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14, width: "100%", maxWidth: 360, alignItems: "center" }}>
+                  {supabaseState.oauthUrl && (
+                    <div style={{ display: "flex", gap: 8, width: "100%", justifyContent: "center" }}>
+                      <button
+                        type="button"
+                        className="primary btn-sm"
+                        style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                        onClick={() => {
+                          if (supabaseState.oauthUrl && (window.neko as any)?.openExternal) {
+                            void (window.neko as any).openExternal(supabaseState.oauthUrl);
+                          }
+                        }}
+                      >
+                        <ExternalLink size={14}/>
+                        Abrir no navegador
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary btn-sm"
+                        style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+                        onClick={() => {
+                          if (supabaseState.oauthUrl) {
+                            navigator.clipboard.writeText(supabaseState.oauthUrl).then(() => {
+                              setCopiedSupabaseOauth(true);
+                              setTimeout(() => setCopiedSupabaseOauth(false), 2500);
+                            }).catch(() => {});
+                          }
+                        }}
+                      >
+                        {copiedSupabaseOauth ? <Check size={14} color="#10b981"/> : <Copy size={14}/>}
+                        {copiedSupabaseOauth ? "Copiado!" : "Copiar link"}
+                      </button>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="secondary btn-sm"
+                    style={{ color: "var(--text-muted)", fontSize: "0.82rem" }}
+                    onClick={() => void cancelSupabaseAuth()}
+                  >
+                    Cancelar autorização
+                  </button>
+                </div>
+              )}
             </div>
           ) : effectiveSupabaseView === "create" ? (
             <form className="modal-scroll-body supabase-project-list" onSubmit={e => void createSupabaseProject(e)}>

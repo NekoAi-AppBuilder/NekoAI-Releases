@@ -29,6 +29,7 @@ export class SupabaseManager extends EventEmitter {
   private isBusy = false;
   private currentAccessToken: string | null = null;
   private initPromise: Promise<void> | null = null;
+  private activeOAuthAbortController: AbortController | null = null;
 
   constructor(vault?: SupabaseVaultManager, cli?: SupabaseCli) {
     super();
@@ -52,6 +53,24 @@ export class SupabaseManager extends EventEmitter {
 
   public setProgress(status: SupabaseStatus, error: string | null = null) {
     this.setState({ status, error });
+  }
+
+  public async cancelOAuth(): Promise<SupabaseState> {
+    console.log("[SupabaseManager] cancelOAuth solicitado pelo usuário");
+    if (this.activeOAuthAbortController) {
+      this.activeOAuthAbortController.abort();
+      this.activeOAuthAbortController = null;
+    }
+    this.cli.cancelActiveOAuth();
+    this.isBusy = false;
+    this.setState({
+      status: "disconnected",
+      oauthUrl: null,
+      oauthOpened: false,
+      error: null,
+      structuredError: null,
+    });
+    return this.getState();
   }
 
   public async initialize(): Promise<void> {
@@ -402,16 +421,61 @@ export class SupabaseManager extends EventEmitter {
 
       // 2) Fluxo OAuth nativo do OpenCode
       this.setProgress("authorizing");
+      this.activeOAuthAbortController = new AbortController();
+      const oauthSignal = this.activeOAuthAbortController.signal;
+
       try {
         await this.cli.authenticateOpenCodeSupabase(
           projectPath,
           ref,
-          options?.log,
-          (status) => this.setProgress(status)
+          {
+            onLog: options?.log,
+            onProgress: (status, url, opened) => {
+              if (status === "authorizing") {
+                this.setState({
+                  status: "authorizing",
+                  oauthUrl: url ?? this.state.oauthUrl,
+                  oauthOpened: opened ?? this.state.oauthOpened ?? false,
+                  error: null,
+                });
+              } else {
+                this.setState({
+                  status,
+                  oauthUrl: null,
+                  oauthOpened: false,
+                  error: null,
+                });
+              }
+            },
+            openExternal: async (url: string) => {
+              try {
+                const electron = require("electron");
+                if (electron?.shell?.openExternal) {
+                  await electron.shell.openExternal(url);
+                }
+              } catch (err) {
+                console.warn("[Neko/Supabase] Aviso ao abrir navegador automaticamente:", err);
+              }
+            },
+            signal: oauthSignal,
+          }
         );
-      } catch (oauthErr) {
+      } catch (oauthErr: any) {
+        if (oauthSignal.aborted || /cancelad[oa]/i.test(oauthErr?.message || "")) {
+          this.setState({
+            status: "disconnected",
+            oauthUrl: null,
+            oauthOpened: false,
+            error: null,
+          });
+          const cancelErr = new Error("A autorização do Supabase foi cancelada pelo usuário.");
+          (cancelErr as any).cancelled = true;
+          throw cancelErr;
+        }
         options?.log?.(`Aviso OAuth OpenCode: ${oauthErr instanceof Error ? oauthErr.message : String(oauthErr)}`);
         throw oauthErr;
+      } finally {
+        this.activeOAuthAbortController = null;
       }
 
       if (this.activeProjectPath !== projectPath) {

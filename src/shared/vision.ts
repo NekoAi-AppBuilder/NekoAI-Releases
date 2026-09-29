@@ -15,26 +15,129 @@ export type VisionCapabilities = {
   imageInput: boolean;
 };
 
+export type VisionFallbackTarget = {
+  providerID: string;
+  modelID: string;
+  name: string;
+  reason?: string;
+};
+
 // The dedicated Vision Fallback model. FREE tier only — this list must never
 // contain a paid model (no GPT/Claude/Gemini/Kimi/MiniMax paid fallback).
-// The real catalog ID of "OpenCode Zen" in OpenCode 1.18.x is `opencode`
-// (not `opencode-zen`). Resolution checks the candidates in order against
-// the provider catalog cache, so older/newer catalogs keep working.
-export const VISION_FALLBACK_MODEL = {
+// The active catalog ID of "OpenCode Zen" in OpenCode 1.18.x is `opencode`
+// with model `mimo-v2.6-flash-free`.
+export const VISION_FALLBACK_MODEL: VisionFallbackTarget = {
   providerID: "opencode",
-  modelID: "mimo-v2.5-free",
-  name: "MiMo V2.5 Free"
+  modelID: "mimo-v2.6-flash-free",
+  name: "MiMo-V2.6-Flash Free"
 };
 
 export const VISION_FALLBACK_PROVIDER_CANDIDATES = ["opencode", "opencode-zen"];
 
+export const VISION_FALLBACK_MODEL_CANDIDATES = [
+  "mimo-v2.6-flash-free",
+  "longcat-2.5-preview-free",
+  "space-bunny-free",
+  "muse-spark-1.3-contributor-free"
+];
+
 export const VISION_SUPPORTED_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 
-// Explicitly-known models. Keys are lowercase "providerID:modelID".
+// Explicitly-known models with vision support in OpenCode Zen. Keys are lowercase "providerID:modelID".
 const VISION_OVERRIDES: Record<string, VisionCapabilities> = {
-  "opencode:mimo-v2.5-free": { textInput: true, imageInput: true },
-  "opencode-zen:mimo-v2.5-free": { textInput: true, imageInput: true }
+  "opencode:mimo-v2.6-flash-free": { textInput: true, imageInput: true },
+  "opencode:longcat-2.5-preview-free": { textInput: true, imageInput: true },
+  "opencode:space-bunny-free": { textInput: true, imageInput: true },
+  "opencode:muse-spark-1.3-contributor-free": { textInput: true, imageInput: true },
+  "opencode-zen:mimo-v2.6-flash-free": { textInput: true, imageInput: true },
+  "opencode-zen:longcat-2.5-preview-free": { textInput: true, imageInput: true },
+  "opencode-zen:space-bunny-free": { textInput: true, imageInput: true },
+  "opencode-zen:muse-spark-1.3-contributor-free": { textInput: true, imageInput: true }
 };
+
+export function resolveVisionFallbackTarget(
+  catalogCache?: Map<string, { attachment?: boolean; connected?: boolean; enabled?: boolean; name?: string }> | Record<string, any>,
+  options?: {
+    connectedProviders?: Set<string>;
+  }
+): VisionFallbackTarget | null {
+  // If catalogCache is completely omitted (undefined), return baseline fallback model
+  if (catalogCache === undefined) {
+    return { ...VISION_FALLBACK_MODEL };
+  }
+
+  const isConnected = (pid: string): boolean => {
+    if (!options?.connectedProviders) return true;
+    return options.connectedProviders.has(pid);
+  };
+
+  const getEntry = (key: string): { attachment?: boolean; name?: string } | undefined => {
+    if (catalogCache && typeof (catalogCache as any).get === "function") {
+      return (catalogCache as Map<string, any>).get(key);
+    }
+    if (catalogCache && typeof catalogCache === "object") {
+      return (catalogCache as Record<string, any>)[key];
+    }
+    return undefined;
+  };
+
+  const getEntries = (): Array<[string, { attachment?: boolean; name?: string }]> => {
+    if (catalogCache && typeof (catalogCache as any).entries === "function") {
+      return Array.from((catalogCache as Map<string, any>).entries());
+    }
+    if (catalogCache && typeof catalogCache === "object") {
+      return Object.entries(catalogCache);
+    }
+    return [];
+  };
+
+  const allEntries = getEntries();
+  if (allEntries.length === 0) {
+    return null;
+  }
+
+  // 1. Try preferred candidates in order
+  for (const provider of VISION_FALLBACK_PROVIDER_CANDIDATES) {
+    if (!isConnected(provider)) continue;
+
+    for (const modelId of VISION_FALLBACK_MODEL_CANDIDATES) {
+      const key = `${provider}:${modelId}`;
+      const entry = getEntry(key);
+      if (entry) {
+        const capabilities = getModelCapabilities(provider, modelId, entry);
+        if (capabilities.imageInput && entry.attachment !== false) {
+          return {
+            providerID: provider,
+            modelID: modelId,
+            name: entry.name || modelId
+          };
+        }
+      }
+    }
+  }
+
+  // 2. Search any other model under candidate providers that has imageInput === true
+  for (const provider of VISION_FALLBACK_PROVIDER_CANDIDATES) {
+    if (!isConnected(provider)) continue;
+
+    for (const [key, entry] of allEntries) {
+      const [p, ...mParts] = key.split(":");
+      const m = mParts.join(":");
+      if (p === provider && m) {
+        const capabilities = getModelCapabilities(p, m, entry);
+        if (capabilities.imageInput && entry.attachment !== false) {
+          return {
+            providerID: p,
+            modelID: m,
+            name: entry.name || m
+          };
+        }
+      }
+    }
+  }
+
+  return null;
+}
 
 export function getModelCapabilities(
   providerID: string | undefined,

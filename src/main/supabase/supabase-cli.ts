@@ -19,6 +19,22 @@ export function sanitizeLog(text: string): string {
     .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/gi, "[REDACTED_JWT]");
 }
 
+export function extractOAuthUrl(text: string): string | null {
+  if (!text || typeof text !== "string") return null;
+  const clean = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+  const matches = clean.match(/https?:\/\/[^\s"'<>\`\)]+/gi);
+  if (!matches) return null;
+  for (const urlStr of matches) {
+    try {
+      const parsed = new URL(urlStr);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+        return parsed.toString();
+      }
+    } catch {}
+  }
+  return null;
+}
+
 export function parseSupabaseError(rawError: any): SupabaseStructuredError {
   let text = "";
   if (typeof rawError === "string") {
@@ -333,6 +349,7 @@ export function hasConnectedMcp(output: string, mcpName: string): boolean {
 
 export class SupabaseCli {
   private activeProcesses = new Set<ChildProcess>();
+  private activeOAuthChild: ChildProcess | null = null;
   private isShuttingDown = false;
   private cliQueue: Promise<any> = Promise.resolve();
   private detectedVersion: string | null = null;
@@ -342,6 +359,14 @@ export class SupabaseCli {
   constructor(customFetch?: typeof fetch) {
     if (customFetch) {
       this.customFetch = customFetch;
+    }
+  }
+
+  public cancelActiveOAuth(): void {
+    if (this.activeOAuthChild) {
+      console.log("[Neko/SupabaseCLI] Cancelando processo ativo de OAuth do OpenCode.");
+      this.terminate(this.activeOAuthChild);
+      this.activeOAuthChild = null;
     }
   }
 
@@ -504,10 +529,30 @@ export class SupabaseCli {
   public runOpenCodeMcp(
     args: string[],
     cwd: string,
-    timeoutMs: number = 60000
+    optionsOrTimeout:
+      | number
+      | {
+          timeoutMs?: number;
+          signal?: AbortSignal;
+          onUrlDetected?: (url: string) => void;
+          isOAuth?: boolean;
+        } = 60000
   ): Promise<{ code: number; stdout: string; stderr: string; output: string }> {
     if (this.isShuttingDown) {
       return Promise.reject(new Error("OpenCode CLI indisponível no momento."));
+    }
+
+    const options =
+      typeof optionsOrTimeout === "number"
+        ? { timeoutMs: optionsOrTimeout }
+        : optionsOrTimeout || {};
+    const timeoutMs = options.timeoutMs ?? 60000;
+    const signal = options.signal;
+    const onUrlDetected = options.onUrlDetected;
+    const isOAuth = options.isOAuth ?? false;
+
+    if (signal?.aborted) {
+      return Promise.reject(new Error("A operação do OpenCode MCP foi cancelada pelo usuário."));
     }
 
     const executable = getOpenCodeExecutable();
@@ -530,6 +575,10 @@ export class SupabaseCli {
       }
 
       this.activeProcesses.add(child);
+      if (isOAuth) {
+        this.activeOAuthChild = child;
+      }
+
       let stdout = "";
       let stderr = "";
       let settled = false;
@@ -541,10 +590,25 @@ export class SupabaseCli {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (abortHandler && signal) {
+          signal.removeEventListener("abort", abortHandler);
+        }
         this.activeProcesses.delete(child);
+        if (this.activeOAuthChild === child) {
+          this.activeOAuthChild = null;
+        }
         if (error) reject(error);
         else resolve(result || { code: 0, stdout: "", stderr: "", output: "" });
       };
+
+      const abortHandler = () => {
+        this.terminate(child);
+        finish(new Error("A operação do OpenCode MCP foi cancelada pelo usuário."));
+      };
+
+      if (signal) {
+        signal.addEventListener("abort", abortHandler, { once: true });
+      }
 
       const timer = setTimeout(() => {
         this.terminate(child);
@@ -552,11 +616,25 @@ export class SupabaseCli {
       }, timeoutMs);
 
       child.stdout?.on("data", (chunk) => {
-        stdout = `${stdout}${chunk.toString("utf8")}`.slice(-512000);
+        const text = chunk.toString("utf8");
+        stdout = `${stdout}${text}`.slice(-512000);
+        if (onUrlDetected) {
+          const url = extractOAuthUrl(text);
+          if (url) {
+            onUrlDetected(url);
+          }
+        }
       });
 
       child.stderr?.on("data", (chunk) => {
-        stderr = `${stderr}${chunk.toString("utf8")}`.slice(-512000);
+        const text = chunk.toString("utf8");
+        stderr = `${stderr}${text}`.slice(-512000);
+        if (onUrlDetected) {
+          const url = extractOAuthUrl(text);
+          if (url) {
+            onUrlDetected(url);
+          }
+        }
       });
 
       child.once("error", (error) => finish(error));
@@ -596,13 +674,37 @@ export class SupabaseCli {
   public async authenticateOpenCodeSupabase(
     projectPath: string,
     projectRef: string,
-    onLog?: (msg: string) => void,
-    onProgress?: (status: "authorizing" | "verifying") => void
+    optionsOrOnLog?:
+      | ((msg: string) => void)
+      | {
+          onLog?: (msg: string) => void;
+          onProgress?: (status: "authorizing" | "verifying", url?: string | null, opened?: boolean) => void;
+          openExternal?: (url: string) => Promise<void>;
+          signal?: AbortSignal;
+        },
+    onProgressLegacy?: (status: "authorizing" | "verifying") => void
   ): Promise<boolean> {
+    let onLog: ((msg: string) => void) | undefined;
+    let onProgress: ((status: "authorizing" | "verifying", url?: string | null, opened?: boolean) => void) | undefined;
+    let openExternal: ((url: string) => Promise<void>) | undefined;
+    let signal: AbortSignal | undefined;
+
+    if (typeof optionsOrOnLog === "function") {
+      onLog = optionsOrOnLog;
+      if (onProgressLegacy) {
+        onProgress = (s) => onProgressLegacy(s);
+      }
+    } else if (optionsOrOnLog && typeof optionsOrOnLog === "object") {
+      onLog = optionsOrOnLog.onLog;
+      onProgress = optionsOrOnLog.onProgress;
+      openExternal = optionsOrOnLog.openExternal;
+      signal = optionsOrOnLog.signal;
+    }
+
     const mcpName = `neko_supabase_${projectRef}`;
 
     // 1) Checa se já está autenticado e conectado
-    onProgress?.("verifying");
+    onProgress?.("verifying", null, false);
     const isAuth = await this.checkMcpAuthStatus(projectPath, mcpName);
     if (isAuth) {
       const isConn = await this.checkMcpConnection(projectPath, mcpName);
@@ -615,22 +717,48 @@ export class SupabaseCli {
     }
 
     onLog?.("Iniciando autorização OAuth do OpenCode no Supabase...");
-    onProgress?.("authorizing");
+    onProgress?.("authorizing", null, false);
 
-    // 2) Executa o comando de auth (abre o browser para autorização)
-    const result = await this.runOpenCodeMcp(
-      ["mcp", "auth", mcpName],
-      projectPath,
-      300000 // 5 minutos para o usuário autorizar no navegador
-    );
+    let detectedOauthUrl: string | null = null;
+    let browserOpened = false;
+
+    const handleUrlDetected = async (url: string) => {
+      if (detectedOauthUrl === url) return;
+      detectedOauthUrl = url;
+      onLog?.("URL de autorização do Supabase detectada.");
+
+      if (openExternal) {
+        try {
+          await openExternal(url);
+          browserOpened = true;
+          onLog?.("Navegador aberto com sucesso para autorização.");
+        } catch (openErr) {
+          console.warn("[Neko/SupabaseCLI] Falha ao abrir navegador automaticamente:", openErr);
+          browserOpened = false;
+        }
+      }
+
+      onProgress?.("authorizing", detectedOauthUrl, browserOpened);
+    };
+
+    // 2) Executa o comando de auth (streaming stdout/stderr para capturar URL)
+    const result = await this.runOpenCodeMcp(["mcp", "auth", mcpName], projectPath, {
+      timeoutMs: 300000, // 5 minutos de segurança
+      signal,
+      onUrlDetected: handleUrlDetected,
+      isOAuth: true,
+    });
 
     if (result.code !== 0) {
+      if (signal?.aborted) {
+        throw new Error("A autorização do Supabase foi cancelada pelo usuário.");
+      }
       const cleanErr = result.output.replace(/https?:\/\/\S+/g, "[URL]").trim();
       throw new Error(cleanErr || `A autorização do MCP terminou com código ${result.code}.`);
     }
 
     // 3) Valida se o OAuth foi registrado com sucesso
-    onProgress?.("verifying");
+    onProgress?.("verifying", null, false);
     const verified = await this.checkMcpAuthStatus(projectPath, mcpName);
     if (!verified) {
       throw new Error("O OpenCode encerrou o fluxo OAuth, mas não confirmou credenciais ativas para o MCP.");

@@ -22,12 +22,14 @@ import {
   MigrationProposal,
   MigrationProposalRequest,
   MigrationExecutionResult,
-  MigrationProposalStatus
+  MigrationProposalStatus,
+  MigrationExecutionMeta
 } from "./migration-types";
 import {
   validateMigrationSql,
   normalizeSqlForHash,
-  sanitizeSqlForDisplay
+  sanitizeSqlForDisplay,
+  isMigrationErrorText
 } from "../security/sql-guard";
 
 export const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos
@@ -37,7 +39,7 @@ export class MigrationManager extends EventEmitter {
   private pendingResolvers = new Map<string, {
     resolve: (result: MigrationExecutionResult) => void;
     reject: (err: Error) => void;
-    timeoutId: NodeJS.Timeout;
+    timeoutId?: NodeJS.Timeout;
     request: MigrationProposalRequest;
   }>();
   private executedHashes = new Set<string>();
@@ -135,7 +137,7 @@ export class MigrationManager extends EventEmitter {
     }
 
     const proposalId = `mig_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
-    const expiresAt = Date.now() + APPROVAL_TIMEOUT_MS;
+    const expiresAt = 0;
 
     const proposal: MigrationProposal = {
       id: proposalId,
@@ -163,14 +165,12 @@ export class MigrationManager extends EventEmitter {
     this.proposals.set(proposalId, proposal);
 
     return new Promise<MigrationExecutionResult>((resolve, reject) => {
-      const timeoutId = setTimeout(() => {
-        this.handleTimeout(proposalId);
-      }, APPROVAL_TIMEOUT_MS);
-
+      // Migration approvals are human-gated and must remain pending
+      // until explicit approve/reject/cancel.
+      // No automatic expiration.
       this.pendingResolvers.set(proposalId, {
         resolve,
         reject,
-        timeoutId,
         request
       });
 
@@ -202,7 +202,9 @@ export class MigrationManager extends EventEmitter {
       throw new Error(`Nenhuma execução aguardando aprovação para a proposta "${proposalId}".`);
     }
 
-    clearTimeout(resolver.timeoutId);
+    if (resolver.timeoutId) {
+      clearTimeout(resolver.timeoutId);
+    }
 
     // Caso Rejeitado pelo usuário
     if (!approved) {
@@ -289,26 +291,88 @@ export class MigrationManager extends EventEmitter {
   public async notifyToolCompleted(
     proposalIdentifier: string,
     success: boolean,
-    errorMessage?: string
+    errorMessage?: string,
+    meta?: MigrationExecutionMeta
   ): Promise<void> {
     const proposal = this.findProposal(proposalIdentifier);
     if (!proposal) return;
 
-    // Se já estiver em estado terminal, ignore eventos tardios
+    // Se a proposta ainda estiver em PENDING, ela não pode ser concluída como SUCCESS
+    if (proposal.status === "PENDING") {
+      console.warn(`[Neko/Migration] Ignorando conclusão de proposta em PENDING id=${proposal.id}`);
+      return;
+    }
+
+    // Se já estiver em estado terminal, ignore eventos tardios (Idempotência)
     if (proposal.status === "SUCCESS" || proposal.status === "FAILED" || proposal.status === "REJECTED" || proposal.status === "CANCELLED" || proposal.status === "EXPIRED") {
       console.log(`[Neko/Migration] Ignoring late tool completion for terminal proposal id=${proposal.id} status=${proposal.status}`);
       return;
     }
 
+    // 1. Validação estrita de projeto remoto vinculado (projectRef)
+    const hasValidProjectRef = Boolean(
+      proposal.projectRef &&
+      typeof proposal.projectRef === "string" &&
+      proposal.projectRef.trim().length > 0 &&
+      proposal.projectRef.trim().toLowerCase() !== "none"
+    );
+
+    if (!hasValidProjectRef && success) {
+      success = false;
+      errorMessage = "Nenhum projeto remoto vinculado. A alteração não foi executada no banco de dados.";
+    }
+
+    // 2. Comprovação da Execução Remota Real (Evidência remota positiva)
+    const isRemoteConfirmed = Boolean(
+      meta?.remoteApplied ||
+      meta?.providerConfirmed ||
+      (proposal.provider === "lovable" && success)
+    );
+
+    if (success && !isRemoteConfirmed) {
+      success = false;
+      errorMessage = errorMessage || "A alteração não possui confirmação de aplicação remota no Supabase/Lovable Cloud.";
+    }
+
+    // 3. Validação de exitCode da ferramenta/processo remoto
+    if (success && meta?.exitCode !== undefined && meta.exitCode !== 0) {
+      success = false;
+      errorMessage = errorMessage || meta.stderr || `A execução da ferramenta remota terminou com código de saída ${meta.exitCode}.`;
+    }
+
+    // 4. Validação de erro em resposta estruturada
+    if (success && meta?.structuredResult && typeof meta.structuredResult === "object") {
+      if (meta.structuredResult.isError === true || meta.structuredResult.error) {
+        success = false;
+        errorMessage = errorMessage || String(meta.structuredResult.error || "Erro na execução da ferramenta remota.");
+      }
+    }
+
+    // 5. Defesa complementar de busca por texto de erro (isMigrationErrorText)
+    if (success && errorMessage && isMigrationErrorText(errorMessage)) {
+      success = false;
+    }
+    if (success && meta?.stderr && isMigrationErrorText(meta.stderr)) {
+      success = false;
+      errorMessage = errorMessage || meta.stderr;
+    }
+
     const resolver = this.pendingResolvers.get(proposal.id);
     if (resolver) {
-      clearTimeout(resolver.timeoutId);
+      if (resolver.timeoutId) {
+        clearTimeout(resolver.timeoutId);
+      }
       this.pendingResolvers.delete(proposal.id);
     }
 
     if (!success) {
       proposal.status = "FAILED";
-      const err = errorMessage || "A execução da migração falhou no Supabase MCP.";
+      const defaultProviderError = proposal.provider === "lovable"
+        ? "A execução da migração falhou no Lovable Cloud."
+        : proposal.provider === "supabase"
+        ? "A execução da migração falhou no Supabase."
+        : "A execução da migração falhou no banco remoto.";
+      const err = errorMessage || defaultProviderError;
       proposal.error = err;
       console.log(`[Neko/Migration] tool execution failed proposal=${proposal.id} error=${err}`);
       const failResult: MigrationExecutionResult = {
@@ -381,7 +445,9 @@ export class MigrationManager extends EventEmitter {
 
     const resolver = this.pendingResolvers.get(proposalId);
     if (resolver) {
-      clearTimeout(resolver.timeoutId);
+      if (resolver.timeoutId) {
+        clearTimeout(resolver.timeoutId);
+      }
       this.pendingResolvers.delete(proposalId);
       proposal.status = "CANCELLED";
       const res: MigrationExecutionResult = {

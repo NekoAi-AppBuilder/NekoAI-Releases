@@ -173,17 +173,21 @@ test("MigrationManager: Fluxo de aprovação e execução bem-sucedida", async (
   // Usuário aprova
   const replyResult = await manager.replyProposal(active[0].id, true, mockFetch);
   assert.equal(replyResult.success, true);
-  assert.equal(replyResult.status, "SUCCESS");
-  assert.ok(replyResult.appliedFilename?.includes("create_profiles.sql"));
+  assert.equal(replyResult.status, "APPROVED");
+
+  manager.notifyToolExecuting(active[0].id);
+  await manager.notifyToolCompleted(active[0].id, true, undefined, { remoteApplied: true });
 
   const finalResult = await proposalPromise;
   assert.equal(finalResult.success, true);
+  assert.equal(finalResult.status, "SUCCESS");
+  assert.ok(finalResult.appliedFilename?.includes("create_profiles.sql"));
   assert.equal(finalResult.status, "SUCCESS");
   assert.equal(executingEmitted, true);
   assert.equal(completedEmitted, true);
 
   // Verifica gravação no disco
-  const writtenFilePath = path.join(tempDir, replyResult.appliedFilename!);
+  const writtenFilePath = path.join(tempDir, finalResult.appliedFilename!);
   const writtenContent = await fs.readFile(writtenFilePath, "utf8");
   assert.ok(writtenContent.includes("CREATE TABLE profiles"));
 
@@ -241,6 +245,8 @@ test("MigrationManager: Anti-duplicação impede reaplicação do mesmo hash", a
   const p1 = manager.proposeMigration(req, mockFetch);
   const id1 = manager.getPendingProposals()[0].id;
   await manager.replyProposal(id1, true, mockFetch);
+  manager.notifyToolExecuting(id1);
+  await manager.notifyToolCompleted(id1, true, undefined, { remoteApplied: true });
   await p1;
 
   // Segunda tentativa com mesmo SQL e projectRef -> deve ser rejeitada imediatamente
