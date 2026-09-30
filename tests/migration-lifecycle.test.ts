@@ -139,7 +139,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
     expect(pending?.status).toBe("EXECUTING");
 
     // MCP conclui
-    await manager.notifyToolCompleted(pending!.id, true);
+    await manager.notifyToolCompleted(pending!.id, true, undefined, { remoteApplied: true });
     await proposalPromise;
     expect(promiseResolved).toBe(true);
   });
@@ -197,7 +197,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
     // Conclui t2 com aprovação + execução completa
     await manager.replyProposal(p2!.id, true);
     manager.notifyToolExecuting(p2!.id);
-    await manager.notifyToolCompleted(p2!.id, true);
+    await manager.notifyToolCompleted(p2!.id, true, undefined, { remoteApplied: true });
     await t2Promise;
     expect(t2Resolved).toBe(true);
   });
@@ -263,7 +263,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
 
     await manager.replyProposal(p2.id, true);
     manager.notifyToolExecuting(p2.id);
-    await manager.notifyToolCompleted(p2.id, true);
+    await manager.notifyToolCompleted(p2.id, true, undefined, { remoteApplied: true });
     await p2Promise;
     expect(p2.status).toBe("SUCCESS");
   });
@@ -312,7 +312,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
     expect(p2.status).toBe("EXECUTING");
 
     // 3. Execução completa com sucesso
-    await manager.notifyToolCompleted(p2.id, true);
+    await manager.notifyToolCompleted(p2.id, true, undefined, { remoteApplied: true });
     expect(p2.status).toBe("SUCCESS");
     expect(p2.schemaVerificationStatus).toBe("VERIFIED");
 
@@ -477,7 +477,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
 
     await manager.replyProposal(p2!.id, true);
     manager.notifyToolExecuting(p2!.id);
-    await manager.notifyToolCompleted(p2!.id, true);
+    await manager.notifyToolCompleted(p2!.id, true, undefined, { remoteApplied: true });
     await p2Promise;
     expect(p2?.status).toBe("SUCCESS");
   });
@@ -593,7 +593,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
     // Aprova e conclui a nova migration
     await manager.replyProposal(newPending!.id, true);
     manager.notifyToolExecuting(newPending!.id);
-    await manager.notifyToolCompleted(newPending!.id, true);
+    await manager.notifyToolCompleted(newPending!.id, true, undefined, { remoteApplied: true });
     await newPromise;
     expect(newPending?.status).toBe("SUCCESS");
   });
@@ -695,7 +695,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
     // Aprova T2
     await manager.replyProposal(p2!.id, true);
     manager.notifyToolExecuting(p2!.id);
-    await manager.notifyToolCompleted(p2!.id, true);
+    await manager.notifyToolCompleted(p2!.id, true, undefined, { remoteApplied: true });
     await t2Promise;
     expect(p2?.status).toBe("SUCCESS");
   });
@@ -728,7 +728,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
         if (partStatus === "running" && targetProposal.status === "APPROVED") {
           manager.notifyToolExecuting(targetProposal.id);
         } else if (partStatus === "completed") {
-          await manager.notifyToolCompleted(targetProposal.id, true);
+          await manager.notifyToolCompleted(targetProposal.id, true, undefined, { remoteApplied: true });
         } else if (partStatus === "error") {
           await manager.notifyToolCompleted(targetProposal.id, false, "Execution failed");
         }
@@ -901,7 +901,7 @@ describe("MigrationManager Consecutive Migrations & Cache Isolation (Same Sessio
     expect(pendingMigration?.status).toBe("EXECUTING");
 
     // 4. OpenCode conclui tool (completed) -> SUCCESS
-    await manager.notifyToolCompleted(pendingMigration!.id, true);
+    await manager.notifyToolCompleted(pendingMigration!.id, true, undefined, { remoteApplied: true });
     pendingMigration = manager.getExecutingOrApprovedProposalForSession(sessionId);
     expect(pendingMigration).toBeNull(); // Proposta concluída não fica mais pendente/executando
 

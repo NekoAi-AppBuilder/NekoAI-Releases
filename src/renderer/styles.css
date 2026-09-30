@@ -6959,3 +6959,287 @@ button.github-pull-btn:hover:not(:disabled) {
   background: #e11d48;
   color: #ffffff;
 }
+
+/* ==========================================================================
+   Git Intelligent Sync & Visual Conflict Resolver
+   ========================================================================== */
+
+.git-pending-sync-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: rgba(234, 179, 8, 0.1);
+  border-bottom: 1px solid rgba(234, 179, 8, 0.25);
+  font-size: 12px;
+  color: #fef08a;
+  z-index: 10;
+}
+
+.git-pending-sync-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.git-conflict-modal-body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: 75vh;
+  overflow-y: auto;
+}
+
+.git-conflict-progress-wrap {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.git-conflict-progress-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #a89bb6;
+}
+
+.git-conflict-progress-header strong {
+  color: #eab308;
+}
+
+.git-conflict-progress-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.git-conflict-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ca8a04, #22c55e);
+  transition: width 0.3s ease;
+  border-radius: 999px;
+}
+
+.git-conflict-file-tabs {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.git-conflict-file-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #c4b8d2;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.git-conflict-file-tab:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+}
+
+.git-conflict-file-tab.active {
+  background: rgba(168, 85, 247, 0.15);
+  border-color: rgba(168, 85, 247, 0.4);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.git-conflict-file-tab.resolved {
+  border-color: rgba(34, 197, 94, 0.3);
+}
+
+.git-conflict-resolved-pill {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(34, 197, 94, 0.15);
+  color: #86efac;
+  font-weight: 600;
+}
+
+.git-conflict-active-file {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.git-conflict-file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+}
+
+.git-conflict-file-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #ddd5e8;
+}
+
+.git-conflict-file-path code {
+  font-family: monospace;
+  color: #a855f7;
+  font-size: 11px;
+}
+
+.git-conflict-chosen-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.12);
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(34, 197, 94, 0.25);
+}
+
+.git-conflict-pending-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #fde047;
+  background: rgba(234, 179, 8, 0.12);
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(234, 179, 8, 0.25);
+}
+
+.git-conflict-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.git-conflict-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: all 0.15s ease;
+}
+
+.git-conflict-card.chosen {
+  border-color: rgba(168, 85, 247, 0.5);
+  background: rgba(168, 85, 247, 0.06);
+  box-shadow: 0 0 15px rgba(168, 85, 247, 0.08);
+}
+
+.git-conflict-card.disabled-card {
+  opacity: 0.6;
+}
+
+.git-conflict-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #ffffff;
+}
+
+.git-conflict-card-tag {
+  font-size: 9px;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+}
+
+.git-conflict-card-tag.local {
+  background: rgba(59, 130, 246, 0.2);
+  color: #93c5fd;
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.git-conflict-card-tag.github {
+  background: rgba(168, 85, 247, 0.2);
+  color: #d8b4fe;
+  border: 1px solid rgba(168, 85, 247, 0.3);
+}
+
+.git-conflict-card-tag.combined {
+  background: rgba(34, 197, 94, 0.2);
+  color: #86efac;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.git-conflict-card-desc {
+  font-size: 11px;
+  color: #a89bb6;
+  line-height: 1.4;
+  min-height: 30px;
+}
+
+.git-conflict-code-container {
+  flex: 1;
+  min-height: 120px;
+  max-height: 220px;
+  overflow: auto;
+  background: #0c0914;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 8px;
+}
+
+.git-conflict-code-box {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  color: #d6cee0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.git-conflict-pick-btn {
+  width: 100%;
+  justify-content: center;
+  height: 32px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 6px;
+  margin-top: auto;
+}
+
+.git-conflict-pick-btn.active {
+  background: #7c3aed;
+  border-color: #8b5cf6;
+  color: #ffffff;
+}
+
+.git-conflict-modal-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+

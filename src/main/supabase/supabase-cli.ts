@@ -24,15 +24,35 @@ export function extractOAuthUrl(text: string): string | null {
   const clean = text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
   const matches = clean.match(/https?:\/\/[^\s"'<>\`\)]+/gi);
   if (!matches) return null;
-  for (const urlStr of matches) {
+  for (let urlStr of matches) {
+    urlStr = urlStr.replace(/[.,;:!?]+$/, "");
     try {
       const parsed = new URL(urlStr);
-      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      if (
+        (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+        (parsed.hostname.includes(".") || parsed.hostname === "localhost")
+      ) {
         return parsed.toString();
       }
     } catch {}
   }
   return null;
+}
+
+export function classifyFetchError(err: any, context: string): Error {
+  if (err?.name === "TimeoutError" || /timed out|tempo limite/i.test(err?.message || "")) {
+    return new Error(`A operação do Supabase excedeu o tempo limite ao ${context}.`);
+  }
+  if (/ENOTFOUND|getaddrinfo/i.test(err?.message || "")) {
+    return new Error(`Não foi possível resolver o endereço dos servidores do Supabase (erro de DNS). Verifique sua conexão ao ${context}.`);
+  }
+  if (/ECONNREFUSED/i.test(err?.message || "")) {
+    return new Error(`Conexão recusada ao conectar aos servidores do Supabase ao ${context}.`);
+  }
+  if (/CERT_|certificate|self-signed|tls|ssl/i.test(err?.message || "")) {
+    return new Error(`Erro de certificado de segurança (TLS/SSL) ao conectar ao Supabase ao ${context}.`);
+  }
+  return new Error(`Erro de conexão com o Supabase ao ${context}: ${err?.message || "falha de rede"}`);
 }
 
 export function parseSupabaseError(rawError: any): SupabaseStructuredError {
@@ -136,7 +156,7 @@ export function parseSupabaseError(rawError: any): SupabaseStructuredError {
       code: "RATE_LIMIT",
       title: "Muitas requisições",
       message: "Muitas tentativas em pouco tempo.",
-      detail: "Aguarde alguns minutos antes de tentar criar um novo projeto.",
+      detail: "Aguarde alguns minutos antes de tentar novamente.",
     };
   }
 
@@ -150,8 +170,8 @@ export function parseSupabaseError(rawError: any): SupabaseStructuredError {
     };
   }
 
-  // 9. Erro de rede
-  if (/ENOTFOUND|ECONNREFUSED|network error|failed to fetch/i.test(text)) {
+  // 9. Erro de rede / DNS / Conexão
+  if (/ENOTFOUND|ECONNREFUSED|network error|failed to fetch|erro de conexão|erro de dns|getaddrinfo/i.test(text)) {
     return {
       code: "NETWORK_ERROR",
       title: "Erro de conexão",
@@ -160,7 +180,27 @@ export function parseSupabaseError(rawError: any): SupabaseStructuredError {
     };
   }
 
-  // 10. Fallback sanitizado (sem stack traces)
+  // 10. Erro de TLS / Certificado
+  if (/CERT_|certificate|self-signed|tls|ssl/i.test(text)) {
+    return {
+      code: "TLS_ERROR",
+      title: "Erro de segurança SSL/TLS",
+      message: "Falha na validação do certificado de segurança com o Supabase.",
+      detail: "Verifique se há antivírus, proxy corporativo ou VPN interceptando a conexão.",
+    };
+  }
+
+  // 11. Erro de Servidor (5xx)
+  if (/HTTP 5\d\d|500|502|503|504|instáveis|indisponíveis|servidores do supabase/i.test(text)) {
+    return {
+      code: "SERVER_ERROR",
+      title: "Servidores do Supabase indisponíveis",
+      message: "Os servidores do Supabase retornaram erro ou estão temporariamente instáveis.",
+      detail: "Aguarde alguns instantes ou verifique o status do Supabase.",
+    };
+  }
+
+  // 12. Fallback sanitizado (sem stack traces)
   const cleanMessage = text
     .split(/\r?\n/)[0]
     .replace(/at\s+[\w\W]+$/i, "")
@@ -168,8 +208,8 @@ export function parseSupabaseError(rawError: any): SupabaseStructuredError {
 
   return {
     code: "GENERIC_ERROR",
-    title: "Não foi possível criar o projeto",
-    message: cleanMessage || "O Supabase retornou um erro ao tentar criar o projeto.",
+    title: "Erro no Supabase",
+    message: cleanMessage || "O Supabase retornou um erro durante a operação.",
     detail: "Verifique os dados informados e tente novamente.",
   };
 }
@@ -564,7 +604,10 @@ export class SupabaseCli {
         child = spawn(invocation.command, invocation.args, {
           ...invocation.options,
           cwd,
-          env: { ...process.env, NO_COLOR: "1" },
+          env: {
+            ...getEmbeddedRuntimeEnv(process.env),
+            NO_COLOR: "1",
+          },
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -582,6 +625,7 @@ export class SupabaseCli {
       let stdout = "";
       let stderr = "";
       let settled = false;
+      let detectedUrl: string | null = null;
 
       const finish = (
         error?: Error,
@@ -619,8 +663,9 @@ export class SupabaseCli {
         const text = chunk.toString("utf8");
         stdout = `${stdout}${text}`.slice(-512000);
         if (onUrlDetected) {
-          const url = extractOAuthUrl(text);
-          if (url) {
+          const url = extractOAuthUrl(stdout) || extractOAuthUrl(text);
+          if (url && url !== detectedUrl) {
+            detectedUrl = url;
             onUrlDetected(url);
           }
         }
@@ -630,8 +675,9 @@ export class SupabaseCli {
         const text = chunk.toString("utf8");
         stderr = `${stderr}${text}`.slice(-512000);
         if (onUrlDetected) {
-          const url = extractOAuthUrl(text);
-          if (url) {
+          const url = extractOAuthUrl(stderr) || extractOAuthUrl(text);
+          if (url && url !== detectedUrl) {
+            detectedUrl = url;
             onUrlDetected(url);
           }
         }
@@ -735,7 +781,10 @@ export class SupabaseCli {
         } catch (openErr) {
           console.warn("[Neko/SupabaseCLI] Falha ao abrir navegador automaticamente:", openErr);
           browserOpened = false;
+          onLog?.("Aviso: não foi possível abrir o navegador automaticamente. Use os botões abaixo para autorizar.");
         }
+      } else {
+        browserOpened = false;
       }
 
       onProgress?.("authorizing", detectedOauthUrl, browserOpened);
@@ -754,6 +803,9 @@ export class SupabaseCli {
         throw new Error("A autorização do Supabase foi cancelada pelo usuário.");
       }
       const cleanErr = result.output.replace(/https?:\/\/\S+/g, "[URL]").trim();
+      if (!detectedOauthUrl) {
+        throw new Error(cleanErr || `O processo do OpenCode MCP encerrou inesperadamente (código ${result.code}) antes de gerar a URL de autorização.`);
+      }
       throw new Error(cleanErr || `A autorização do MCP terminou com código ${result.code}.`);
     }
 
@@ -793,21 +845,23 @@ export class SupabaseCli {
       response = await fetchFn("https://api.supabase.com/v1/organizations", {
         headers: {
           Authorization: `Bearer ${trimmed}`,
-          "User-Agent": "NekoAI/0.4.91",
+          "User-Agent": "NekoAI/0.4.93",
         },
         signal: AbortSignal.timeout(15000),
       });
     } catch (err: any) {
-      if (err?.name === "TimeoutError" || /timed out|tempo limite/i.test(err?.message || "")) {
-        throw new Error("A operação do Supabase excedeu o tempo limite.");
-      }
-      throw new Error(`Erro de conexão com o Supabase: ${err?.message || "falha de rede"}`);
+      throw classifyFetchError(err, "validar token de acesso");
     }
 
     if (response.status === 401 || response.status === 403) {
       throw new Error("O token de acesso do Supabase é inválido ou expirou.");
     }
-
+    if (response.status === 429) {
+      throw new Error("Limite de requisições do Supabase atingido (429). Aguarde alguns instantes.");
+    }
+    if (response.status >= 500) {
+      throw new Error(`Servidores do Supabase indisponíveis ou instáveis (HTTP ${response.status}).`);
+    }
     if (!response.ok) {
       throw new Error(`Supabase API retornou erro HTTP ${response.status}`);
     }
@@ -866,13 +920,14 @@ export class SupabaseCli {
 
   public async listProjects(): Promise<SupabaseProject[]> {
     const token = this.getToken();
+    let lastApiError: Error | null = null;
     if (token) {
       const fetchFn = this.customFetch || globalThis.fetch;
       try {
         const res = await fetchFn("https://api.supabase.com/v1/projects", {
           headers: {
             Authorization: `Bearer ${token}`,
-            "User-Agent": "NekoAI/0.4.91",
+            "User-Agent": "NekoAI/0.4.93",
           },
           signal: AbortSignal.timeout(20000),
         });
@@ -889,15 +944,25 @@ export class SupabaseCli {
             }))
             .sort((a, b) => b.status.localeCompare(a.status) || a.name.localeCompare(b.name));
         }
-      } catch (apiErr) {
+        if (res.status === 401 || res.status === 403) {
+          lastApiError = new Error("O token de acesso do Supabase é inválido ou expirou.");
+        } else if (res.status === 429) {
+          lastApiError = new Error("Limite de requisições do Supabase atingido (429). Aguarde um momento.");
+        } else if (res.status >= 500) {
+          lastApiError = new Error(`Servidores do Supabase instáveis ou indisponíveis (HTTP ${res.status}).`);
+        } else {
+          lastApiError = new Error(`Supabase API retornou erro HTTP ${res.status} ao listar projetos.`);
+        }
+      } catch (apiErr: any) {
         console.warn("[Neko/SupabaseCLI] Erro na REST API listProjects:", apiErr);
+        lastApiError = classifyFetchError(apiErr, "listar projetos");
       }
     }
 
     const standalone = await resolveExecutable(["supabase"]);
     if (standalone) {
-      const result = await this.runCli(["projects", "list", "--output-format", "json"]);
       try {
+        const result = await this.runCli(["projects", "list", "--output-format", "json"]);
         const jsonStart = Math.min(
           ...[result.stdout.indexOf("["), result.stdout.indexOf("{")].filter((i) => i !== -1)
         );
@@ -913,23 +978,27 @@ export class SupabaseCli {
             status: p.status || "ACTIVE",
           }))
           .sort((a, b) => b.status.localeCompare(a.status) || a.name.localeCompare(b.name));
-      } catch {
-        throw new Error("Não foi possível carregar a lista de projetos do Supabase.");
+      } catch (cliErr) {
+        console.warn("[Neko/SupabaseCLI] Fallback CLI listProjects falhou:", cliErr);
       }
     }
 
-    throw new Error("Não foi possível carregar a lista de projetos do Supabase.");
+    if (lastApiError) {
+      throw lastApiError;
+    }
+    throw new Error("Não foi possível carregar a lista de projetos do Supabase. Nenhum token configurado.");
   }
 
   public async listOrganizations(): Promise<SupabaseOrganization[]> {
     const token = this.getToken();
+    let lastApiError: Error | null = null;
     if (token) {
       const fetchFn = this.customFetch || globalThis.fetch;
       try {
         const res = await fetchFn("https://api.supabase.com/v1/organizations", {
           headers: {
             Authorization: `Bearer ${token}`,
-            "User-Agent": "NekoAI/0.4.91",
+            "User-Agent": "NekoAI/0.4.93",
           },
           signal: AbortSignal.timeout(15000),
         });
@@ -941,15 +1010,25 @@ export class SupabaseCli {
             name: o.name || "Organização",
           }));
         }
-      } catch (apiErr) {
+        if (res.status === 401 || res.status === 403) {
+          lastApiError = new Error("O token de acesso do Supabase é inválido ou expirou.");
+        } else if (res.status === 429) {
+          lastApiError = new Error("Limite de requisições do Supabase atingido (429). Aguarde um momento.");
+        } else if (res.status >= 500) {
+          lastApiError = new Error(`Servidores do Supabase instáveis ou indisponíveis (HTTP ${res.status}).`);
+        } else {
+          lastApiError = new Error(`Supabase API retornou erro HTTP ${res.status} ao listar organizações.`);
+        }
+      } catch (apiErr: any) {
         console.warn("[Neko/SupabaseCLI] Erro na REST API listOrganizations:", apiErr);
+        lastApiError = classifyFetchError(apiErr, "listar organizações");
       }
     }
 
     const standalone = await resolveExecutable(["supabase"]);
     if (standalone) {
-      const result = await this.runCli(["orgs", "list", "--output-format", "json"]);
       try {
+        const result = await this.runCli(["orgs", "list", "--output-format", "json"]);
         const jsonStart = Math.min(
           ...[result.stdout.indexOf("["), result.stdout.indexOf("{")].filter((i) => i !== -1)
         );
@@ -960,16 +1039,20 @@ export class SupabaseCli {
           id: o.id,
           name: o.name || "Organização",
         }));
-      } catch {
-        throw new Error("Não foi possível carregar a lista de organizações do Supabase.");
+      } catch (cliErr) {
+        console.warn("[Neko/SupabaseCLI] Fallback CLI listOrganizations falhou:", cliErr);
       }
     }
 
-    throw new Error("Não foi possível carregar a lista de organizações do Supabase.");
+    if (lastApiError) {
+      throw lastApiError;
+    }
+    throw new Error("Não foi possível carregar a lista de organizações do Supabase. Nenhum token configurado.");
   }
 
   public async createProject(payload: SupabaseCreateProjectPayload): Promise<void> {
     const token = this.getToken();
+    let lastApiError: Error | null = null;
     if (token) {
       const fetchFn = this.customFetch || globalThis.fetch;
       try {
@@ -978,7 +1061,7 @@ export class SupabaseCli {
           headers: {
             Authorization: `Bearer ${token}`,
             "Content-Type": "application/json",
-            "User-Agent": "NekoAI/0.4.91",
+            "User-Agent": "NekoAI/0.4.93",
           },
           body: JSON.stringify({
             name: payload.name,
@@ -1001,41 +1084,48 @@ export class SupabaseCli {
         } catch {
           errBody = await res.text();
         }
-        throw new Error(errBody || `HTTP ${res.status}`);
+        lastApiError = new Error(errBody || `HTTP ${res.status}`);
       } catch (err: any) {
-        const standalone = await resolveExecutable(["supabase"]);
-        if (!standalone) {
-          throw err;
-        }
+        lastApiError = classifyFetchError(err, "criar projeto no Supabase");
         console.warn("[Neko/SupabaseCLI] REST API createProject falhou, tentando CLI standalone fallback:", err);
       }
     }
 
-    await this.runCli(
-      [
-        "projects",
-        "create",
-        payload.name,
-        "--org-id",
-        payload.orgId,
-        "--db-password",
-        payload.dbPassword,
-        "--region",
-        payload.region || "sa-east-1",
-      ],
-      120000
-    );
+    const standalone = await resolveExecutable(["supabase"]);
+    if (standalone) {
+      await this.runCli(
+        [
+          "projects",
+          "create",
+          payload.name,
+          "--org-id",
+          payload.orgId,
+          "--db-password",
+          payload.dbPassword,
+          "--region",
+          payload.region || "sa-east-1",
+        ],
+        120000
+      );
+      return;
+    }
+
+    if (lastApiError) {
+      throw lastApiError;
+    }
+    throw new Error("Não foi possível criar o projeto no Supabase. Nenhum token configurado.");
   }
 
   public async fetchApiKeys(ref: string): Promise<{ publishableKey: string }> {
     const token = this.getToken();
+    let lastApiError: Error | null = null;
     if (token) {
       const fetchFn = this.customFetch || globalThis.fetch;
       try {
         const res = await fetchFn(`https://api.supabase.com/v1/projects/${ref}/api-keys`, {
           headers: {
             Authorization: `Bearer ${token}`,
-            "User-Agent": "NekoAI/0.4.91",
+            "User-Agent": "NekoAI/0.4.93",
           },
           signal: AbortSignal.timeout(15000),
         });
@@ -1054,24 +1144,34 @@ export class SupabaseCli {
           if (apiKey) {
             return { publishableKey: apiKey };
           }
+          lastApiError = new Error("Chave pública (anon/publishable) não encontrada na resposta do projeto.");
+        } else if (res.status === 401 || res.status === 403) {
+          lastApiError = new Error("O token de acesso do Supabase é inválido ou expirou ao buscar chaves de API.");
+        } else if (res.status === 404) {
+          lastApiError = new Error(`Projeto Supabase (${ref}) não foi encontrado ou não está acessível.`);
+        } else if (res.status >= 500) {
+          lastApiError = new Error(`Servidores do Supabase indisponíveis ao buscar chaves de API (HTTP ${res.status}).`);
+        } else {
+          lastApiError = new Error(`Supabase API retornou erro HTTP ${res.status} ao buscar chaves de API.`);
         }
-      } catch (apiErr) {
+      } catch (apiErr: any) {
         console.warn("[Neko/SupabaseCLI] Erro na REST API fetchApiKeys:", apiErr);
+        lastApiError = classifyFetchError(apiErr, "obter chaves de API do projeto");
       }
     }
 
     const standalone = await resolveExecutable(["supabase"]);
     if (standalone) {
-      const result = await this.runCli([
-        "projects",
-        "api-keys",
-        "--project-ref",
-        ref,
-        "--output-format",
-        "json",
-      ]);
-
       try {
+        const result = await this.runCli([
+          "projects",
+          "api-keys",
+          "--project-ref",
+          ref,
+          "--output-format",
+          "json",
+        ]);
+
         const jsonStart = result.stdout.indexOf("{");
         if (jsonStart === -1) throw new Error("Saída inválida");
         const parsed = JSON.parse(result.stdout.substring(jsonStart));
@@ -1088,15 +1188,14 @@ export class SupabaseCli {
           throw new Error("Chave pública (anon/publishable) não encontrada para este projeto.");
         }
         return { publishableKey: keyEntry.api_key };
-      } catch (error) {
-        throw new Error(
-          error instanceof Error
-            ? error.message
-            : "Não foi possível obter as chaves públicas do Supabase para este projeto."
-        );
+      } catch (cliErr) {
+        console.warn("[Neko/SupabaseCLI] Fallback CLI fetchApiKeys falhou:", cliErr);
       }
     }
 
+    if (lastApiError) {
+      throw lastApiError;
+    }
     throw new Error("Não foi possível obter as chaves públicas do Supabase para este projeto.");
   }
 }

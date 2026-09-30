@@ -8,6 +8,7 @@ import {
   SupabaseEnvironmentNames,
 } from "./supabase-types";
 import { resolvePackageManager, getSpawnInvocation } from "./supabase-cli";
+import { getEmbeddedRuntimeEnv } from "../node-runtime";
 
 export const getSupabaseMcpName = (projectRef: string): string =>
   `neko_supabase_${projectRef}`;
@@ -418,7 +419,10 @@ export const installSupabasePackage = async (
       child = spawn(invocation.command, invocation.args, {
         ...invocation.options,
         cwd: root,
-        env: { ...process.env, NO_COLOR: "1" },
+        env: {
+          ...getEmbeddedRuntimeEnv(process.env),
+          NO_COLOR: "1",
+        },
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });

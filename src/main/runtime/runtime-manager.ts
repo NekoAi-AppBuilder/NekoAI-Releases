@@ -202,11 +202,16 @@ export class RuntimeManager {
     runtimeId: string,
     options: ResolveEnvironmentOptions = {}
   ): Promise<ResolvedRuntimeEnvironment> {
-    const descriptor = await this.store.getRuntime(runtimeId);
+    let descriptor = await this.store.getRuntime(runtimeId);
+    if (!descriptor) {
+      const baseId = runtimeId.split("-")[0];
+      const version = runtimeId.includes("-") ? runtimeId.split("-").slice(1).join("-") : undefined;
+      descriptor = this.lifecycleManager.getBundledRuntimeDescriptor(baseId, version) || null;
+    }
     if (!descriptor) {
       return {
         status: "not-installed",
-        error: `NOT_INSTALLED: O runtime '${runtimeId}' não possui registro no RuntimeStore.`,
+        error: `NOT_INSTALLED: O runtime '${runtimeId}' não possui registro no RuntimeStore nem na toolchain embutida.`,
       };
     }
     return RuntimeEnvironmentBuilder.buildEnvironment(descriptor, options);

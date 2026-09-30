@@ -125,6 +125,21 @@ export function getKnownPackageManagerDirectories(packageManager?: string): stri
       if (home) dirs.push(path.join(home, ".local", "bin"));
       dirs.push("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin");
     }
+
+    // Bun embutido no NekoAI (tools/bun)
+    const baseDir = typeof __dirname !== "undefined" ? __dirname : process.cwd();
+    const candidateBases = [
+      path.resolve(baseDir, "..", "..", "tools", "bun"),
+      path.resolve(baseDir, "..", "tools", "bun"),
+      path.resolve(process.cwd(), "tools", "bun"),
+    ];
+    if (process.resourcesPath) {
+      candidateBases.push(path.join(process.resourcesPath, "tools", "bun"));
+    }
+    for (const b of candidateBases) {
+      dirs.push(b);
+      dirs.push(path.join(b, "bun-windows-x64"));
+    }
   }
 
   // 2. Diretórios específicos do pnpm / yarn / npm
@@ -147,7 +162,7 @@ export function getKnownPackageManagerDirectories(packageManager?: string): stri
     }
   }
 
-  // 3. Ferramentas embutidas do NekoAI (tools/node, tools/git)
+  // 3. Ferramentas embutidas do NekoAI (tools/node, tools/git, tools/bun, tools/python, tools/deno, tools/php)
   const baseDir = typeof __dirname !== "undefined" ? __dirname : process.cwd();
   dirs.push(
     path.resolve(baseDir, "..", "..", "tools", "node"),

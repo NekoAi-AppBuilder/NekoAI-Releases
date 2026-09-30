@@ -1,4 +1,6 @@
-import { BrowserWindow } from "electron";
+import electron from "electron";
+import type { BrowserWindow as ElectronBrowserWindow } from "electron";
+type BrowserWindow = ElectronBrowserWindow;
 import { EventEmitter } from "node:events";
 import {
   EMPTY_LOVABLE_STATE,
@@ -268,7 +270,9 @@ export class LovableCloudManager extends EventEmitter {
       return;
     }
 
-    const win = new BrowserWindow({
+    const BrowserWindowClass = (electron as any)?.BrowserWindow || (electron as any)?.default?.BrowserWindow;
+    if (!BrowserWindowClass) throw new Error("BrowserWindow indisponível no ambiente atual.");
+    const win = new BrowserWindowClass({
       width: 980,
       height: 720,
       title: "NekoAI — Conectar Lovable Cloud",
@@ -338,7 +342,9 @@ export class LovableCloudManager extends EventEmitter {
     }
 
     try {
-      const probeWin = new BrowserWindow({
+      const BrowserWindowClass = (electron as any)?.BrowserWindow || (electron as any)?.default?.BrowserWindow;
+      if (!BrowserWindowClass) return null;
+      const probeWin = new BrowserWindowClass({
         width: 100,
         height: 100,
         show: false,

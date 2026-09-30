@@ -448,13 +448,11 @@ export class SupabaseManager extends EventEmitter {
               }
             },
             openExternal: async (url: string) => {
-              try {
-                const electron = require("electron");
-                if (electron?.shell?.openExternal) {
-                  await electron.shell.openExternal(url);
-                }
-              } catch (err) {
-                console.warn("[Neko/Supabase] Aviso ao abrir navegador automaticamente:", err);
+              const electron = require("electron");
+              if (electron?.shell?.openExternal) {
+                await electron.shell.openExternal(url);
+              } else {
+                throw new Error("Electron shell.openExternal não disponível.");
               }
             },
             signal: oauthSignal,

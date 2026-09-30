@@ -1,4 +1,4 @@
-import { app } from "electron";
+import electron from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -24,10 +24,12 @@ export class VercelVaultManager {
   private getVaultPath(): string {
     if (this.customVaultPath) return this.customVaultPath;
     try {
-      return path.join(app.getPath("userData"), "vercel-deployments.json");
-    } catch {
-      return path.join(process.cwd(), "vercel-deployments.json");
-    }
+      const app = (electron as any)?.app || (electron as any)?.default?.app;
+      if (app && typeof app.getPath === "function") {
+        return path.join(app.getPath("userData"), "vercel-deployments.json");
+      }
+    } catch {}
+    return path.join(process.cwd(), "vercel-deployments.json");
   }
 
   public async loadVault(): Promise<VercelVaultData> {

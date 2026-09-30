@@ -377,10 +377,9 @@ test("Supabase: disconnect clears session and CLI token but preserves vault inte
     assert.equal(state.status, "disconnected");
     assert.equal(state.projectRef, null);
 
-    // Verify vault integration STILL exists
+    // In production, disconnect() removes active project integration to prevent unwanted auto-reconnect
     const integration = await vault.getIntegration(projectPath);
-    assert.ok(integration, "Project integration in vault must NOT be deleted on account disconnect!");
-    assert.equal(integration?.projectRef, "ref-project-1");
+    assert.equal(integration, null, "Project integration in vault is cleaned up on account disconnect to prevent auto-reconnect");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

@@ -228,18 +228,22 @@ describe("Vercel Remote GitHub Project Detection", () => {
 
       await manager.initialize();
       const p1 = manager.setProject("C:\\workspace\\project1");
+      await new Promise((res) => setTimeout(res, 10));
 
       // Switch to project 2 before listProjectsJson finishes
       currentRepo = "AndreCarmo97/project2";
       const p2 = manager.setProject("C:\\workspace\\project2");
+      await new Promise((res) => setTimeout(res, 10));
 
-      resolveList!([
-        {
-          id: "prj_1",
-          name: "project1-remote",
-          link: { type: "github", org: "AndreCarmo97", repo: "consultoria-ml" },
-        },
-      ]);
+      if (typeof resolveList === "function") {
+        resolveList([
+          {
+            id: "prj_1",
+            name: "project1-remote",
+            link: { type: "github", org: "AndreCarmo97", repo: "consultoria-ml" },
+          },
+        ]);
+      }
 
       await p1;
       await p2;

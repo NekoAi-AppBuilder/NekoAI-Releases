@@ -1,6 +1,14 @@
 // tests/billing-core.test.ts
 // Testes unitários locais para a máquina de regras do Billing Core, Cakto Adapter e SyncPay Adapter
 
+if (typeof (globalThis as any).Deno === "undefined") {
+  (globalThis as any).Deno = {
+    env: {
+      get: (k: string) => process.env[k],
+    },
+  };
+}
+
 import { SyncPayAdapter } from "../supabase/functions/_shared/billing/syncpay-adapter.ts";
 import { CaktoAdapter } from "../supabase/functions/_shared/billing/cakto-adapter.ts";
 import { BillingCore } from "../supabase/functions/_shared/billing/billing-core.ts";

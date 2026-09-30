@@ -26,20 +26,20 @@ async function createTempBaseDir(prefix: string): Promise<string> {
 class MockPythonProvider implements RuntimeProvider {
   id = "python";
   name = "Python Provider";
-  supportedVersions = ["3.12.8"];
+  supportedVersions = ["3.13.1"];
 
   getSupportedVersions(): RuntimeVersionSpec[] {
-    return [{ version: "3.12.8", isLts: true, isStable: true }];
+    return [{ version: "3.13.1", isLts: true, isStable: true }];
   }
 
   getDistribution(version: string, platform: string, architecture: string): RuntimeDistribution | undefined {
-    if (version !== "3.12.8") return undefined;
+    if (version !== "3.13.1") return undefined;
     return {
       runtime: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       platform: platform as any,
       architecture: architecture as any,
-      url: "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip",
+      url: "https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip",
       expectedSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       status: "verified",
       archiveType: "zip",
@@ -49,7 +49,7 @@ class MockPythonProvider implements RuntimeProvider {
   }
 
   isDistributionVerifiable(version: string, platform: string, architecture: string): boolean {
-    return version === "3.12.8";
+    return version === "3.13.1";
   }
 }
 
@@ -121,9 +121,9 @@ test("A. IPC Bridge: runtime detectado em projeto gera Card Data com origem ofic
     assert.ok(card);
     assert.equal(card.runtimeId, "python");
     assert.equal(card.technology, "Python");
-    assert.equal(card.version, "3.12.8");
+    assert.equal(card.version, "3.13.1");
     assert.equal(card.officialOrigin, "www.python.org");
-    assert.equal(card.downloadUrl, "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip");
+    assert.equal(card.downloadUrl, "https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -151,7 +151,7 @@ test("B. IPC Bridge: aprovação do usuário envia ProvisionAuthorization { appr
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       reason: "Chamada simulada via IPC",
       confidence: "high" as const,
       evidence: "ipc-test",
@@ -195,7 +195,7 @@ test("D. IPC Bridge: negação do usuário (approved: false) aborta o fluxo sem 
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       reason: "Chamada cancelada via IPC",
       confidence: "high" as const,
       evidence: "ipc-test",
@@ -240,7 +240,7 @@ test("E. SEGURANÇA IPC: renderer não consegue injetar URL ou SHA-256 arbitrár
     // Simulação de requisição que tentaria injetar URL maliciosa na chamada do IPC
     const payload = {
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       url: "https://evil.com/malicious.zip",
       expectedSha256: "badhash",
     };
@@ -263,7 +263,7 @@ test("E. SEGURANÇA IPC: renderer não consegue injetar URL ou SHA-256 arbitrár
 
     assert.equal(result.status, "installed");
     // O downloader deve obrigatoriamente ter baixado a URL oficial do Provider, não a URL maliciosa
-    assert.equal(downloader.lastSpecUrl, "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip");
+    assert.equal(downloader.lastSpecUrl, "https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip");
     assert.notEqual(downloader.lastSpecUrl, "https://evil.com/malicious.zip");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -275,9 +275,9 @@ test("F. IPC Bridge: runtime inexistente ou inconsistente retorna erro determin�
   try {
     const store = new RuntimeStore({ baseDir: tempDir });
     await store.registerRuntime({
-      id: "python-3.12.8",
+      id: "python-3.13.1",
       name: "Python",
-      version: "3.12.8",
+      version: "3.13.1",
       category: "provisioned",
       status: "ready",
       installDir: path.join(tempDir, "pasta-fantasma"),
@@ -297,7 +297,7 @@ test("F. IPC Bridge: runtime inexistente ou inconsistente retorna erro determin�
     });
 
     const result = await orchestrator.requestProvisioning(
-      { runtimeId: "python", version: "3.12.8" },
+      { runtimeId: "python", version: "3.13.1" },
       { approved: true, source: "user" }
     );
 
@@ -331,7 +331,7 @@ test("G. GARANTIA ARQUITETURAL: process.env.PATH permanece 100% inalterado duran
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       reason: "IPC Test",
       confidence: "high" as const,
       evidence: "ipc-test",

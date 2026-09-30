@@ -81,6 +81,13 @@ interface Window {
     githubCreatePullRequest(repoFullName: string, head: string, base: string, title?: string, body?: string): Promise<{ ok: boolean; error?: string; html_url?: string }>;
     onGithubEvent(callback: (event: any) => void): () => void;
     githubDiscardChanges(): Promise<boolean>;
+    githubCheckSync?(projectPath?: string): Promise<any>;
+    githubPullChanges?(projectPath?: string): Promise<any>;
+    githubGetSyncDetails?(projectPath?: string): Promise<any>;
+    githubSyncAndCombine?(projectPath?: string): Promise<any>;
+    githubResolveConflict?(payload: { projectPath?: string; filePath: string; resolution: "local" | "github" | "both"; customContent?: string }): Promise<any>;
+    githubFinalizeSync?(payload?: { projectPath?: string; message?: string }): Promise<any>;
+    githubGetConflictDetails?(projectPath?: string): Promise<any[]>;
     githubCheckRepoAccess?(repoFullName: string): Promise<{ accessible: boolean; status: number }>;
     supabaseGetState(): Promise<any>;
     supabaseConnectWithToken(token: string): Promise<any>;

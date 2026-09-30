@@ -220,7 +220,7 @@ export function getEmbeddedRuntimeEnv(baseEnv: NodeJS.ProcessEnv = process.env):
   try {
     const binDirs: string[] = [];
 
-    // 1. Node.js runtime
+    // 1. Node.js runtime (inclui pnpm e yarn embutidos)
     try {
       const nodeRuntime = resolveNodeRuntime();
       if (nodeRuntime?.binDir && !binDirs.includes(nodeRuntime.binDir)) {
@@ -240,6 +240,32 @@ export function getEmbeddedRuntimeEnv(baseEnv: NodeJS.ProcessEnv = process.env):
       }
     } catch {}
 
+    // 3. Toolchain Base Embutida: Python, Bun, Deno, PHP
+    const baseDir = typeof __dirname !== "undefined" ? __dirname : process.cwd();
+    const candidateSearchBases = [
+      path.resolve(baseDir, "..", "..", "tools"),
+      path.resolve(baseDir, "..", "tools"),
+      path.resolve(process.cwd(), "tools"),
+    ];
+    if (process.resourcesPath) {
+      candidateSearchBases.push(path.join(process.resourcesPath, "tools"));
+    }
+
+    const toolSubdirs = ["python", "bun", "deno", "php"];
+    for (const searchBase of candidateSearchBases) {
+      for (const sub of toolSubdirs) {
+        const candidateDir = path.join(searchBase, sub);
+        if (fs.existsSync(candidateDir) && !binDirs.includes(candidateDir)) {
+          binDirs.push(candidateDir);
+          // Caso Bun tenha pasta bun-windows-x64 interna
+          const nestedBun = path.join(candidateDir, "bun-windows-x64");
+          if (fs.existsSync(nestedBun) && !binDirs.includes(nestedBun)) {
+            binDirs.push(nestedBun);
+          }
+        }
+      }
+    }
+
     if (binDirs.length > 0) {
       const currentPath = env.PATH || env.Path || "";
       const pathSegments = currentPath ? currentPath.split(path.delimiter).filter(Boolean) : [];
@@ -255,6 +281,11 @@ export function getEmbeddedRuntimeEnv(baseEnv: NodeJS.ProcessEnv = process.env):
           env.Path = newPath;
         }
       }
+    }
+
+    // Variáveis de ambiente default para Python embutido
+    if (!env.PYTHONUNBUFFERED) {
+      env.PYTHONUNBUFFERED = "1";
     }
   } catch (err) {
     console.warn("[Runtime] Não foi possível resolver ambiente de runtimes embutidos:", err);
@@ -284,6 +315,27 @@ export function spawnNodeTool(
     const cliPath = path.join(runtime.binDir, "node_modules", "npm", "bin", cliFileName);
     if (fs.existsSync(cliPath)) {
       console.log(`[PreviewRuntime] Direct Node invocation (bypassing cmd.exe): ${runtime.nodePath} ${cliPath} ${args.join(" ")}`);
+      return spawn(runtime.nodePath, [cliPath, ...args], { ...spawnOpts, shell: false });
+    }
+  }
+
+  const isPnpm = nameLower === "pnpm" || nameLower.endsWith("pnpm.cmd") || nameLower.endsWith("/pnpm");
+  const isPnpx = nameLower === "pnpx" || nameLower.endsWith("pnpx.cmd") || nameLower.endsWith("/pnpx");
+  if (isPnpm || isPnpx) {
+    const cliFileName = isPnpm ? "pnpm.cjs" : "pnpx.cjs";
+    const cliPath = path.join(runtime.binDir, "node_modules", "pnpm", "bin", cliFileName);
+    if (fs.existsSync(cliPath)) {
+      console.log(`[PreviewRuntime] Direct Node invocation (pnpm): ${runtime.nodePath} ${cliPath} ${args.join(" ")}`);
+      return spawn(runtime.nodePath, [cliPath, ...args], { ...spawnOpts, shell: false });
+    }
+  }
+
+  const isYarn = nameLower === "yarn" || nameLower.endsWith("yarn.cmd") || nameLower.endsWith("/yarn");
+  const isYarnpkg = nameLower === "yarnpkg" || nameLower.endsWith("yarnpkg.cmd") || nameLower.endsWith("/yarnpkg");
+  if (isYarn || isYarnpkg) {
+    const cliPath = path.join(runtime.binDir, "node_modules", "yarn", "bin", "yarn.js");
+    if (fs.existsSync(cliPath)) {
+      console.log(`[PreviewRuntime] Direct Node invocation (yarn): ${runtime.nodePath} ${cliPath} ${args.join(" ")}`);
       return spawn(runtime.nodePath, [cliPath, ...args], { ...spawnOpts, shell: false });
     }
   }

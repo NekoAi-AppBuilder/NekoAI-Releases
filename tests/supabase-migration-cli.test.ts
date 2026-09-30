@@ -1,24 +1,9 @@
-import { describe, test, expect, vi, beforeEach } from 'vitest';
+import { describe, test, expect, beforeEach } from 'bun:test';
 import { MigrationManager } from '../src/main/supabase/migration-manager';
-
-const mockRunCli = vi.fn();
-vi.mock('../src/main/supabase/supabase-manager', () => ({
-  supabaseManager: { cli: { runCli: (...args: any[]) => mockRunCli(...args) } }
-}));
-
-vi.mock('node:fs/promises', () => ({
-  default: {
-    mkdir: vi.fn().mockResolvedValue(undefined),
-    writeFile: vi.fn().mockResolvedValue(undefined)
-  },
-  mkdir: vi.fn().mockResolvedValue(undefined),
-  writeFile: vi.fn().mockResolvedValue(undefined)
-}));
 
 describe('MigrationManager - CLI Execution', () => {
   let manager: MigrationManager;
   beforeEach(() => {
-    vi.clearAllMocks();
     manager = new MigrationManager();
   });
 
@@ -40,7 +25,7 @@ describe('MigrationManager - CLI Execution', () => {
     const p = manager.proposeMigration({ sessionId: 's2', projectRef: 'proj_x', name: 'm2', sql: 'create table t2();' });
     await manager.replyProposal(proposalId!, true);
     manager.notifyToolExecuting(proposalId!);
-    await manager.notifyToolCompleted(proposalId!, true);
+    await manager.notifyToolCompleted(proposalId!, true, undefined, { remoteApplied: true });
     
     const res = await p;
     expect(res.success).toBe(true);

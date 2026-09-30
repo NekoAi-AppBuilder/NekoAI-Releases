@@ -28,20 +28,20 @@ async function createTempBaseDir(prefix: string): Promise<string> {
 class MockPythonProvider implements RuntimeProvider {
   id = "python";
   name = "Python Provider";
-  supportedVersions = ["3.12.8"];
+  supportedVersions = ["3.13.1"];
 
   getSupportedVersions(): RuntimeVersionSpec[] {
-    return [{ version: "3.12.8", isLts: true, isStable: true }];
+    return [{ version: "3.13.1", isLts: true, isStable: true }];
   }
 
   getDistribution(version: string, platform: string, architecture: string): RuntimeDistribution | undefined {
-    if (version !== "3.12.8") return undefined;
+    if (version !== "3.13.1") return undefined;
     return {
       runtime: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       platform: platform as any,
       architecture: architecture as any,
-      url: "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip",
+      url: "https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip",
       expectedSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       status: "verified",
       archiveType: "zip",
@@ -51,7 +51,7 @@ class MockPythonProvider implements RuntimeProvider {
   }
 
   isDistributionVerifiable(version: string, platform: string, architecture: string): boolean {
-    return version === "3.12.8";
+    return version === "3.13.1";
   }
 }
 
@@ -165,7 +165,7 @@ test("1. Lifecycle: Detector encontra Python em projeto e gera RuntimeRequiremen
     const req = requirements[0];
     assert.equal(req.technology, "Python");
     assert.equal(req.runtimeId, "python");
-    assert.equal(req.version, "3.12.8");
+    assert.equal(req.version, "3.13.1");
     assert.equal(req.state, "requires-authorization");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -180,14 +180,14 @@ test("2. Lifecycle: Runtime já instalado e consistente retorna estado 'ready'",
     await fs.writeFile(path.join(projectDir, "requirements.txt"), "requests\n");
 
     const store = new RuntimeStore({ baseDir: tempDir });
-    const installDir = path.join(tempDir, "python-3.12.8");
+    const installDir = path.join(tempDir, "python-3.13.1");
     await fs.mkdir(installDir, { recursive: true });
     await fs.writeFile(path.join(installDir, "python.exe"), "binary");
 
     await store.registerRuntime({
-      id: "python-3.12.8",
+      id: "python-3.13.1",
       name: "Python",
-      version: "3.12.8",
+      version: "3.13.1",
       category: "provisioned",
       status: "ready",
       installDir,
@@ -208,7 +208,7 @@ test("2. Lifecycle: Runtime já instalado e consistente retorna estado 'ready'",
     const req = requirements[0];
     assert.equal(req.state, "ready");
     assert.ok(req.descriptor);
-    assert.equal(req.descriptor.id, "python-3.12.8");
+    assert.equal(req.descriptor.id, "python-3.13.1");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
@@ -236,7 +236,7 @@ test("3. Lifecycle: Recusa de autorização (approved: false) cancela o fluxo e 
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       reason: "Requerido pelo projeto",
       confidence: "high" as const,
       evidence: "requirements.txt",
@@ -281,7 +281,7 @@ test("4. Lifecycle: Aprovação de autorização executa o fluxo e registra no S
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       reason: "Requerido pelo projeto",
       confidence: "high" as const,
       evidence: "requirements.txt",
@@ -298,7 +298,7 @@ test("4. Lifecycle: Aprovação de autorização executa o fluxo e registra no S
     assert.ok(downloader.downloadCalled);
     assert.ok(provisioner.provisionCalled);
 
-    const saved = await store.getRuntime("python-3.12.8");
+    const saved = await store.getRuntime("python-3.13.1");
     assert.ok(saved);
     assert.equal(saved.status, "ready");
 
@@ -334,7 +334,7 @@ test("5. Lifecycle: Checksum incorreto no download simulado gera estado 'failed'
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
+      version: "3.13.1",
       reason: "Requerido pelo projeto",
       confidence: "high" as const,
       evidence: "requirements.txt",
@@ -376,7 +376,7 @@ test("6. Lifecycle: Suporte a múltiplos runtimes independentes no mesmo projeto
     assert.ok(bunReq);
     assert.equal(pyReq.state, "requires-authorization");
     assert.equal(bunReq.state, "requires-authorization");
-    assert.equal(pyReq.version, "3.12.8");
+    assert.equal(pyReq.version, "3.13.1");
     assert.equal(bunReq.version, "1.1.30");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -392,9 +392,9 @@ test("7. Lifecycle: Runtime registrado no Store mas ausente no disco gera estado
 
     const store = new RuntimeStore({ baseDir: tempDir });
     await store.registerRuntime({
-      id: "python-3.12.8",
+      id: "python-3.13.1",
       name: "Python",
-      version: "3.12.8",
+      version: "3.13.1",
       category: "provisioned",
       status: "ready",
       installDir: path.join(tempDir, "pasta-excluida"),
@@ -453,8 +453,8 @@ test("9. Lifecycle: Permission Card Data (buildPermissionCardData) constrói met
     const req = {
       technology: "Python",
       runtimeId: "python",
-      version: "3.12.8",
-      reason: "Projeto requer Python 3.12.8",
+      version: "3.13.1",
+      reason: "Projeto requer Python 3.13.1",
       confidence: "high" as const,
       evidence: "requirements.txt",
       detectedFrom: "requirements.txt",
@@ -466,9 +466,9 @@ test("9. Lifecycle: Permission Card Data (buildPermissionCardData) constrói met
     assert.ok(card);
     assert.equal(card.runtimeId, "python");
     assert.equal(card.technology, "Python");
-    assert.equal(card.version, "3.12.8");
+    assert.equal(card.version, "3.13.1");
     assert.equal(card.officialOrigin, "www.python.org");
-    assert.equal(card.downloadUrl, "https://www.python.org/ftp/python/3.12.8/python-3.12.8-embed-amd64.zip");
+    assert.equal(card.downloadUrl, "https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip");
     assert.equal(card.expectedSha256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});

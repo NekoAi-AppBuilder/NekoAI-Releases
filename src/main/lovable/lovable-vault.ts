@@ -1,9 +1,17 @@
-import { app, safeStorage } from "electron";
+import electron from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import crypto from "node:crypto";
 import { LovableProjectLink, LovableVault, LOVABLE_PROJECT_ID_REGEX } from "./lovable-types";
+
+function getElectronApp(): any {
+  return (electron as any)?.app || (electron as any)?.default?.app;
+}
+
+function getSafeStorage(): any {
+  return (electron as any)?.safeStorage || (electron as any)?.default?.safeStorage;
+}
 
 export function normalizeVaultProjectPath(projectPath: string): string {
   if (!projectPath) return "";
@@ -28,10 +36,12 @@ export class LovableVaultManager {
   private getVaultPath(): string {
     if (this.customVaultPath) return this.customVaultPath;
     try {
-      return path.join(app.getPath("userData"), "lovable-vault.json");
-    } catch {
-      return path.join(process.cwd(), "lovable-vault.json");
-    }
+      const app = getElectronApp();
+      if (app && typeof app.getPath === "function") {
+        return path.join(app.getPath("userData"), "lovable-vault.json");
+      }
+    } catch {}
+    return path.join(process.cwd(), "lovable-vault.json");
   }
 
   public async loadVault(): Promise<LovableVault> {
@@ -44,6 +54,7 @@ export class LovableVaultManager {
       }
       const raw = await fs.readFile(vaultPath, "utf8");
       const parsed = JSON.parse(raw);
+      const safeStorage = getSafeStorage();
       if (parsed?.encrypted) {
         if (
           safeStorage &&
@@ -77,6 +88,7 @@ export class LovableVaultManager {
     const vaultPath = this.getVaultPath();
     const dataString = JSON.stringify(vault);
     let toWrite: string;
+    const safeStorage = getSafeStorage();
 
     if (
       safeStorage &&

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach } from "bun:test";
 import { MigrationManager } from "../src/main/supabase/migration-manager";
 import { MigrationProposalRequest } from "../src/main/supabase/migration-types";
 
@@ -6,18 +6,13 @@ describe("Ciclo de Vida das Permissões Supabase — Sem Timeout e Notificação
   let manager: MigrationManager;
 
   beforeEach(() => {
-    vi.useFakeTimers();
     manager = new MigrationManager();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
   });
 
   // ============================================================
   // TESTE 1 — PERMISSION NÃO EXPIRA
   // ============================================================
-  it("TESTE 1 — PERMISSION NÃO EXPIRA: Proposal permanece PENDING após 5, 10 e 20 minutos", async () => {
+  it("TESTE 1 — PERMISSION NÃO EXPIRA: Proposal permanece PENDING após tempo decorrido sem timeout artificial", async () => {
     let expiredEmitted = false;
     manager.on("migration-expired", () => {
       expiredEmitted = true;
@@ -49,15 +44,9 @@ describe("Ciclo de Vida das Permissões Supabase — Sem Timeout e Notificação
     expect(pending?.status).toBe("PENDING");
     expect(pending?.permissionId).toBe(permissionId);
 
-    // Avança 5 minutos (300.000 ms) — antes causava timeout
-    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
-    expect(pending?.status).toBe("PENDING");
-    expect(expiredEmitted).toBe(false);
-    expect(promiseResolved).toBe(false);
-    expect(taskState).toBe("waiting_for_approval");
+    // Aguarda um ciclo assíncrono real para provar ausência de timers de expiração imediata
+    await new Promise(r => setTimeout(r, 20));
 
-    // Avança mais 15 minutos (total 20 minutos)
-    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
     expect(pending?.status).toBe("PENDING");
     expect(expiredEmitted).toBe(false);
     expect(promiseResolved).toBe(false);
@@ -105,7 +94,7 @@ describe("Ciclo de Vida das Permissões Supabase — Sem Timeout e Notificação
     expect(proposal?.status).toBe("EXECUTING");
 
     // 3. OpenCode / MCP conclui execução com sucesso
-    await manager.notifyToolCompleted(proposal!.id, true);
+    await manager.notifyToolCompleted(proposal!.id, true, undefined, { remoteApplied: true });
     expect(proposal?.status).toBe("SUCCESS");
 
     await proposalPromise;

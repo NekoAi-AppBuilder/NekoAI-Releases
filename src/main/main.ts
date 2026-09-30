@@ -38,6 +38,7 @@ import { RuntimeEnvironmentBuilder } from "./runtime/runtime-environment";
 import { RuntimeRequirement } from "./runtime/runtime-types";
 import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTimeoutDiagnostic } from "./opencode-diagnostics";
 import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
+import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolveConflictFile, finalizeConflictResolution, getConflictFiles, parseLinkedRepo, type GitSyncStatus, type PullResult, type GitConflictFile, type GitSyncCombineResult } from "./git-sync";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -1308,6 +1309,11 @@ type GitStatus = {
   linkedRepo: string | null;
   dirty: boolean;
   unpushed?: boolean;
+  ahead?: number;
+  behind?: number;
+  diverged?: boolean;
+  canFastForward?: boolean;
+  syncState?: string;
   changedFiles?: GitChangedFile[];
   summary?: GitStatusSummary;
 };
@@ -1981,36 +1987,52 @@ async function getGitStatus(targetProject?: string): Promise<GitStatus> {
   const emptySummary: GitStatusSummary = { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 };
   const projectPath = targetProject ? assertProjectRootSafe(targetProject, "git-read") : currentProject;
   if (!projectPath) {
-    return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, changedFiles: [], summary: emptySummary };
+    return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, ahead: 0, behind: 0, diverged: false, canFastForward: false, changedFiles: [], summary: emptySummary };
   }
 
   const inside = await runGit(projectPath, ["rev-parse", "--is-inside-work-tree"], {}, 10000);
   if (inside.code !== 0 || inside.stdout !== "true") {
-    return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, changedFiles: [], summary: emptySummary };
+    return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, ahead: 0, behind: 0, diverged: false, canFastForward: false, changedFiles: [], summary: emptySummary };
   }
 
   const branchResult = await runGit(projectPath, ["branch", "--show-current"], {}, 10000);
   const remoteResult = await runGit(projectPath, ["remote", "get-url", "origin"], {}, 10000);
   const dirtyResult = await runGit(projectPath, ["status", "--porcelain", "-uall"], {}, 15000);
 
-  const parsed = parseGitStatusPorcelain(dirtyResult.stdout);
+  const parsed = parseGitStatusPorcelain(dirtyResult.stdout || "");
 
-  const remote = remoteResult.code === 0 && remoteResult.stdout ? remoteResult.stdout : null;
-  const linkedRepo = remote
-    ? remote
-        .replace(/^git@github\.com:/i, "")
-        .replace(/^https?:\/\/github\.com\//i, "")
-        .replace(/\/+$/, "")
-        .replace(/\.git$/i, "")
-        .replace(/\/+$/, "")
-    : null;
+  const remote = remoteResult.code === 0 && remoteResult.stdout ? remoteResult.stdout.trim() : null;
+  const linkedRepo = parseLinkedRepo(remote);
 
-  const currentBranch = branchResult.code === 0 && branchResult.stdout ? branchResult.stdout : null;
+  const currentBranch = branchResult.code === 0 && branchResult.stdout ? branchResult.stdout.trim() : null;
+  let ahead = 0;
+  let behind = 0;
   let unpushed = false;
+  let diverged = false;
+  let canFastForward = false;
+
   if (currentBranch && remote) {
-    const aheadCheck = await runGit(projectPath, ["rev-list", "--count", `origin/${currentBranch}..${currentBranch}`], {}, 5000);
-    if (aheadCheck.code === 0 && parseInt(aheadCheck.stdout.trim(), 10) > 0) {
-      unpushed = true;
+    const remoteRefName = `refs/remotes/origin/${currentBranch}`;
+    const remoteRefCheck = await runGit(projectPath, ["rev-parse", "--verify", remoteRefName], {}, 5000);
+    if (remoteRefCheck.code === 0) {
+      const aheadCheck = await runGit(projectPath, ["rev-list", "--count", `${remoteRefName}..HEAD`], {}, 5000);
+      const behindCheck = await runGit(projectPath, ["rev-list", "--count", `HEAD..${remoteRefName}`], {}, 5000);
+      if (aheadCheck.code === 0) {
+        ahead = parseInt(aheadCheck.stdout.trim(), 10) || 0;
+      }
+      if (behindCheck.code === 0) {
+        behind = parseInt(behindCheck.stdout.trim(), 10) || 0;
+      }
+      diverged = ahead > 0 && behind > 0;
+      canFastForward = ahead === 0 && behind > 0 && parsed.files.length === 0;
+      unpushed = ahead > 0;
+    } else {
+      const headCheck = await runGit(projectPath, ["rev-parse", "--verify", "HEAD"], {}, 5000);
+      if (headCheck.code === 0) {
+        const countRes = await runGit(projectPath, ["rev-list", "--count", "HEAD"], {}, 5000);
+        ahead = parseInt(countRes.stdout.trim(), 10) || 0;
+        unpushed = ahead > 0;
+      }
     }
   }
 
@@ -2021,6 +2043,10 @@ async function getGitStatus(targetProject?: string): Promise<GitStatus> {
     linkedRepo,
     dirty: parsed.files.length > 0,
     unpushed,
+    ahead,
+    behind,
+    diverged,
+    canFastForward,
     changedFiles: parsed.files,
     summary: parsed.summary
   };
@@ -6398,6 +6424,21 @@ async function performGithubCommitPush(
     // Ensure .gitignore exists and is populated
     await ensureGitignore(safePath);
 
+    // Pre-check sync status with remote
+    const syncStatus = await checkGitSyncStatus(safePath, {
+      fetch: true,
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
+
+    if (syncStatus.behind > 0 || syncStatus.diverged) {
+      const msg = syncStatus.diverged
+        ? "O projeto possui alterações divergentes no GitHub e localmente. Sincronize antes de enviar commits."
+        : "O GitHub possui alterações que ainda não estão neste computador. Traga as alterações antes de enviar commits.";
+      throw new Error(msg);
+    }
+
     // Configure user.name and user.email if not set
     const name = await runGit(safePath, ["config", "user.name"], {}, 5000);
     if (name.code !== 0 || !name.stdout) {
@@ -6494,7 +6535,6 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
       console.log(`[Neko/AutoCommit] Ignorando tarefa já commitada: taskId=${taskId}`);
       return { ok: true, skipped: true, reason: "already-committed", message: "Esta tarefa já foi enviada ao GitHub." };
     }
-    autoCommittedTaskIds.add(taskId);
   }
 
   // 3. Verifica se o projeto está conectado ao GitHub
@@ -6508,7 +6548,38 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
     return { ok: true, committed: false, pushed: false, status: gitStatus, message: "Nenhuma alteração nova para enviar ao GitHub." };
   }
 
-  // 5. Executa commit e push sob lock
+  // 5. Verifica se há alterações externas antes do commit/push
+  let token: string | undefined = undefined;
+  try {
+    token = await getGithubAccessToken();
+  } catch {}
+
+  const syncStatus = await checkGitSyncStatus(projectPath, {
+    fetch: true,
+    token,
+    gitRunner: runGit,
+    authenticatedGitRunner: runGitWithGithubAuth
+  });
+
+  if (syncStatus.behind > 0 || syncStatus.diverged) {
+    console.warn(`[Neko/AutoCommit] Auto Commit pausado devido a alterações no GitHub: behind=${syncStatus.behind}, diverged=${syncStatus.diverged}`);
+    return {
+      ok: false,
+      skipped: true,
+      reason: syncStatus.diverged ? "diverged" : "remote-ahead",
+      syncStatus,
+      status: gitStatus,
+      message: syncStatus.diverged
+        ? "O projeto possui alterações diferentes no GitHub e localmente. Auto Commit pausado."
+        : "O GitHub possui alterações que ainda não estão neste computador. Auto Commit pausado."
+    };
+  }
+
+  if (taskId) {
+    autoCommittedTaskIds.add(taskId);
+  }
+
+  // 6. Executa commit e push sob lock
   const commitMessage = payload?.message || "NekoAI: tarefa concluída";
   return await performGithubCommitPush(projectPath, commitMessage, { isAuto: true });
 });
@@ -6835,6 +6906,186 @@ ipcMain.handle("github:cancelPublish", async () => {
 });
 
 ipcMain.handle("github:gitStatus", async () => getGitStatus());
+
+ipcMain.handle("github:checkSync", async (_event, projectPath?: string) => {
+  const target = projectPath || currentProject;
+  if (!target) {
+    return {
+      initialized: false,
+      branch: null,
+      remote: null,
+      linkedRepo: null,
+      ahead: 0,
+      behind: 0,
+      workingTreeDirty: false,
+      diverged: false,
+      canFastForward: false,
+      status: "not-initialized",
+      hasRemote: false,
+      hasUpstream: false,
+      fetchSuccess: false,
+      fetchError: null,
+      changedFiles: [],
+      summary: { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 }
+    };
+  }
+  const safePath = assertProjectRootSafe(target, "git-read");
+  let token: string | undefined = undefined;
+  try {
+    token = await getGithubAccessToken();
+  } catch {}
+
+  return await checkGitSyncStatus(safePath, {
+    fetch: true,
+    token,
+    gitRunner: runGit,
+    authenticatedGitRunner: runGitWithGithubAuth
+  });
+});
+
+ipcMain.handle("github:pullChanges", async (_event, projectPath?: string) => {
+  licenseManager.assertAccess("sincronização de alterações do GitHub");
+  const target = projectPath || currentProject;
+  if (!target) throw new Error("Abra um projeto antes de sincronizar alterações.");
+  const safePath = assertProjectRootSafe(target, "git-write");
+
+  return withProjectGitLock(safePath, async () => {
+    let token: string | undefined = undefined;
+    try {
+      token = await getGithubAccessToken();
+    } catch {}
+
+    const result = await pullFastForwardOnly(safePath, {
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
+
+    invalidateProjectCheckpoints(safePath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: safePath, reason: "git.pull" }
+    });
+
+    return {
+      ...result,
+      status: await getGitStatus(safePath)
+    };
+  });
+});
+
+ipcMain.handle("github:getSyncDetails", async (_event, projectPath?: string) => {
+  const target = projectPath || currentProject;
+  if (!target) return null;
+  const safePath = assertProjectRootSafe(target, "git-read");
+  let token: string | undefined = undefined;
+  try {
+    token = await getGithubAccessToken();
+  } catch {}
+
+  return await checkGitSyncStatus(safePath, {
+    fetch: false,
+    token,
+    gitRunner: runGit,
+    authenticatedGitRunner: runGitWithGithubAuth
+  });
+});
+
+ipcMain.handle("github:syncAndCombine", async (_event, projectPath?: string) => {
+  licenseManager.assertAccess("sincronização de alterações do GitHub");
+  const target = projectPath || currentProject;
+  if (!target) throw new Error("Abra um projeto antes de sincronizar e combinar alterações.");
+  const safePath = assertProjectRootSafe(target, "git-write");
+
+  return withProjectGitLock(safePath, async () => {
+    let token: string | undefined = undefined;
+    try {
+      token = await getGithubAccessToken();
+    } catch {}
+
+    const result = await syncAndCombineProject(safePath, {
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
+
+    invalidateProjectCheckpoints(safePath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: safePath, reason: "git.sync-combine" }
+    });
+
+    return {
+      ...result,
+      status: await getGitStatus(safePath)
+    };
+  });
+});
+
+ipcMain.handle("github:resolveConflict", async (_event, payload: { projectPath?: string; filePath: string; resolution: "local" | "github" | "both"; customContent?: string }) => {
+  licenseManager.assertAccess("resolução de conflitos no Git");
+  const target = payload?.projectPath || currentProject;
+  if (!target) throw new Error("Abra um projeto antes de resolver conflitos.");
+  if (!payload?.filePath) throw new Error("Arquivo para resolução de conflito não informado.");
+  if (!["local", "github", "both"].includes(payload?.resolution)) {
+    throw new Error("Opção de resolução de conflito inválida.");
+  }
+  const safePath = assertProjectRootSafe(target, "git-write");
+
+  return withProjectGitLock(safePath, async () => {
+    const res = await resolveConflictFile(
+      safePath,
+      payload.filePath,
+      payload.resolution,
+      payload.customContent,
+      runGit
+    );
+
+    invalidateProjectCheckpoints(safePath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: safePath, reason: "git.resolve-conflict", file: payload.filePath }
+    });
+
+    return res;
+  });
+});
+
+ipcMain.handle("github:finalizeSync", async (_event, payload?: { projectPath?: string; message?: string }) => {
+  licenseManager.assertAccess("finalização de sincronização no Git");
+  const target = payload?.projectPath || currentProject;
+  if (!target) throw new Error("Abra um projeto antes de finalizar a sincronização.");
+  const safePath = assertProjectRootSafe(target, "git-write");
+
+  return withProjectGitLock(safePath, async () => {
+    const result = await finalizeConflictResolution(safePath, {
+      message: payload?.message,
+      runner: runGit
+    });
+
+    invalidateProjectCheckpoints(safePath);
+    mainWindow?.webContents.send("opencode:event", {
+      type: "neko.project.changed",
+      properties: { path: safePath, reason: "git.finalize-sync" }
+    });
+
+    return {
+      ...result,
+      status: await getGitStatus(safePath)
+    };
+  });
+});
+
+ipcMain.handle("github:getConflictDetails", async (_event, projectPath?: string) => {
+  const target = projectPath || currentProject;
+  if (!target) return [];
+  const safePath = assertProjectRootSafe(target, "git-read");
+
+  return withProjectGitLock(safePath, async () => {
+    return await getConflictFiles(safePath, runGit);
+  });
+});
+
 
 ipcMain.handle("github:discardChanges", async () => {
   licenseManager.assertAccess("descarte de alterações no Git");

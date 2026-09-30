@@ -40,12 +40,31 @@ export function extractFetchErrorDetails(error: any): FetchErrorDiagnostics {
   const message = String(error?.message || error || "Unknown error");
   const cause = error?.cause;
 
-  const causeCode = cause?.code ? String(cause.code) : undefined;
-  const causeErrno = cause?.errno !== undefined ? (typeof cause.errno === "number" || typeof cause.errno === "string" ? cause.errno : String(cause.errno)) : undefined;
-  const causeSyscall = cause?.syscall ? String(cause.syscall) : undefined;
-  const causeAddress = cause?.address ? String(cause.address) : undefined;
-  const causePort = typeof cause?.port === "number" ? cause.port : undefined;
-  const causeMessage = cause?.message ? String(cause.message) : undefined;
+  let causeCode = (cause?.code || error?.code) ? String(cause?.code || error?.code) : undefined;
+  let causeErrno = (cause?.errno !== undefined || error?.errno !== undefined)
+    ? (typeof (cause?.errno ?? error?.errno) === "number" || typeof (cause?.errno ?? error?.errno) === "string" ? (cause?.errno ?? error?.errno) : String(cause?.errno ?? error?.errno))
+    : undefined;
+  let causeSyscall = (cause?.syscall || error?.syscall) ? String(cause?.syscall || error?.syscall) : undefined;
+  let causeAddress = (cause?.address || error?.address) ? String(cause?.address || error?.address) : undefined;
+  let causePort = typeof cause?.port === "number" ? cause.port : (typeof error?.port === "number" ? error.port : undefined);
+  const causeMessage = (cause?.message || error?.message) ? String(cause?.message || error?.message) : undefined;
+
+  // Normaliza códigos entre Node.js (ECONNREFUSED) e Bun (ConnectionRefused)
+  if (causeCode === "ConnectionRefused") {
+    causeCode = "ECONNREFUSED";
+  }
+
+  // Extrai de mensagens estruturadas quando cause não está presente (ex: Bun / Node TLS)
+  if (!causeCode && (message.includes("ECONNREFUSED") || message.includes("ConnectionRefused"))) {
+    causeCode = "ECONNREFUSED";
+  }
+  if (!causeAddress || !causePort) {
+    const match = message.match(/(?:connect\s+[A-Z_]+\s+)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost):(\d+)/i);
+    if (match) {
+      if (!causeAddress) causeAddress = match[1];
+      if (!causePort) causePort = parseInt(match[2], 10);
+    }
+  }
 
   const parts: string[] = [];
 
