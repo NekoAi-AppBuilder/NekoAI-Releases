@@ -59,6 +59,8 @@ interface Window {
     onEvent(callback: (event: any) => void): () => void;
     onPreviewEvent(callback: (event: any) => void): () => void;
     githubStatus(refresh?: boolean): Promise<any>;
+    githubSelectAccount?(accountId: string, projectPath?: string): Promise<any>;
+    githubDisconnectAccount?(accountId: string): Promise<any>;
     githubStart(forceReauthorize?: boolean): Promise<any>;
     githubCancel(): Promise<{ ok: boolean }>;
     githubDisconnect(): Promise<boolean>;

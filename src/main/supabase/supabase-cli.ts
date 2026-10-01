@@ -845,7 +845,7 @@ export class SupabaseCli {
       response = await fetchFn("https://api.supabase.com/v1/organizations", {
         headers: {
           Authorization: `Bearer ${trimmed}`,
-          "User-Agent": "NekoAI/0.4.95",
+          "User-Agent": "NekoAI/0.4.96",
         },
         signal: AbortSignal.timeout(15000),
       });
@@ -927,7 +927,7 @@ export class SupabaseCli {
         const res = await fetchFn("https://api.supabase.com/v1/projects", {
           headers: {
             Authorization: `Bearer ${token}`,
-            "User-Agent": "NekoAI/0.4.95",
+            "User-Agent": "NekoAI/0.4.96",
           },
           signal: AbortSignal.timeout(20000),
         });
@@ -998,7 +998,7 @@ export class SupabaseCli {
         const res = await fetchFn("https://api.supabase.com/v1/organizations", {
           headers: {
             Authorization: `Bearer ${token}`,
-            "User-Agent": "NekoAI/0.4.95",
+            "User-Agent": "NekoAI/0.4.96",
           },
           signal: AbortSignal.timeout(15000),
         });
@@ -1061,7 +1061,7 @@ export class SupabaseCli {
           headers: {
             Authorization: `Bearer ${token}`,
             "Content-Type": "application/json",
-            "User-Agent": "NekoAI/0.4.95",
+            "User-Agent": "NekoAI/0.4.96",
           },
           body: JSON.stringify({
             name: payload.name,
@@ -1125,7 +1125,7 @@ export class SupabaseCli {
         const res = await fetchFn(`https://api.supabase.com/v1/projects/${ref}/api-keys`, {
           headers: {
             Authorization: `Bearer ${token}`,
-            "User-Agent": "NekoAI/0.4.95",
+            "User-Agent": "NekoAI/0.4.96",
           },
           signal: AbortSignal.timeout(15000),
         });

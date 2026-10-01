@@ -581,8 +581,246 @@ type PreviewConsoleEntry = {
   ts: number;
 };
 
-type GithubStatus = { connected: boolean; user?: { login: string; name?: string | null; avatarUrl?: string | null }; repos?: Array<{ id: number; name: string; fullName: string; private: boolean; htmlUrl: string; defaultBranch?: string | null }>; needsInstallation?: boolean; needsReauthorization?: boolean; needsPermissions?: boolean; capabilities?: { canReadRepositories: boolean; canWriteContents: boolean; canCreateRepository: boolean }; installUrl?: string };
+type GithubAccountSummary = { id: string; login: string; name?: string | null; avatarUrl?: string | null };
+type GithubStatus = { connected: boolean; activeAccount?: GithubAccountSummary; accounts?: GithubAccountSummary[]; user?: { login: string; name?: string | null; avatarUrl?: string | null }; repos?: Array<{ id: number; name: string; fullName: string; private: boolean; htmlUrl: string; defaultBranch?: string | null }>; needsInstallation?: boolean; needsReauthorization?: boolean; needsPermissions?: boolean; capabilities?: { canReadRepositories: boolean; canWriteContents: boolean; canCreateRepository: boolean }; installUrl?: string };
 type GithubDevice = { userCode: string; verificationUri: string; expiresIn: number; interval: number };
+
+interface GithubAccountSelectorProps {
+  githubStatus: GithubStatus;
+  onSelectAccount: (accountId: string) => void;
+  onDisconnectAccount: (accountId?: string) => void;
+  onAddAccount: () => void;
+  disabled?: boolean;
+}
+
+function GithubAccountSelector({
+  githubStatus,
+  onSelectAccount,
+  onDisconnectAccount,
+  onAddAccount,
+  disabled
+}: GithubAccountSelectorProps) {
+  const [open, setOpen] = React.useState(false);
+  const buttonRef = React.useRef<HTMLButtonElement>(null);
+  const [popoverPos, setPopoverPos] = React.useState<{ top: number; left: number; width: number } | null>(null);
+
+  const updatePos = React.useCallback(() => {
+    if (buttonRef.current) {
+      const rect = buttonRef.current.getBoundingClientRect();
+      setPopoverPos({
+        top: rect.bottom + 4,
+        left: rect.left,
+        width: Math.max(280, rect.width)
+      });
+    }
+  }, []);
+
+  const toggleOpen = () => {
+    if (disabled) return;
+    if (!open) {
+      updatePos();
+      setOpen(true);
+      console.log("[GitHub/UI] account selector opened");
+    } else {
+      setOpen(false);
+      console.log("[GitHub/UI] account selector closed (toggle)");
+    }
+  };
+
+  React.useEffect(() => {
+    if (!open) return;
+    const handleScrollOrResize = () => {
+      updatePos();
+    };
+    window.addEventListener("scroll", handleScrollOrResize, true);
+    window.addEventListener("resize", handleScrollOrResize);
+    return () => {
+      window.removeEventListener("scroll", handleScrollOrResize, true);
+      window.removeEventListener("resize", handleScrollOrResize);
+    };
+  }, [open, updatePos]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (buttonRef.current && buttonRef.current.contains(e.target as Node)) return;
+      const popoverEl = document.getElementById("neko-github-account-portal-popover");
+      if (popoverEl && popoverEl.contains(e.target as Node)) return;
+      setOpen(false);
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", handleClickOutside);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  const activeAcc = githubStatus.activeAccount || githubStatus.user;
+  const accountsList = (githubStatus.accounts && githubStatus.accounts.length > 0 ? githubStatus.accounts : [activeAcc]).filter(Boolean);
+
+  return (
+    <div className="github-account-selector-container" style={{ position: "relative", width: "100%" }}>
+      <button
+        ref={buttonRef}
+        type="button"
+        className="github-account-selector-btn"
+        onClick={toggleOpen}
+        disabled={disabled}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          width: "100%",
+          background: "rgba(255, 255, 255, 0.05)",
+          border: "1px solid rgba(255, 255, 255, 0.12)",
+          borderRadius: 8,
+          padding: "6px 12px",
+          cursor: disabled ? "not-allowed" : "pointer",
+          color: "#ffffff",
+          boxSizing: "border-box"
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+          <div className="github-avatar" style={{ width: 24, height: 24, borderRadius: "50%", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#333", flexShrink: 0 }}>
+            {activeAcc?.avatarUrl ? (
+              <img src={activeAcc.avatarUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            ) : (
+              <GitHubIcon size={16} />
+            )}
+          </div>
+          <div style={{ textAlign: "left", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <b style={{ fontSize: 13, display: "block", lineHeight: 1.2, color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {activeAcc?.name || activeAcc?.login || "GitHub"}
+            </b>
+            <small style={{ fontSize: 11, color: "#9ca3af", display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              @{activeAcc?.login || ""}
+            </small>
+          </div>
+        </div>
+        <ChevronDown size={14} style={{ color: "#9ca3af", flexShrink: 0, marginLeft: 8 }} />
+      </button>
+
+      {open && popoverPos && createPortal(
+        <div
+          id="neko-github-account-portal-popover"
+          className="github-account-popover"
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "fixed",
+            top: popoverPos.top,
+            left: popoverPos.left,
+            width: popoverPos.width,
+            background: "#18181b",
+            border: "1px solid rgba(255, 255, 255, 0.15)",
+            borderRadius: 8,
+            boxShadow: "0 12px 30px rgba(0,0,0,0.7)",
+            zIndex: 999999,
+            padding: "6px 0",
+            overflow: "hidden",
+            boxSizing: "border-box"
+          }}
+        >
+          <div style={{ padding: "4px 12px 6px 12px", fontSize: 11, fontWeight: 600, color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.5px" }}>
+            Contas Conectadas
+          </div>
+          {accountsList.map((acc: any) => {
+            const isActive = acc.id ? acc.id === activeAcc?.id : acc.login === activeAcc?.login;
+            return (
+              <div
+                key={acc.id || acc.login}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  padding: "8px 12px",
+                  background: isActive ? "rgba(168, 85, 247, 0.14)" : "transparent",
+                  cursor: "pointer"
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  console.log(`[GitHub/UI] account item clicked accountId=${acc.id || acc.login} isActive=${isActive}`);
+                  setOpen(false);
+                  if (!isActive && acc.id) {
+                    console.log(`[GitHub/UI] calling onSelectAccount accountId=${acc.id}`);
+                    onSelectAccount(acc.id);
+                  }
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
+                  <span style={{ width: 14, display: "inline-flex", justifyContent: "center" }}>
+                    {isActive ? <Check size={14} color="#a855f7" /> : null}
+                  </span>
+                  <div style={{ width: 22, height: 22, borderRadius: "50%", overflow: "hidden", background: "#333", flexShrink: 0 }}>
+                    {acc.avatarUrl ? <img src={acc.avatarUrl} alt="" style={{ width: "100%", height: "100%" }} /> : <GitHubIcon size={14} />}
+                  </div>
+                  <div style={{ minWidth: 0, flex: 1, textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap" }}>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: "#fff" }}>@{acc.login}</div>
+                    {acc.name && <div style={{ fontSize: 10, color: "#9ca3af" }}>{acc.name}</div>}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  title="Desconectar conta"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    console.log(`[GitHub/UI] trash clicked accountId=${acc.id || acc.login}`);
+                    setOpen(false);
+                    onDisconnectAccount(acc.id);
+                  }}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    color: "#ef4444",
+                    cursor: "pointer",
+                    padding: 4,
+                    borderRadius: 4,
+                    display: "flex",
+                    alignItems: "center"
+                  }}
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            );
+          })}
+          <div style={{ borderTop: "1px solid rgba(255, 255, 255, 0.08)", marginTop: 4, paddingTop: 4 }}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                console.log("[GitHub/UI] add account clicked");
+                setOpen(false);
+                onAddAccount();
+              }}
+              style={{
+                width: "100%",
+                padding: "8px 12px",
+                background: "transparent",
+                border: "none",
+                color: "#a855f7",
+                fontSize: 12,
+                fontWeight: 600,
+                textAlign: "left",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 6
+              }}
+            >
+              <Plus size={14} /> Adicionar conta GitHub
+            </button>
+          </div>
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
 type RecentProject = {
   name: string;
   path: string;
@@ -1084,7 +1322,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.95");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.96");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1744,6 +1982,7 @@ function App() {
   const [uploadErrors, setUploadErrors] = React.useState<Array<{id:string; name:string; message:string; extension:string}>>([]);
   const [chatCollapsed, setChatCollapsed] = React.useState(false);
   const [githubStatus, setGithubStatus] = React.useState<GithubStatus>({ connected: false, repos: [] });
+  const [accountDropdownOpen, setAccountDropdownOpen] = React.useState(false);
   const [githubDevice, setGithubDevice] = React.useState<GithubDevice | null>(null);
   const [githubBusy, setGithubBusy] = React.useState(false);
   const [githubError, setGithubError] = React.useState("");
@@ -1831,6 +2070,8 @@ function App() {
   const [githubCloneParent, setGithubCloneParent] = React.useState("");
   const [githubCloneName, setGithubCloneName] = React.useState("");
   const [githubRepoSearch, setGithubRepoSearch] = React.useState("");
+  const [githubCloneLoadingRepos, setGithubCloneLoadingRepos] = React.useState(false);
+  const cloneFetchGenRef = React.useRef(0);
   const [pendingGithubIntent, setPendingGithubIntent] = React.useState<"clone" | "publish" | null>(null);
   const pendingGithubIntentRef = React.useRef<"clone" | "publish" | null>(null);
   const setGithubIntent = React.useCallback((intent: "clone" | "publish" | null) => {
@@ -2844,6 +3085,10 @@ function App() {
 
       if (modal) {
         if (target.closest(".modal")) return;
+        // The GitHub account selector dropdown renders via Portal to document.body
+        // (outside the .modal DOM tree) to avoid overflow clipping. Clicks inside
+        // the portal popover must NOT close the modal.
+        if (target.closest("#neko-github-account-portal-popover")) return;
         if (modal === "vercel" && vercelState.connection === "authorizing") {
           void window.neko.vercelCancelLogin().catch(() => {});
           setVercelBusy(false);
@@ -2855,6 +3100,9 @@ function App() {
       if (!target.closest(".project-selector-wrap")) {
         setProjectMenuOpen(false);
         setRecentProjectsMenuOpen(false);
+      }
+      if (!target.closest(".github-account-dropdown-wrap")) {
+        setAccountDropdownOpen(false);
       }
       if (!target.closest(".model-anchor")) {
         setModelOpen(false);
@@ -5873,7 +6121,8 @@ function App() {
     }
   }
 
-  async function startGithubConnect() {
+  async function startGithubConnect(forceReauthorize: boolean = false) {
+    console.log("[GitHub/UI] add account clicked");
     if (githubBusy) return;
     if (modalRef.current === "githubClone" || pendingGithubIntentRef.current === "clone") {
       setGithubIntent("clone");
@@ -5882,10 +6131,12 @@ function App() {
     }
     setGithubBusy(true);
     setGithubError("");
+    console.log(`[GitHub/UI] calling githubStart forceReauthorize=${forceReauthorize}`);
     try {
-      const result = await window.neko.githubStart();
+      const result = await window.neko.githubStart(forceReauthorize);
       const device = result?.device || (result?.userCode ? result : null);
       if (device?.userCode) {
+        console.log("[GitHub/OAuth] user code received");
         setGithubDevice({
           userCode: device.userCode,
           verificationUri: device.verificationUri || "https://github.com/login/device",
@@ -5897,6 +6148,7 @@ function App() {
     } catch (error) {
       setGithubError(getUserFacingError(error, "Erro ao iniciar conexão com GitHub."));
       console.warn("[Github] connect failed", String((error as Error)?.message ?? error));
+    } finally {
       setGithubBusy(false);
     }
   }
@@ -5994,6 +6246,9 @@ function App() {
       }
 
       const selectedFilesArray = selectedCommitFiles.size > 0 ? Array.from(selectedCommitFiles) : undefined;
+      if (selectedFilesArray) {
+        selectedFilesArray.forEach(p => console.log(`[SELECTIVE-COMMIT] selected path: ${p}`));
+      }
       await window.neko.githubCommitPush(githubCommitMessage.trim(), selectedFilesArray);
       setGithubCommitSuccess(true);
       setGithubCommitMessage("");
@@ -6024,6 +6279,8 @@ function App() {
     try {
       const result = await window.neko.githubStatus(true);
       setGithubStatus(result || { connected: false, repos: [] });
+      console.log("[GitHub/UI] github status refreshed");
+      console.log(`[GitHub/UI] accounts=${result?.accounts?.length || (result?.connected ? 1 : 0)}`);
       void syncGithubContext();
     } catch (error) {
       console.warn("[Github] refresh failed", String((error as Error)?.message ?? error));
@@ -6084,6 +6341,68 @@ function App() {
       setModal("github");
     } catch (error) {
       console.warn("[Github] disconnect failed", String((error as Error)?.message ?? error));
+    }
+  }
+
+  async function selectGithubAccount(accountId: string) {
+    try {
+      setAccountDropdownOpen(false);
+      const result = await window.neko.githubSelectAccount(accountId);
+      if (result) setGithubStatus(result);
+      void syncGithubContext();
+    } catch (error) {
+      console.warn("[Github] select account failed", String((error as Error)?.message ?? error));
+    }
+  }
+
+  async function disconnectGithubAccount(accountId?: string) {
+    try {
+      setAccountDropdownOpen(false);
+      const result = await window.neko.githubDisconnectAccount(accountId);
+      if (result) setGithubStatus(result);
+      void syncGithubContext();
+    } catch (error) {
+      console.warn("[Github] disconnect account failed", String((error as Error)?.message ?? error));
+    }
+  }
+
+  async function selectGithubAccountInClone(accountId: string) {
+    const currentGen = ++cloneFetchGenRef.current;
+    setGithubCloneLoadingRepos(true);
+    setGithubCloneRepo(null);
+    setGithubRepoSearch("");
+    try {
+      const result = await window.neko.githubSelectAccount(accountId);
+      if (currentGen === cloneFetchGenRef.current) {
+        if (result) setGithubStatus(result);
+        void syncGithubContext();
+      }
+    } catch (error) {
+      console.warn("[GithubClone] select account failed:", error);
+    } finally {
+      if (currentGen === cloneFetchGenRef.current) {
+        setGithubCloneLoadingRepos(false);
+      }
+    }
+  }
+
+  async function disconnectGithubAccountInClone(accountId?: string) {
+    const currentGen = ++cloneFetchGenRef.current;
+    setGithubCloneLoadingRepos(true);
+    setGithubCloneRepo(null);
+    setGithubRepoSearch("");
+    try {
+      const result = await window.neko.githubDisconnectAccount(accountId);
+      if (currentGen === cloneFetchGenRef.current) {
+        if (result) setGithubStatus(result);
+        void syncGithubContext();
+      }
+    } catch (error) {
+      console.warn("[GithubClone] disconnect account failed:", error);
+    } finally {
+      if (currentGen === cloneFetchGenRef.current) {
+        setGithubCloneLoadingRepos(false);
+      }
     }
   }
 
@@ -6248,7 +6567,7 @@ function App() {
   }
 
   async function handleBranchCommitAndCheckout() {
-    if (!pendingTargetBranch || !branchCommitMessage.trim() || branchActionBusy) return;
+    if (!pendingTargetBranch || !branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0) return;
     setBranchActionBusy(true);
     setBranchActionError("");
     const target = pendingTargetBranch;
@@ -6268,7 +6587,8 @@ function App() {
         return;
       }
 
-      const selectedFilesArray = selectedCommitFiles.size > 0 ? Array.from(selectedCommitFiles) : undefined;
+      const selectedFilesArray = Array.from(selectedCommitFiles);
+      selectedFilesArray.forEach(p => console.log(`[SELECTIVE-COMMIT] selected path: ${p}`));
       await window.neko.githubCommitPush(branchCommitMessage.trim(), selectedFilesArray);
       await window.neko.githubCheckoutBranch(target);
       const git = await window.neko.githubGitStatus();
@@ -6879,7 +7199,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.95"}</span>
+                  <span>Versão {appVersion || "0.4.96"}</span>
                 </div>
                 <button
                   type="button"
@@ -8226,7 +8546,7 @@ function App() {
       )}
 
     {modal && createPortal(
-      <div className="modal-backdrop" role="presentation" onClick={() => { if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
+      <div className="modal-backdrop" role="presentation" onClick={() => { console.log("[GitHub/UI] modal backdrop click — closing modal:", modal); if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
       {modal === "tutorials" && (() => {
         const tutorials = getNekoTutorials();
         const openVideo = (tutorial: NekoTutorial) => {
@@ -8603,30 +8923,38 @@ function App() {
           </div>
           <button className="close-btn" onClick={() => setModal(null)} aria-label="Fechar"><X size={17}/></button>
         </div>
-        {!githubStatus.connected ? <div className="github-connect-panel">
-          <div className="github-hero-icon"><GitHubIcon size={34} /></div>
-          <h3>Conectar GitHub</h3>
-          <p>O NekoAI vai abrir o GitHub no navegador e usar o Device Flow para autorizar esta aplicação desktop.</p>
-          {githubError && <div className="auth-error">{githubError}</div>}
-          <button className="primary github-connect-main" onClick={() => void startGithubConnect()} disabled={githubBusy}>{githubBusy ? <><Loader2 size={15} className="spin"/> Aguardando autorização...</> : <><GitHubIcon size={15} /> Conectar GitHub</>}</button>
-        </div> : <div className="modal-scroll-body github-connected-panel">
-          <div className="github-user">
-            <div className="github-avatar">{githubStatus.user?.avatarUrl ? <img src={githubStatus.user.avatarUrl} alt=""/> : <GitHubIcon size={20} />}</div>
-            <div><b>{githubStatus.user?.name || githubStatus.user?.login || "GitHub"}</b><small>@{githubStatus.user?.login || ""}</small></div>
+        {!githubStatus.connected ? (
+          <div className="github-connect-panel">
+            <div className="github-hero-icon"><GitHubIcon size={34} /></div>
+            <h3>Conectar GitHub</h3>
+            <p>O NekoAI vai abrir o GitHub no navegador e usar o Device Flow para autorizar esta aplicação desktop.</p>
+            {githubError && <div className="auth-error">{githubError}</div>}
+            <button className="primary github-connect-main" onClick={() => void startGithubConnect(true)} disabled={githubBusy}>{githubBusy ? <><Loader2 size={15} className="spin"/> Aguardando autorização...</> : <><GitHubIcon size={15} /> Conectar GitHub</>}</button>
+          </div>
+        ) : (
+          <div className="modal-scroll-body github-connected-panel">
+            <div className="github-user-bar" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, gap: 12 }}>
+            <GithubAccountSelector
+              githubStatus={githubStatus}
+              onSelectAccount={(accId) => void selectGithubAccount(accId)}
+              onDisconnectAccount={(accId) => void disconnectGithubAccount(accId)}
+              onAddAccount={() => void startGithubConnect(true)}
+            />
+
             {githubStatus.needsInstallation ? (
-              <span className="github-warning" style={{ marginLeft: "auto", fontSize: 9, color: "#fbbf24", background: "rgba(251,191,36,.08)", border: "1px solid rgba(251,191,36,.22)", padding: "4px 7px", borderRadius: 5 }}>Instalação pendente</span>
+              <span className="github-warning" style={{ fontSize: 9, color: "#fbbf24", background: "rgba(251,191,36,.08)", border: "1px solid rgba(251,191,36,.22)", padding: "4px 7px", borderRadius: 5, flexShrink: 0 }}>Instalação pendente</span>
             ) : (
-              <span className="github-ok">Conectado</span>
+              <span className="github-ok" style={{ flexShrink: 0 }}>Conectado</span>
             )}
           </div>
           {githubStatus.needsInstallation ? (
-            <div className="github-auth-update-needed" style={{ margin: "12px 0 16px 0", flexDirection: "column", alignItems: "stretch" }}>
-              <div>
+            <div className="github-auth-update-needed" style={{ margin: "12px 0 16px 0" }}>
+              <div className="github-auth-update-copy">
                 <b>Instalação do GitHub App necessária</b>
                 <small>Seu GitHub foi autorizado com sucesso, mas o NekoAI ainda precisa ser instalado na sua conta para ter acesso aos seus repositórios.</small>
               </div>
-              <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, marginTop: 12, width: "100%" }}>
-                <button className="primary" onClick={() => window.neko.githubOpen(githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new")}>
+              <div className="github-auth-update-actions">
+                <button className="primary" onClick={() => { console.log("[GitHub/UI] authorize github clicked"); void window.neko.githubOpen(githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new"); }}>
                   <GitHubIcon size={14}/> Instalar NekoAI no GitHub
                 </button>
                 <button className="secondary" onClick={() => void refreshGithub()} disabled={githubBranchRefreshing}>
@@ -8635,7 +8963,19 @@ function App() {
               </div>
             </div>
           ) : null}
-          {githubStatus.needsPermissions && !githubStatus.needsInstallation ? <div className="github-auth-update-needed"><div><b>Permissões do GitHub precisam de aprovação</b><small>O NekoAI está conectado, mas o GitHub App ainda não tem todas as permissões necessárias para publicar e enviar código.</small></div><button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}><GitHubIcon size={14}/> Verificar permissões</button></div> : null}
+          {githubStatus.needsPermissions && !githubStatus.needsInstallation ? (
+            <div className="github-auth-update-needed">
+              <div className="github-auth-update-copy">
+                <b>Permissões do GitHub precisam de aprovação</b>
+                <small>O NekoAI está conectado, mas o GitHub App ainda não tem todas as permissões necessárias para publicar e enviar código.</small>
+              </div>
+              <div className="github-auth-update-actions">
+                <button className="primary" onClick={() => { console.log("[GitHub/UI] authorize github clicked"); void window.neko.githubOpen(githubStatus.installUrl || "https://github.com/settings/installations"); }}>
+                  <GitHubIcon size={14}/> Verificar permissões
+                </button>
+              </div>
+            </div>
+          ) : null}
           {project && githubLinkStatus.linkedRepo ? (() => {
             const isAccessible = Boolean(githubStatus.repos?.some(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase()));
             const linkedRepoUrl = githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`;
@@ -8653,13 +8993,25 @@ function App() {
 
               {!isAccessible ? (
                 <div className="github-auth-update-needed" style={{ margin: "12px 0 16px 0" }}>
-                  <div>
-                    <b>Repositório não autorizado para @{githubStatus.user?.login || "usuário"}</b>
+                  <div className="github-auth-update-copy">
+                    <b>Repositório não autorizado para @{githubStatus.activeAccount?.login || githubStatus.user?.login || "usuário"}</b>
                     <small>O projeto local possui o remote <b>{githubLinkStatus.linkedRepo}</b>, mas a conta GitHub conectada não possui acesso a ele ou o repositório ainda não foi autorizado no GitHub App.</small>
                   </div>
-                  <button className="primary" onClick={() => githubStatus.installUrl && window.neko.githubOpen(githubStatus.installUrl)}>
-                    <GitHubIcon size={14}/> Autorizar no GitHub
-                  </button>
+                  <div className="github-auth-update-actions">
+                    <button className="primary" onClick={() => {
+                      console.log("[GitHub/UI] authorize github clicked");
+                      const targetUrl = githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new";
+                      void window.neko.githubOpen(targetUrl);
+                    }}>
+                      <GitHubIcon size={14}/> Autorizar no GitHub
+                    </button>
+                    <button className="secondary" onClick={() => {
+                      console.log("[GitHub/UI] add account clicked");
+                      void startGithubConnect(true);
+                    }}>
+                      <Plus size={14}/> Adicionar conta GitHub
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <>
@@ -8690,12 +9042,12 @@ function App() {
                   {githubPullError && (
                     (githubPullError.includes("Permissões do GitHub precisam de aprovação") || githubPullError.toLowerCase().includes("resource not accessible by integration")) ? (
                       <div className="github-auth-update-needed" style={{ marginBottom: 16 }}>
-                        <div>
+                        <div className="github-auth-update-copy">
                           <b>Permissões do GitHub precisam de aprovação</b>
                           <small>O NekoAI solicitou novas permissões para o GitHub App, mas esta instalação ainda não aprovou a atualização no GitHub.</small>
                         </div>
-                        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-                          <button className="primary" onClick={() => window.neko.githubOpen(githubStatus.installUrl || "https://github.com/settings/installations")}>
+                        <div className="github-auth-update-actions">
+                          <button className="primary" onClick={() => { console.log("[GitHub/UI] authorize github clicked"); void window.neko.githubOpen(githubStatus.installUrl || "https://github.com/settings/installations"); }}>
                             <GitHubIcon size={14}/> Revisar permissões
                           </button>
                           <button className="secondary" onClick={() => void refreshGithub()}>
@@ -8756,7 +9108,7 @@ function App() {
             </div>
           ) : null}
           <div className="github-modal-footer" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 24, paddingTop: 16, borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
-            <button className="secondary github-disconnect danger-btn" style={{ display: "flex", alignItems: "center", gap: 6, margin: 0, alignSelf: "center" }} onClick={() => void disconnectGithub()} title="Desconectar conta do GitHub"><Unplug size={14}/> Desconectar</button>
+            <button className="secondary github-disconnect danger-btn" style={{ display: "flex", alignItems: "center", gap: 6, margin: 0, alignSelf: "center" }} onClick={() => void disconnectGithubAccount(githubStatus.activeAccount?.id)} title="Desconectar conta do GitHub"><Unplug size={14}/> Desconectar</button>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               {project && githubLinkStatus.linkedRepo ? (
                 <button
@@ -8770,34 +9122,48 @@ function App() {
                 </button>
               ) : null}
               {(() => { const url = (project && githubLinkStatus.linkedRepo) ? (githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`) : null; return url ? <button className="secondary github-view-repo-btn" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={() => void window.neko.githubOpen(url)} title="Abrir repositório no GitHub"><ExternalLinkIcon size={14}/> Ver no GitHub</button> : null; })()}
-            </div>
           </div>
-        </div>}
-      </>}
+        </div>
+      </div>
+    )}
+  </>}
 
       {modal === "githubClone" && <>
         <div className="modal-head">
           <div>
             <h2 id="modal-title"><GitHubIcon size={18}/> Clonar do GitHub</h2>
-            <p>Escolha o repositório e a pasta de destino para criar seu projeto.</p>
+            <p>Escolha a conta, o repositório e a pasta de destino para criar seu projeto.</p>
           </div>
           <button className="close-btn" onClick={closeGithubCloneModal} aria-label="Fechar"><X size={17}/></button>
         </div>
         {!githubStatus.connected ? (
           <div className="github-connect-panel">
             <div className="github-hero-icon"><GitHubIcon size={34} /></div>
-            <h3>Conectar GitHub</h3>
-            <p>O NekoAI vai abrir o GitHub no navegador e usar o Device Flow para autorizar esta aplicação desktop.</p>
+            <h3>Nenhuma conta GitHub conectada</h3>
+            <p>Conecte sua conta do GitHub para listar e clonar seus repositórios no NekoAI.</p>
             {githubError && <div className="auth-error">{githubError}</div>}
-            <button className="primary github-connect-main" onClick={() => void startGithubConnect()} disabled={githubBusy}>
+            <button className="primary github-connect-main" onClick={() => void startGithubConnect(true)} disabled={githubBusy}>
               {githubBusy ? <><Loader2 size={15} className="spin"/> Aguardando autorização...</> : <><GitHubIcon size={15} /> Conectar GitHub</>}
             </button>
           </div>
         ) : (
           <>
-            <div className="modal-scroll-body new-project-panel github-clone-project-panel">
+            <div className="modal-scroll-body new-project-panel github-clone-project-panel" style={{ gap: 8, padding: "2px 0" }}>
+              {/* GRUPO 1: SELETOR DE CONTA GITHUB */}
+              <div className="github-clone-group" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <label style={{ fontSize: 11, fontWeight: 600, color: "#9ca3af" }}>Conta GitHub</label>
+                <GithubAccountSelector
+                  githubStatus={githubStatus}
+                  onSelectAccount={(accId) => void selectGithubAccountInClone(accId)}
+                  onDisconnectAccount={(accId) => void disconnectGithubAccountInClone(accId)}
+                  onAddAccount={() => void startGithubConnect(true)}
+                  disabled={githubBusy || githubCloneLoadingRepos}
+                />
+              </div>
+
+              {/* GRUPO 2: SELEÇÃO DE REPOSITÓRIO */}
               {githubCloneRepo ? (
-                <div className="github-clone-source" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                <div className="github-clone-source" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginTop: 2 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0, flex: 1 }}>
                     <GitHubIcon size={18} style={{ flexShrink: 0 }} />
                     <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0, textAlign: "left" }}>
@@ -8812,14 +9178,14 @@ function App() {
                   )}
                 </div>
               ) : (
-                <>
+                <div className="github-clone-group" style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 2 }}>
                   {githubStatus.needsInstallation && (
-                    <div className="github-auth-update-needed" style={{ margin: "2px 0 12px 0" }}>
-                      <div>
+                    <div className="github-auth-update-needed" style={{ margin: "2px 0 8px 0" }}>
+                      <div className="github-auth-update-copy">
                         <b>Instalação do GitHub App necessária</b>
                         <small>Sua conta foi autorizada, mas o NekoAI precisa ser instalado no GitHub para acessar seus repositórios.</small>
                       </div>
-                      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                      <div className="github-auth-update-actions">
                         <button className="primary" onClick={() => window.neko.githubOpen(githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new")}>
                           <GitHubIcon size={14}/> Instalar NekoAI no GitHub
                         </button>
@@ -8829,24 +9195,33 @@ function App() {
                       </div>
                     </div>
                   )}
-                  <div className="github-repo-head" style={{ marginTop: 2, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <b>Selecione o repositório</b>
-                    <button className="icon-btn" onClick={() => void refreshGithub()} title="Atualizar lista"><RefreshCw size={14}/></button>
+
+                  <div className="github-repo-head" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <b style={{ fontSize: 11, fontWeight: 600, color: "#9ca3af" }}>Selecione o repositório</b>
+                    <button className="icon-btn" onClick={() => void refreshGithub()} title="Atualizar lista" disabled={githubCloneLoadingRepos}><RefreshCw size={13}/></button>
                   </div>
                   <input
                     className="api-input"
-                    style={{ margin: "2px 0 6px 0" }}
+                    style={{ margin: "0 0 4px 0" }}
                     value={githubRepoSearch}
                     onChange={e => setGithubRepoSearch(e.target.value)}
                     placeholder="Buscar repositório..."
-                    disabled={githubBusy}
+                    disabled={githubBusy || githubCloneLoadingRepos}
                   />
-                  <div className="github-repos" style={{ maxHeight: 150, overflowY: "auto", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8 }}>
+                  <div className="github-repos" style={{ maxHeight: 135, overflowY: "auto", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8 }}>
                     {(() => {
+                      if (githubCloneLoadingRepos) {
+                        return (
+                          <div className="github-empty" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: 16 }}>
+                            <Loader2 size={15} className="spin" style={{ color: "#a855f7" }} />
+                            <span>Carregando repositórios de @{githubStatus.activeAccount?.login || githubStatus.user?.login || "conta"}...</span>
+                          </div>
+                        );
+                      }
                       const query = githubRepoSearch.trim().toLowerCase();
                       const repos = (githubStatus.repos || []).filter(r => !query || r.fullName.toLowerCase().includes(query) || r.name.toLowerCase().includes(query));
                       if (repos.length === 0) {
-                        return <div className="github-empty">{githubStatus.needsInstallation ? "Nenhum repositório concedido ao NekoAI." : "Nenhum repositório encontrado."}</div>;
+                        return <div className="github-empty">{githubStatus.needsInstallation ? "Nenhum repositório concedido ao NekoAI." : "Nenhum repositório encontrado para esta conta."}</div>;
                       }
                       return repos.map(repo => (
                         <div className="github-repo-row" key={repo.id}>
@@ -8883,23 +9258,26 @@ function App() {
                       ));
                     })()}
                   </div>
-                </>
+                </div>
               )}
 
-              <label style={{ marginTop: 6 }}>Nome do projeto</label>
-              <input
-                className="api-input"
-                value={githubCloneName}
-                onChange={e => setGithubCloneName(e.target.value)}
-                placeholder="meu-projeto"
-                disabled={githubBusy}
-              />
+              {/* GRUPO 3: DESTINO DO PROJETO */}
+              <div className="github-clone-group" style={{ display: "flex", flexDirection: "column", gap: 5, marginTop: 4 }}>
+                <label style={{ fontSize: 11, fontWeight: 600, color: "#9ca3af" }}>Nome do projeto</label>
+                <input
+                  className="api-input"
+                  value={githubCloneName}
+                  onChange={e => setGithubCloneName(e.target.value)}
+                  placeholder="meu-projeto"
+                  disabled={githubBusy}
+                />
 
-              <label>Local onde será salvo</label>
-              <div className="new-project-folder">
-                <FolderOpen size={15}/>
-                <span>{githubCloneParent || "Escolha a pasta principal"}</span>
-                <button className="secondary" onClick={() => void chooseGithubCloneParent()} disabled={githubBusy}>Escolher</button>
+                <label style={{ fontSize: 11, fontWeight: 600, color: "#9ca3af", marginTop: 2 }}>Local onde será salvo</label>
+                <div className="new-project-folder">
+                  <FolderOpen size={15}/>
+                  <span>{githubCloneParent || "Escolha a pasta principal"}</span>
+                  <button className="secondary" onClick={() => void chooseGithubCloneParent()} disabled={githubBusy}>Escolher</button>
+                </div>
               </div>
 
               {githubBusy && (

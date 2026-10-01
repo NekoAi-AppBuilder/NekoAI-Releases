@@ -1,6 +1,8 @@
 import path from "node:path";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
+import { normalizeRepoRelativePath } from "./git-path-normalizer";
+export { normalizeRepoRelativePath };
 
 export interface GitChangedFile {
   path: string;
@@ -121,22 +123,48 @@ export type AuthenticatedGitRunner = (
 
 export function parseGitStatusPorcelain(output: string): { files: GitChangedFile[]; summary: GitStatusSummary } {
   const files: GitChangedFile[] = [];
-  const lines = output.split(/\r?\n/).filter(line => line.length >= 3);
+  const lines = output.split(/\r?\n/).filter(line => line.length >= 2);
   let modifiedCount = 0;
   let untrackedCount = 0;
   let deletedCount = 0;
   let stagedCount = 0;
 
   for (const line of lines) {
-    const x = line[0];
-    const y = line[1];
-    let filePath = line.slice(3).trim();
-    if (filePath.includes(" -> ")) {
-      filePath = filePath.split(" -> ")[1].trim();
+    let x = " ";
+    let y = " ";
+    let rawPath = "";
+
+    // Regex robusta para Git Status Porcelain v1:
+    // Captura código de 1 ou 2 caracteres e o caminho completo.
+    // Suporta status com espaço inicial preservado (" M index.html", "?? index.html")
+    // e status cujo espaço inicial foi removido por trim ("M index.html", "D index.html").
+    const match = line.match(/^([ MADRCU?!]{1,2})\s+(.+)$/);
+    if (match) {
+      const statusCode = match[1];
+      rawPath = match[2].trim();
+      if (statusCode.length === 1) {
+        // O espaço da primeira coluna (index) foi removido por trim; logo coluna 1 é ' ', coluna 2 é statusCode[0]
+        x = " ";
+        y = statusCode[0];
+      } else {
+        x = statusCode[0];
+        y = statusCode[1];
+      }
+    } else {
+      x = line[0] || " ";
+      y = line[1] || " ";
+      rawPath = line.slice(2).trim();
     }
-    if (filePath.startsWith('"') && filePath.endsWith('"')) {
-      filePath = filePath.slice(1, -1);
+
+    if (rawPath.includes(" -> ")) {
+      rawPath = rawPath.split(" -> ")[1].trim();
     }
+    if (rawPath.startsWith('"') && rawPath.endsWith('"')) {
+      rawPath = rawPath.slice(1, -1);
+    }
+
+    const cleanPath = normalizeRepoRelativePath(rawPath);
+    console.log(`[SELECTIVE-COMMIT] status path: ${cleanPath}`);
 
     let status: GitChangedFile["status"] = "modified";
     const isStaged = x !== " " && x !== "?" && x !== "!";
@@ -163,7 +191,7 @@ export function parseGitStatusPorcelain(output: string): { files: GitChangedFile
     }
 
     files.push({
-      path: filePath.replaceAll("\\", "/"),
+      path: cleanPath,
       status,
       staged: isStaged
     });

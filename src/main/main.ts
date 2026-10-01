@@ -22,6 +22,7 @@ import { updaterManager } from "./updater";
 import { lovableCloudManager } from "./lovable/lovable-cloud-manager";
 import { lovableMcpServer, writeLovableOpenCodeConfig, removeLovableOpenCodeConfig } from "./lovable/lovable-mcp-server";
 import { detectDatabaseIntent } from "./lovable/lovable-intent-detector";
+import { GithubAccountManager, type GithubAccountRecord, type GithubAccountSummary } from "./github/github-account-manager";
 import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES, VISION_FALLBACK_MODEL_CANDIDATES, resolveVisionFallbackTarget, type VisionFallbackTarget } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
 import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession, friendlyFallbackError } from "./vision-fallback";
@@ -39,6 +40,7 @@ import { RuntimeRequirement } from "./runtime/runtime-types";
 import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTimeoutDiagnostic } from "./opencode-diagnostics";
 import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
 import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolveConflictFile, finalizeConflictResolution, getConflictFiles, parseLinkedRepo, type GitSyncStatus, type PullResult, type GitConflictFile, type GitSyncCombineResult } from "./git-sync";
+import { normalizeRepoRelativePath } from "./git-path-normalizer";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -1319,48 +1321,123 @@ type GitStatus = {
 };
 
 
+const githubAccountManager = new GithubAccountManager();
+
+async function refreshGithubAccessTokenForRecord(account: GithubAccountRecord): Promise<boolean> {
+  if (!account.refreshToken) return false;
+  const response = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      client_id: GITHUB_CLIENT_ID,
+      grant_type: "refresh_token",
+      refresh_token: account.refreshToken
+    })
+  });
+  const data: any = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) return false;
+  githubAccountManager.saveAccountRecord({
+    ...account,
+    token: String(data.access_token),
+    expiresAt: typeof data.expires_in === "number" ? Date.now() + data.expires_in * 1000 : account.expiresAt,
+    refreshToken: data.refresh_token ? String(data.refresh_token) : account.refreshToken,
+    refreshExpiresAt: typeof data.refresh_token_expires_in === "number" ? Date.now() + data.refresh_token_expires_in * 1000 : account.refreshExpiresAt
+  });
+  return true;
+}
+
+async function resolveGithubAccountForProject(projectPath?: string | null, preferredAccountId?: string | null): Promise<GithubAccountRecord | null> {
+  const records = githubAccountManager.getAccountRecords();
+  if (records.length === 0) return null;
+
+  if (preferredAccountId) {
+    const acc = records.find(r => r.id === preferredAccountId || r.login.toLowerCase() === preferredAccountId.toLowerCase());
+    if (acc) return acc;
+  }
+
+  const proj = projectPath || currentProject;
+  let linkedRepo: string | null = null;
+  if (proj) {
+    try {
+      const git = await getGitStatus(proj);
+      linkedRepo = git.linkedRepo;
+    } catch {}
+  }
+
+  const projKey = proj || linkedRepo || "";
+  const savedAccountId = githubAccountManager.getProjectAssociation(projKey) || (linkedRepo ? githubAccountManager.getProjectAssociation(linkedRepo) : null);
+  if (savedAccountId) {
+    const acc = records.find(r => r.id === savedAccountId || r.login.toLowerCase() === savedAccountId.toLowerCase());
+    if (acc) return acc;
+  }
+
+  if (linkedRepo) {
+    const accessibleAccounts: GithubAccountRecord[] = [];
+    for (const record of records) {
+      try {
+        const res = await fetchWithTimeout(`https://api.github.com/repos/${linkedRepo}`, {
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${record.token}`,
+            "X-GitHub-Api-Version": "2022-11-28"
+          }
+        });
+        if (res.ok) {
+          accessibleAccounts.push(record);
+        }
+      } catch {}
+    }
+
+    if (accessibleAccounts.length === 1) {
+      githubAccountManager.setProjectAssociation(projKey, accessibleAccounts[0].id);
+      if (linkedRepo) githubAccountManager.setProjectAssociation(linkedRepo, accessibleAccounts[0].id);
+      return accessibleAccounts[0];
+    } else if (accessibleAccounts.length > 1) {
+      githubAccountManager.setProjectAssociation(projKey, accessibleAccounts[0].id);
+      return accessibleAccounts[0];
+    }
+  }
+
+  return records[0];
+}
+
+async function getGithubAccessToken(projectPath?: string | null, preferredAccountId?: string | null): Promise<string> {
+  const account = await resolveGithubAccountForProject(projectPath, preferredAccountId);
+  if (!account || !account.token) throw new Error("GitHub não está conectado.");
+
+  if (account.expiresAt && Date.now() >= account.expiresAt - 60_000) {
+    if (!account.refreshToken) throw new Error("A autorização do GitHub expirou. Conecte sua conta do GitHub novamente.");
+    const refreshed = await refreshGithubAccessTokenForRecord(account).catch(() => false);
+    if (!refreshed) {
+      githubAccountManager.removeAccountRecord(account.id);
+      throw new Error("A autorização do GitHub expirou. Conecte sua conta do GitHub novamente.");
+    }
+    const updated = githubAccountManager.getAccountById(account.id);
+    if (!updated?.token) throw new Error("GitHub não está conectado.");
+    return updated.token;
+  }
+
+  return account.token;
+}
+
 type GithubAuthRecord = { token: string; expiresAt?: number; refreshToken?: string; refreshExpiresAt?: number };
 
 function readGithubAuth(): GithubAuthRecord | null {
-  try {
-    const raw = fs.readFileSync(githubAuthFile(), "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed?.encrypted) return null;
-    if (!safeStorage.isEncryptionAvailable()) return null;
-    return JSON.parse(safeStorage.decryptString(Buffer.from(parsed.encrypted, "base64")));
-  } catch {
-    return null;
-  }
+  const account = githubAccountManager.getAccountRecords()[0];
+  if (!account) return null;
+  return { token: account.token, expiresAt: account.expiresAt, refreshToken: account.refreshToken, refreshExpiresAt: account.refreshExpiresAt };
 }
 
-function writeGithubAuth(record: GithubAuthRecord) {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error("O armazenamento seguro do Windows não está disponível.");
-  const encrypted = safeStorage.encryptString(JSON.stringify(record)).toString("base64");
-  fs.mkdirSync(app.getPath("userData"), { recursive: true });
-  fs.writeFileSync(githubAuthFile(), JSON.stringify({ encrypted }, null, 2), "utf8");
-}
+function writeGithubAuth(record: GithubAuthRecord) {}
 
 function clearGithubAuth() {
-  try { fs.rmSync(githubAuthFile(), { force: true }); } catch {}
-}
-
-
-async function getGithubAccessToken(): Promise<string> {
-  let auth = readGithubAuth();
-  if (!auth?.token) throw new Error("GitHub não está conectado.");
-
-  if (auth.expiresAt && Date.now() >= auth.expiresAt - 60_000) {
-    if (!auth.refreshToken) throw new Error("A autorização do GitHub expirou. Conecte o GitHub novamente.");
-    const refreshed = await refreshGithubAccessToken(auth).catch(() => false);
-    if (!refreshed) {
-      clearGithubAuth();
-      throw new Error("A autorização do GitHub expirou. Conecte o GitHub novamente.");
-    }
-    auth = readGithubAuth();
+  const records = githubAccountManager.getAccountRecords();
+  if (records.length > 0) {
+    githubAccountManager.removeAccountRecord(records[0].id);
   }
-
-  if (!auth?.token) throw new Error("GitHub não está conectado.");
-  return auth.token;
 }
 
 type GithubErrorCategory =
@@ -1457,7 +1534,27 @@ function formatGitHubGitError(result: { code: number; stdout: string; stderr: st
     return `Não foi possível conectar ao GitHub durante ${action}. Verifique sua conexão com a internet e tente novamente.`;
   }
   if (lower.includes("local changes") || lower.includes("would be overwritten by checkout") || lower.includes("please commit your changes or stash them")) {
-    return "Existem alterações locais não salvas que seriam sobrescritas. Faça commit ou descarte as alterações antes de trocar de branch.";
+    const lines = raw.split(/\r?\n/);
+    const conflictingFiles: string[] = [];
+    let capturing = false;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes("would be overwritten by checkout:")) {
+        capturing = true;
+        continue;
+      }
+      if (capturing) {
+        if (trimmed.startsWith("Please commit") || trimmed.startsWith("Aborting") || !trimmed) {
+          capturing = false;
+          continue;
+        }
+        conflictingFiles.push(trimmed);
+      }
+    }
+    if (conflictingFiles.length > 0) {
+      return `Troca de branch bloqueada pelo Git. As alterações locais em [${conflictingFiles.join(", ")}] conflitam com a branch destino.`;
+    }
+    return "Troca de branch bloqueada pelo Git. Existem alterações locais que conflitam com a branch destino.";
   }
   if (lower.includes("already exists") || lower.includes("already on")) {
     return `Não foi possível ${action}. O branch já existe ou já está ativo.`;
@@ -1727,20 +1824,19 @@ async function refreshGithubAccessToken(auth: GithubAuthRecord) {
   return true;
 }
 
-async function githubApi(pathname: string, init: RequestInit = {}) {
-  const auth = readGithubAuth();
-  if (!auth?.token) throw new Error("GitHub não está conectado.");
+async function githubApi(pathname: string, init: RequestInit = {}, options?: { projectPath?: string | null; accountId?: string | null }) {
+  const token = await getGithubAccessToken(options?.projectPath, options?.accountId);
+  if (!token) throw new Error("GitHub não está conectado.");
   const response = await fetchWithTimeout(`https://api.github.com${pathname}`, {
     ...init,
     headers: {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${auth.token}`,
+      Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2026-03-10",
       ...(init.headers || {})
     }
   });
   if (response.status === 401) {
-    clearGithubAuth();
     throw new Error("A autorização do GitHub expirou ou foi revogada.");
   }
   if (!response.ok) {
@@ -1854,7 +1950,7 @@ function runGit(
       resolved = true;
       resolve({
         code: typeof code === "number" ? code : 1,
-        stdout: stdout.trim(),
+        stdout: stdout.replace(/^[\r\n]+|[\r\n\s]+$/g, ""),
         stderr: stderr.trim()
       });
     });
@@ -1910,22 +2006,48 @@ async function runGitWithGithubAuth(
 
 function parseGitStatusPorcelain(output: string): { files: GitChangedFile[]; summary: GitStatusSummary } {
   const files: GitChangedFile[] = [];
-  const lines = output.split(/\r?\n/).filter(line => line.length >= 3);
+  const lines = output.split(/\r?\n/).filter(line => line.length >= 2);
   let modifiedCount = 0;
   let untrackedCount = 0;
   let deletedCount = 0;
   let stagedCount = 0;
 
   for (const line of lines) {
-    const x = line[0];
-    const y = line[1];
-    let filePath = line.slice(3).trim();
-    if (filePath.includes(" -> ")) {
-      filePath = filePath.split(" -> ")[1].trim();
+    let x = " ";
+    let y = " ";
+    let rawPath = "";
+
+    // Regex robusta para Git Status Porcelain v1:
+    // Captura código de 1 ou 2 caracteres e o caminho completo.
+    // Suporta status com espaço inicial preservado (" M index.html", "?? index.html")
+    // e status cujo espaço inicial foi removido por trim ("M index.html", "D index.html").
+    const match = line.match(/^([ MADRCU?!]{1,2})\s+(.+)$/);
+    if (match) {
+      const statusCode = match[1];
+      rawPath = match[2].trim();
+      if (statusCode.length === 1) {
+        // O espaço da primeira coluna (index) foi removido por trim; logo coluna 1 é ' ', coluna 2 é statusCode[0]
+        x = " ";
+        y = statusCode[0];
+      } else {
+        x = statusCode[0];
+        y = statusCode[1];
+      }
+    } else {
+      x = line[0] || " ";
+      y = line[1] || " ";
+      rawPath = line.slice(2).trim();
     }
-    if (filePath.startsWith('"') && filePath.endsWith('"')) {
-      filePath = filePath.slice(1, -1);
+
+    if (rawPath.includes(" -> ")) {
+      rawPath = rawPath.split(" -> ")[1].trim();
     }
+    if (rawPath.startsWith('"') && rawPath.endsWith('"')) {
+      rawPath = rawPath.slice(1, -1);
+    }
+
+    const cleanPath = normalizeRepoRelativePath(rawPath);
+    console.log(`[SELECTIVE-COMMIT] status path: ${cleanPath}`);
 
     let status: GitChangedFile["status"] = "modified";
     const isStaged = x !== " " && x !== "?" && x !== "!";
@@ -1952,7 +2074,7 @@ function parseGitStatusPorcelain(output: string): { files: GitChangedFile[]; sum
     }
 
     files.push({
-      path: filePath.replaceAll("\\", "/"),
+      path: cleanPath,
       status,
       staged: isStaged
     });
@@ -2052,35 +2174,88 @@ async function getGitStatus(targetProject?: string): Promise<GitStatus> {
   };
 }
 
-async function getGithubStatus() {
-  let auth = readGithubAuth();
-  if (!auth?.token) return { connected: false, repos: [] as GithubRepo[] };
-  if (auth.expiresAt && Date.now() >= auth.expiresAt - 60_000 && auth.refreshToken) {
-    const refreshed = await refreshGithubAccessToken(auth).catch(() => false);
-    if (refreshed) auth = readGithubAuth();
+async function getGithubStatus(targetProject?: string | null, preferredAccountId?: string | null) {
+  const records = githubAccountManager.getAccountRecords();
+  if (records.length === 0) {
+    return { connected: false, activeAccount: null, accounts: [], repos: [] as GithubRepo[] };
   }
-  try {
-    const userResponse = await githubApi("/user");
-    const userJson: any = await userResponse.json();
-    const user: GithubUser = {
-      login: String(userJson.login || ""),
-      name: userJson.name ?? null,
-      avatarUrl: userJson.avatar_url ?? null,
-      id: typeof userJson.id === "number" ? userJson.id : null,
-      email: userJson.email ?? null
-    };
 
-    // GitHub App user access tokens do NOT use OAuth scopes. Their effective
-    // permissions come from the GitHub App + the user's approved installation.
-    // The installation endpoint exposes the permissions actually granted.
-    console.log(`[GitHub Install] Checking installation for user @${user.login}`);
+  const proj = targetProject || currentProject;
+  const activeRecord = await resolveGithubAccountForProject(proj, preferredAccountId);
+  if (!activeRecord) {
+    return { connected: false, activeAccount: null, accounts: githubAccountManager.getAccountsSummary(), repos: [] as GithubRepo[] };
+  }
+
+  let token = "";
+  try {
+    token = await getGithubAccessToken(proj, activeRecord.id);
+  } catch (err: any) {
+    return {
+      connected: true,
+      activeAccount: { id: activeRecord.id, login: activeRecord.login, name: activeRecord.name, avatarUrl: activeRecord.avatarUrl, email: activeRecord.email },
+      accounts: githubAccountManager.getAccountsSummary(),
+      repos: [],
+      error: err?.message || "Token do GitHub expirado."
+    };
+  }
+
+  const activeAccountSummary: GithubAccountSummary = {
+    id: activeRecord.id,
+    login: activeRecord.login,
+    name: activeRecord.name,
+    avatarUrl: activeRecord.avatarUrl,
+    email: activeRecord.email
+  };
+
+  const user: GithubUser = {
+    login: activeRecord.login,
+    name: activeRecord.name,
+    avatarUrl: activeRecord.avatarUrl,
+    id: Number(activeRecord.id) || null,
+    email: activeRecord.email
+  };
+
+  let allAccounts = githubAccountManager.getAccountsSummary();
+
+  try {
+    const userResponse = await githubApi("/user", {}, { projectPath: proj, accountId: activeRecord.id });
+    const userJson: any = await userResponse.json();
+    if (userJson.login) {
+      user.login = String(userJson.login);
+      user.name = userJson.name ?? null;
+      user.avatarUrl = userJson.avatar_url ?? null;
+      activeAccountSummary.login = user.login;
+      activeAccountSummary.name = user.name ?? null;
+      activeAccountSummary.avatarUrl = user.avatarUrl ?? null;
+
+      if (
+        activeRecord.login !== user.login ||
+        activeRecord.login === "account_connected" ||
+        activeRecord.login === "pending_fetch" ||
+        activeRecord.name !== user.name ||
+        activeRecord.avatarUrl !== user.avatarUrl
+      ) {
+        const updatedRecord: GithubAccountRecord = {
+          ...activeRecord,
+          id: userJson.id ? String(userJson.id) : activeRecord.id,
+          login: user.login,
+          name: user.name ?? user.login,
+          avatarUrl: user.avatarUrl ?? null,
+          email: userJson.email || activeRecord.email || null
+        };
+        githubAccountManager.saveAccountRecord(updatedRecord);
+      }
+    }
+
+    allAccounts = githubAccountManager.getAccountsSummary();
+
     const installations: any[] = [];
     let installationsFailed = false;
     let installationsErrorMsg = "";
 
     try {
       for (let page = 1; ; page++) {
-        const installationsResponse = await githubApi(`/user/installations?per_page=100&page=${page}`);
+        const installationsResponse = await githubApi(`/user/installations?per_page=100&page=${page}`, {}, { projectPath: proj, accountId: activeRecord.id });
         const installationsJson: any = await installationsResponse.json();
         const pageItems = Array.isArray(installationsJson?.installations) ? installationsJson.installations : [];
         installations.push(...pageItems);
@@ -2089,14 +2264,14 @@ async function getGithubStatus() {
     } catch (err: any) {
       installationsFailed = true;
       installationsErrorMsg = err?.message || String(err);
-      console.warn("[GitHub Install] Failed to query /user/installations:", installationsErrorMsg);
     }
 
-    // If querying installations failed due to network/API error, do NOT mark as missing installation
     if (installationsFailed) {
       const defaultInstallUrl = `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`;
       return {
         connected: true,
+        activeAccount: activeAccountSummary,
+        accounts: allAccounts,
         user,
         repos: [],
         needsInstallation: false,
@@ -2125,9 +2300,10 @@ async function getGithubStatus() {
 
     if (appInstallations.length === 0) {
       const newInstallUrl = `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`;
-      console.log(`[GitHub Install] Installation missing for ${GITHUB_APP_SLUG} (user @${user.login})`);
       return {
         connected: true,
+        activeAccount: activeAccountSummary,
+        accounts: allAccounts,
         user,
         repos: [],
         needsInstallation: true,
@@ -2138,16 +2314,13 @@ async function getGithubStatus() {
     }
 
     const firstInst = appInstallations[0];
-    const installationId = Number(firstInst?.id);
-    console.log(`[GitHub Install] Installation found: id=${installationId || "unknown"}, slug=${firstInst?.app_slug || GITHUB_APP_SLUG}`);
-
     const repoMap = new Map<number, GithubRepo>();
     for (const installation of appInstallations) {
       const instId = Number(installation?.id);
       if (!instId) continue;
 
       for (let page = 1; ; page++) {
-        const reposResponse = await githubApi(`/user/installations/${instId}/repositories?per_page=100&page=${page}`);
+        const reposResponse = await githubApi(`/user/installations/${instId}/repositories?per_page=100&page=${page}`, {}, { projectPath: proj, accountId: activeRecord.id });
         const reposJson: any = await reposResponse.json();
         const repos = Array.isArray(reposJson?.repositories) ? reposJson.repositories : [];
 
@@ -2167,13 +2340,13 @@ async function getGithubStatus() {
     }
 
     const primaryInstallUrl = firstInst?.html_url || (firstInst?.id ? `https://github.com/settings/installations/${firstInst.id}` : `https://github.com/apps/${GITHUB_APP_SLUG}/installations/new`);
-
     const hasPullRequestsWrite = permissionsList.some((permissions: any) => String(permissions.pull_requests || "").toLowerCase() === "write");
     const needsPermissions = !capabilities.canWriteContents || !capabilities.canCreateRepository || !hasPullRequestsWrite;
 
-    console.log(`[GitHub Install] Installation confirmed: ${repoMap.size} repositories accessible`);
     return {
       connected: true,
+      activeAccount: activeAccountSummary,
+      accounts: allAccounts,
       user,
       repos: Array.from(repoMap.values()).sort((a, b) => a.fullName.localeCompare(b.fullName)),
       needsInstallation: false,
@@ -2183,7 +2356,14 @@ async function getGithubStatus() {
       installUrl: primaryInstallUrl
     };
   } catch (error) {
-    return { connected: false, repos: [], error: error instanceof Error ? error.message : String(error) };
+    return {
+      connected: true,
+      activeAccount: activeAccountSummary,
+      accounts: allAccounts,
+      user,
+      repos: [],
+      error: error instanceof Error ? error.message : String(error)
+    };
   }
 }
 
@@ -2228,12 +2408,43 @@ async function pollGithubDevice(deviceCode: string, intervalSeconds: number, att
       }
 
       if (data.access_token) {
-        writeGithubAuth({
+        console.log("[GitHub/OAuth] authorization successful");
+        console.log("[GitHub/OAuth] fetching /user");
+        let userJson: any = {};
+        try {
+          const userRes = await fetch("https://api.github.com/user", {
+            headers: {
+              Authorization: `Bearer ${data.access_token}`,
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28"
+            }
+          });
+          userJson = await userRes.json().catch(() => ({}));
+        } catch {}
+
+        const userId = String(userJson.id || userJson.login || Date.now());
+        const userLogin = String(userJson.login || "user");
+        console.log(`[GitHub/OAuth] authenticated user login=${userLogin}`);
+
+        const newRecord: GithubAccountRecord = {
+          id: userId,
+          login: userLogin,
+          name: userJson.name || userLogin,
+          avatarUrl: userJson.avatar_url || null,
+          email: userJson.email || null,
           token: String(data.access_token),
           expiresAt: typeof data.expires_in === "number" ? Date.now() + data.expires_in * 1000 : undefined,
           refreshToken: data.refresh_token ? String(data.refresh_token) : undefined,
-          refreshExpiresAt: typeof data.refresh_token_expires_in === "number" ? Date.now() + data.refresh_token_expires_in * 1000 : undefined
-        });
+          refreshExpiresAt: typeof data.refresh_token_expires_in === "number" ? Date.now() + data.refresh_token_expires_in * 1000 : undefined,
+          addedAt: Date.now()
+        };
+
+        console.log(`[GitHub/Accounts] saving account login=${userLogin}`);
+        githubAccountManager.saveAccountRecord(newRecord);
+        console.log("[GitHub/Accounts] account saved");
+        if (currentProject) {
+          githubAccountManager.setProjectAssociation(currentProject, newRecord.id);
+        }
 
         // Clean up pending session state on completion
         if (githubAuthState.attemptId === attemptId) {
@@ -2243,7 +2454,7 @@ async function pollGithubDevice(deviceCode: string, intervalSeconds: number, att
           githubAuthState.isStarting = false;
         }
 
-        const status = await getGithubStatus();
+        const status = await getGithubStatus(currentProject, newRecord.id);
         mainWindow?.webContents.send("github:event", { type: "github.connected", properties: status });
         return;
       }
@@ -5912,28 +6123,61 @@ ipcMain.handle("opencode:command", async (_event, payload: { sessionId: string; 
 
 
 ipcMain.handle("github:status", async (_event, refresh: boolean = false) => {
-  const status = await getGithubStatus();
+  const status = await getGithubStatus(currentProject);
   if (status.error && refresh) throw new Error(status.error);
   return status;
 });
 
+ipcMain.handle("github:selectAccount", async (_event, payload: { accountId: string; projectPath?: string }) => {
+  const accountId = String(payload?.accountId || "").trim();
+  const proj = payload?.projectPath || currentProject;
+  if (accountId) {
+    if (proj) {
+      githubAccountManager.setProjectAssociation(proj, accountId);
+      try {
+        const git = await getGitStatus(proj);
+        if (git.linkedRepo) {
+          githubAccountManager.setProjectAssociation(git.linkedRepo, accountId);
+        }
+      } catch {}
+    }
+  }
+  const status = await getGithubStatus(proj, accountId);
+  mainWindow?.webContents.send("github:event", { type: "github.accountSelected", properties: status });
+  return status;
+});
+
+ipcMain.handle("github:disconnectAccount", async (_event, payload: { accountId: string }) => {
+  const accountId = String(payload?.accountId || "").trim();
+  if (accountId) {
+    githubAccountManager.removeAccountRecord(accountId);
+  }
+  const status = await getGithubStatus(currentProject);
+  mainWindow?.webContents.send("github:event", { type: "github.disconnected", properties: status });
+  return status;
+});
+
 ipcMain.handle("github:open", async (_event, url: string) => {
+  console.log("[GitHub] opening install URL");
   if (!/^https:\/\/github\.com\//i.test(url)) throw new Error("URL do GitHub inválida.");
   await shell.openExternal(url);
   return true;
 });
 
 ipcMain.handle("github:start", async (_event, forceReauthorize: boolean = false) => {
+  console.log("[GitHub/OAuth] github:start received");
+  console.log(`[GitHub/OAuth] forceReauthorize=${forceReauthorize}`);
   const existing = await getGithubStatus();
   if (existing.connected && !forceReauthorize && !existing.needsReauthorization) return { device: null, status: existing };
 
   // Prevent multiple concurrent initiations within the exact same tick / double-click
   if (githubAuthState.isStarting) {
-    console.warn("[GitHub OAuth] Initiation already in progress, ignoring duplicate call.");
+    console.warn("[GitHub/OAuth] Initiation already in progress, ignoring duplicate call.");
     return { device: null, status: { connected: false, repos: [] } };
   }
 
   githubAuthState.isStarting = true;
+  console.log("[GitHub/OAuth] starting device flow");
 
   try {
     // If there is any existing polling attempt from before, cancel it cleanly
@@ -5968,6 +6212,9 @@ ipcMain.handle("github:start", async (_event, forceReauthorize: boolean = false)
     if (!response.ok || !data.device_code || !data.user_code) {
       throw new Error(`Não foi possível iniciar o Device Flow do GitHub${data.error ? `: ${data.error}` : "."}`);
     }
+
+    console.log("[GitHub/OAuth] device flow started");
+    console.log("[GitHub/OAuth] user code received");
 
     const device = {
       userCode: String(data.user_code),
@@ -6120,7 +6367,6 @@ ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
     const status = await getGitStatus();
     if (!status.initialized) throw new Error("O projeto ainda não possui um repositório Git.");
     if (status.branch === name) return status;
-    if (status.dirty) throw new Error("Existem alterações locais não salvas. Faça commit ou descarte as alterações antes de trocar de branch.");
 
     // 1. Check if branch exists locally
     const local = await runGit(projectPath, ["rev-parse", "--verify", `refs/heads/${name}`], {}, 15000);
@@ -6212,7 +6458,6 @@ ipcMain.handle("github:createBranch", async (_event, payload: { name: string; ba
     const status = await getGitStatus();
     if (!status.initialized) throw new Error("O projeto ainda não possui um repositório Git.");
     if (status.branch === name) return { ok: true, status };
-    if (status.dirty) throw new Error("Existem alterações locais não salvas. Faça commit ou descarte as alterações antes de criar uma nova branch.");
 
     const gitArgs = baseBranch ? ["checkout", "-b", name, baseBranch] : ["checkout", "-b", name];
     const checkout = await runGit(projectPath, gitArgs, {}, 20000);
@@ -6467,10 +6712,18 @@ async function performGithubCommitPush(
       await runGit(safePath, ["branch", "-M", branch], {}, 5000);
     }
 
-    // Stage ONLY selected files if options.files is provided and non-empty
+    // Stage ONLY selected files if options.files is provided
     let addResult;
-    if (Array.isArray(options.files) && options.files.length > 0) {
-      addResult = await runGit(safePath, ["add", "--", ...options.files], {}, 20000);
+    if (Array.isArray(options.files)) {
+      if (options.files.length === 0) {
+        throw new Error("Selecione ao menos um arquivo para realizar o commit.");
+      }
+      const normalizedFiles = options.files.map(f => {
+        const norm = normalizeRepoRelativePath(f, safePath);
+        console.log(`[SELECTIVE-COMMIT] git add path: ${norm}`);
+        return norm;
+      });
+      addResult = await runGit(safePath, ["add", "--", ...normalizedFiles], {}, 20000);
     } else {
       addResult = await runGit(safePath, ["add", "-A"], {}, 20000);
     }
@@ -6517,7 +6770,16 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string; f
   if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
   const projectPath = assertProjectRootSafe(currentProject, "git-write");
   const message = String(payload?.message || "").trim();
-  const files = Array.isArray(payload?.files) ? payload.files.map(f => String(f).trim()).filter(Boolean) : undefined;
+  const rawFiles = Array.isArray(payload?.files) ? payload.files.map(f => String(f).trim()).filter(Boolean) : undefined;
+  let files: string[] | undefined = undefined;
+  if (rawFiles) {
+    files = rawFiles.map(f => {
+      console.log(`[SELECTIVE-COMMIT] IPC path: ${f}`);
+      const norm = normalizeRepoRelativePath(f, projectPath);
+      console.log(`[SELECTIVE-COMMIT] normalized path: ${norm}`);
+      return norm;
+    });
+  }
   return await performGithubCommitPush(projectPath, message, { isAuto: false, files });
 });
 

@@ -70,6 +70,8 @@ contextBridge.exposeInMainWorld("neko", {
   onEvent: (callback: (event: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("opencode:event", listener); return () => ipcRenderer.removeListener("opencode:event", listener); },
   onPreviewEvent: (callback: (event: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("preview:event", listener); return () => ipcRenderer.removeListener("preview:event", listener); },
   githubStatus: (refresh = false) => ipcRenderer.invoke("github:status", refresh),
+  githubSelectAccount: (accountId: string, projectPath?: string) => ipcRenderer.invoke("github:selectAccount", { accountId, projectPath }),
+  githubDisconnectAccount: (accountId: string) => ipcRenderer.invoke("github:disconnectAccount", { accountId }),
   githubStart: (forceReauthorize = false) => ipcRenderer.invoke("github:start", forceReauthorize),
   githubCancel: () => ipcRenderer.invoke("github:cancel"),
   githubDisconnect: () => ipcRenderer.invoke("github:disconnect"),

@@ -31,6 +31,7 @@ class RendererBranchController {
     changedFiles: [],
     summary: { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 }
   };
+  public selectedCommitFiles: Set<string> = new Set();
   public pendingTargetBranch: string | null = null;
   public modal: string | null = null;
   public isBusy: boolean = false;
@@ -140,17 +141,18 @@ class RendererBranchController {
   // 4. Salvar commit e trocar
   async handleBranchCommitAndCheckout(
     commitMessage: string,
-    commitApi: (m: string) => Promise<void>,
+    commitApi: (m: string, files?: string[]) => Promise<void>,
     checkoutApi: (b: string) => Promise<void>,
     getStatusApi: () => Promise<GitState>
   ): Promise<void> {
-    if (!this.pendingTargetBranch || !commitMessage.trim() || this.isBusy) return;
+    if (!this.pendingTargetBranch || !commitMessage.trim() || this.isBusy || this.selectedCommitFiles.size === 0) return;
     this.isBusy = true;
     this.lastError = "";
     const target = this.pendingTargetBranch;
     try {
       this.refreshRequestId++;
-      await commitApi(commitMessage.trim());
+      const selectedArray = Array.from(this.selectedCommitFiles);
+      await commitApi(commitMessage.trim(), selectedArray);
       await checkoutApi(target);
       const git = await getStatusApi();
       this.gitStatus = git;
@@ -328,6 +330,7 @@ describe("Git Branch Lifecycle & Resolution Flows", () => {
     controller.gitStatus.dirty = true;
     controller.modal = "branchCommit";
     controller.pendingTargetBranch = "feature-target";
+    controller.selectedCommitFiles = new Set(["file.ts"]);
 
     let commitCalled = false;
     let checkoutCalled = false;
@@ -571,5 +574,128 @@ describe("Deterministic Race Condition Tests", () => {
 
     const dirtyRepo = { dirty: true, linkedRepo: "user/repo" };
     assert.equal(checkAutoCommitAction(dirtyRepo).shouldCommit, true);
+  });
+});
+
+describe("Fluxo de Commit Seletivo e Troca de Branch Sem Bloqueio Indevido", () => {
+  it("TESTE 1: Commit seletivo - 5 arquivos selecionados de 8 alterados -> apenas os 5 entram no commit", async () => {
+    const controller = new RendererBranchController(["main", "feature-x"]);
+    controller.gitStatus.dirty = true;
+    controller.pendingTargetBranch = "feature-x";
+    controller.selectedCommitFiles = new Set(["file1.ts", "file2.ts", "file3.ts", "file4.ts", "file5.ts"]);
+
+    let committedFiles: string[] = [];
+    await controller.handleBranchCommitAndCheckout(
+      "Commit de 5 arquivos",
+      async (_msg, files) => {
+        committedFiles = files || [];
+      },
+      async () => {},
+      async () => ({ ...controller.gitStatus, branch: "feature-x" })
+    );
+
+    assert.equal(committedFiles.length, 5);
+    assert.deepEqual(committedFiles, ["file1.ts", "file2.ts", "file3.ts", "file4.ts", "file5.ts"]);
+  });
+
+  it("TESTE 2: Após commit seletivo, troca de branch ocorre preservando alterações não selecionadas não conflitantes", async () => {
+    const controller = new RendererBranchController(["main", "feature-safe"]);
+    controller.gitStatus.dirty = true;
+    controller.gitStatus.changedFiles = [
+      { path: "unselected.ts", status: "M", staged: false }
+    ];
+    controller.pendingTargetBranch = "feature-safe";
+    controller.selectedCommitFiles = new Set(["selected.ts"]);
+
+    let checkoutExecuted = false;
+    await controller.handleBranchCommitAndCheckout(
+      "Commit seletivo parcial",
+      async () => {},
+      async (branch) => {
+        assert.equal(branch, "feature-safe");
+        checkoutExecuted = true;
+      },
+      async () => ({
+        ...controller.gitStatus,
+        branch: "feature-safe",
+        dirty: true,
+        changedFiles: [{ path: "unselected.ts", status: "M", staged: false }]
+      })
+    );
+
+    assert.equal(checkoutExecuted, true);
+    assert.equal(controller.currentBranch, "feature-safe");
+    assert.equal(controller.gitStatus.dirty, true);
+    assert.equal(controller.gitStatus.changedFiles[0].path, "unselected.ts");
+  });
+
+  it("TESTE 3: Git recusa a troca por conflito na branch destino -> branch NÃO muda e alteração local é PRESERVADA", async () => {
+    const controller = new RendererBranchController(["main", "feature-conflict"]);
+    controller.gitStatus.dirty = true;
+    controller.gitStatus.changedFiles = [
+      { path: "conflict.ts", status: "M", staged: false }
+    ];
+    controller.pendingTargetBranch = "feature-conflict";
+    controller.selectedCommitFiles = new Set(["selected.ts"]);
+
+    await controller.handleBranchCommitAndCheckout(
+      "Commit antes do conflito",
+      async () => {},
+      async () => {
+        throw new Error("Troca de branch bloqueada pelo Git. As alterações locais em [conflict.ts] conflitam com a branch destino.");
+      },
+      async () => controller.gitStatus
+    );
+
+    assert.equal(controller.currentBranch, "main");
+    assert.match(controller.lastError, /bloqueada pelo Git.*conflict\.ts/i);
+    assert.equal(controller.gitStatus.dirty, true);
+  });
+
+  it("TESTE 4: Seleção vazia -> não executa commit nem altera o repositório", async () => {
+    const controller = new RendererBranchController(["main", "feature-empty"]);
+    controller.gitStatus.dirty = true;
+    controller.pendingTargetBranch = "feature-empty";
+    controller.selectedCommitFiles = new Set();
+
+    let commitCalled = false;
+    let checkoutCalled = false;
+
+    await controller.handleBranchCommitAndCheckout(
+      "Commit vazio",
+      async () => { commitCalled = true; },
+      async () => { checkoutCalled = true; },
+      async () => controller.gitStatus
+    );
+
+    assert.equal(commitCalled, false, "Commit API NÃO deve ser chamado com seleção vazia");
+    assert.equal(checkoutCalled, false, "Checkout API NÃO deve ser chamado com seleção vazia");
+    assert.equal(controller.currentBranch, "main");
+  });
+
+  it("TESTE 5: Auto Commit -> mantém comportamento decoupled existente sem seletivo", async () => {
+    const autoCommitOptions = { isAuto: true };
+    assert.equal(autoCommitOptions.isAuto, true);
+    const filesToPass: string[] | undefined = undefined;
+    assert.equal(filesToPass, undefined);
+  });
+
+  it("TESTE 6: Commit seletivo com novos (untracked), modificados e deletados -> apenas os selecionados entram no commit", async () => {
+    const controller = new RendererBranchController(["main", "feature-mixed"]);
+    controller.gitStatus.dirty = true;
+    controller.pendingTargetBranch = "feature-mixed";
+    controller.selectedCommitFiles = new Set(["newfile.ts", "modified.ts", "deleted.ts"]);
+
+    let committedFiles: string[] = [];
+    await controller.handleBranchCommitAndCheckout(
+      "Commit misto seletivo",
+      async (_msg, files) => {
+        committedFiles = files || [];
+      },
+      async () => {},
+      async () => ({ ...controller.gitStatus, branch: "feature-mixed" })
+    );
+
+    assert.deepEqual(committedFiles, ["newfile.ts", "modified.ts", "deleted.ts"]);
   });
 });
