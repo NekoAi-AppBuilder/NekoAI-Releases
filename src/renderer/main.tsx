@@ -1322,7 +1322,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.96");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.97");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -2011,6 +2011,32 @@ function App() {
       setSelectedCommitFiles(new Set());
     }
   }, [modal]);
+
+  // Limpa seleções quando a branch atual mudar
+  React.useEffect(() => {
+    setSelectedCommitFiles(new Set());
+  }, [githubLinkStatus.branch]);
+
+  // Remove caminhos selecionados que não existem mais na lista de alterações locais
+  React.useEffect(() => {
+    const validPaths = new Set((githubLinkStatus.changedFiles || []).map(f => f.path));
+    setSelectedCommitFiles(prev => {
+      if (prev.size === 0) return prev;
+      let hasStale = false;
+      for (const p of prev) {
+        if (!validPaths.has(p)) {
+          hasStale = true;
+          break;
+        }
+      }
+      if (!hasStale) return prev;
+      const next = new Set<string>();
+      for (const p of prev) {
+        if (validPaths.has(p)) next.add(p);
+      }
+      return next;
+    });
+  }, [githubLinkStatus.changedFiles]);
 
   const allChangedFiles = React.useMemo(() => (githubLinkStatus.changedFiles || []), [githubLinkStatus.changedFiles]);
   const modifiedFiles = React.useMemo(() => allChangedFiles.filter(f => f.status === "modified" || f.status === "renamed"), [allChangedFiles]);
@@ -6030,7 +6056,15 @@ function App() {
       return;
     }
 
-    if (githubLinkStatus.dirty) {
+    let currentGit = githubLinkStatus;
+    try {
+      currentGit = await window.neko.githubGitStatus();
+      setGithubLinkStatus(currentGit);
+    } catch {
+      // fallback to current githubLinkStatus
+    }
+
+    if (currentGit.dirty) {
       setPendingTargetBranch(branch);
       setBranchActionError("");
       setGithubBranchMenuOpen(false);
@@ -6537,6 +6571,32 @@ function App() {
     setGithubPublishBusy(false);
     setGithubPublishError("");
     setModal("github");
+  }
+
+  async function handleBranchCheckoutWithoutCommit() {
+    if (!pendingTargetBranch || branchActionBusy) return;
+    setBranchActionBusy(true);
+    setBranchActionError("");
+    const target = pendingTargetBranch;
+    try {
+      branchRefreshRequestIdRef.current++;
+      await window.neko.githubCheckoutBranch(target);
+      const git = await window.neko.githubGitStatus();
+      setGithubLinkStatus(git);
+      if (git.branch) {
+        setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
+      }
+      setModal(null);
+      setPendingTargetBranch(null);
+      showToast(`Alternado para a branch "${git.branch || target}" sem commit!`);
+    } catch (error: any) {
+      const errMsg = getUserFacingError(error, `Erro ao trocar para branch "${target}".`);
+      setBranchActionError(errMsg);
+      showToast(errMsg);
+      console.warn("[Branch] checkout without commit failed", String((error as Error)?.message ?? error));
+    } finally {
+      setBranchActionBusy(false);
+    }
   }
 
   async function handleBranchDiscardAndCheckout() {
@@ -7199,7 +7259,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.96"}</span>
+                  <span>Versão {appVersion || "0.4.97"}</span>
                 </div>
                 <button
                   type="button"
@@ -9016,7 +9076,30 @@ function App() {
               ) : (
                 <>
                   <textarea className="github-commit-input" value={githubCommitMessage} onChange={e => { setGithubCommitMessage(e.target.value); if (githubCommitError) setGithubCommitError(""); if (githubCommitSuccess) setGithubCommitSuccess(false); }} placeholder="Mensagem do commit" rows={2} disabled={githubCommitBusy}/>
-                  {githubCommitError && <div className="auth-error" style={{ marginTop: 8 }}>{githubCommitError}</div>}
+                  {githubCommitError && (
+                    <div className="auth-error" style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8, whiteSpace: "pre-line" }}>
+                      <div>{githubCommitError}</div>
+                      <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                        <button
+                          type="button"
+                          className="secondary btn-sm"
+                          style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
+                          onClick={async () => {
+                            try {
+                              const git = await window.neko.githubGitStatus();
+                              setGithubLinkStatus(git);
+                              setGithubCommitError("");
+                              showToast("Alterações locais atualizadas.");
+                            } catch {
+                              showToast("Erro ao atualizar alterações locais.");
+                            }
+                          }}
+                        >
+                          <RefreshCw size={12}/> Atualizar alterações
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   {githubCommitSuccess && <div className="github-linked-success" style={{ marginTop: 8 }}><Check size={16}/><div><b>Commit e Push realizado com sucesso</b><small>Alterações publicadas no GitHub com sucesso.</small></div></div>}
                   
                   <label className="github-auto-commit-label" style={{ display: "flex", alignItems: "center", gap: 8, margin: "12px 0 20px 0", fontSize: 13, cursor: "pointer", color: "var(--foreground-muted)", lineHeight: 1 }}>
@@ -9562,6 +9645,23 @@ function App() {
               <button
                 type="button"
                 className="secondary btn-sm"
+                onClick={async () => {
+                  try {
+                    const git = await window.neko.githubGitStatus();
+                    setGithubLinkStatus(git);
+                    showToast("Alterações locais atualizadas.");
+                  } catch {
+                    showToast("Erro ao atualizar alterações locais.");
+                  }
+                }}
+                style={{ fontSize: 11, padding: "3px 10px", display: "inline-flex", alignItems: "center", gap: 4 }}
+                title="Recarregar arquivos alterados"
+              >
+                <RefreshCw size={11}/> Atualizar
+              </button>
+              <button
+                type="button"
+                className="secondary btn-sm"
                 onClick={selectAllFiles}
                 style={{ fontSize: 11, padding: "3px 10px" }}
               >
@@ -9711,9 +9811,15 @@ function App() {
           <button className="secondary danger-btn" disabled={branchActionBusy} onClick={() => setModal("branchDiscardConfirm")}>
             <Trash2 size={14}/> Descartar alterações
           </button>
-          <button className="primary" disabled={branchActionBusy || selectedCommitFiles.size === 0} onClick={() => setModal("branchCommit")}>
-            <Check size={14}/> Fazer Commit ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})
-          </button>
+          {selectedCommitFiles.size === 0 ? (
+            <button className="primary" disabled={branchActionBusy} onClick={() => void handleBranchCheckoutWithoutCommit()}>
+              <GitBranch size={14}/> {pendingTargetBranch ? `Trocar para ${pendingTargetBranch} sem commit` : "Trocar sem commit"}
+            </button>
+          ) : (
+            <button className="primary" disabled={branchActionBusy} onClick={() => setModal("branchCommit")}>
+              <Check size={14}/> Fazer Commit ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})
+            </button>
+          )}
         </div>
       </>}
 
@@ -9768,7 +9874,30 @@ function App() {
           <div className="branch-commit-help">
             <span>Após o commit, o NekoAI trocará automaticamente para <b>{pendingTargetBranch}</b>.</span>
           </div>
-          {branchActionError && <div className="auth-error">{branchActionError}</div>}
+          {branchActionError && (
+            <div className="auth-error" style={{ display: "flex", flexDirection: "column", gap: 8, whiteSpace: "pre-line" }}>
+              <div>{branchActionError}</div>
+              <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  type="button"
+                  className="secondary btn-sm"
+                  style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
+                  onClick={async () => {
+                    try {
+                      const git = await window.neko.githubGitStatus();
+                      setGithubLinkStatus(git);
+                      setBranchActionError("");
+                      showToast("Alterações locais atualizadas.");
+                    } catch {
+                      showToast("Erro ao atualizar alterações locais.");
+                    }
+                  }}
+                >
+                  <RefreshCw size={12}/> Atualizar alterações
+                </button>
+              </div>
+            </div>
+          )}
         </div>
         <div className="modal-actions branch-modal-actions">
           <button className="secondary" disabled={branchActionBusy} onClick={() => setModal("branchChanges")}>Voltar</button>

@@ -144,4 +144,80 @@ describe("Selective Commit Path Normalization & Git Porcelain Parsing", () => {
       assert.ok(!gitArgs.includes("ndex.html"));
     });
   });
+
+  describe("4. Diagnóstico de Arquivos de Outra Branch & Seleção Stale", () => {
+    const { diagnoseGitFilePath } = require("../src/main/git-path-normalizer");
+
+    it("4.1. Diagnostica arquivo existente no status e working tree como normal", async () => {
+      const fs = require("node:fs");
+      const tmpDir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "neko-test-diag-"));
+      try {
+        fs.writeFileSync(path.join(tmpDir, "index.html"), "<h1>Test</h1>");
+        const diag = await diagnoseGitFilePath(
+          "index.html",
+          tmpDir,
+          ["index.html"],
+          "main",
+          async () => ({ code: 0, stdout: "", stderr: "" })
+        );
+        assert.equal(diag.existsInWorkingTree, true);
+        assert.equal(diag.statusMatch, true);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("4.2. Detecta arquivo que pertence a outra branch quando ausente localmente", async () => {
+      const fs = require("node:fs");
+      const tmpDir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "neko-test-diag-"));
+      try {
+        // Arquivo "src/pages/Landing.tsx" não existe no tmpDir nem em currentStatus
+        const fakeGit = async (args: string[]) => {
+          if (args[0] === "for-each-ref") {
+            return { code: 0, stdout: "main\norigin/main\nfeature/teste\n", stderr: "" };
+          }
+          if (args[0] === "ls-tree" && (args[2] === "main" || args[2] === "origin/main")) {
+            return { code: 0, stdout: "src/pages/Landing.tsx\n", stderr: "" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        };
+
+        const diag = await diagnoseGitFilePath(
+          "src/pages/Landing.tsx",
+          tmpDir,
+          [],
+          "teste-nekoai-stage2-2",
+          fakeGit
+        );
+
+        assert.equal(diag.existsInWorkingTree, false);
+        assert.equal(diag.statusMatch, false);
+        assert.equal(diag.reason, "other_branch");
+        assert.ok(diag.branchesContainingFile?.includes("main"));
+        assert.ok(diag.message?.includes("main"));
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("4.3. Classifica como stale_not_found quando arquivo não existe em nenhuma branch", async () => {
+      const fs = require("node:fs");
+      const tmpDir = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "neko-test-diag-"));
+      try {
+        const fakeGit = async () => ({ code: 0, stdout: "", stderr: "" });
+        const diag = await diagnoseGitFilePath(
+          "arquivo-fantasma.txt",
+          tmpDir,
+          [],
+          "main",
+          fakeGit
+        );
+        assert.equal(diag.existsInWorkingTree, false);
+        assert.equal(diag.statusMatch, false);
+        assert.equal(diag.reason, "stale_not_found");
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

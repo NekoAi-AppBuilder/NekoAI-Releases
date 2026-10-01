@@ -52,3 +52,86 @@ export function normalizeRepoRelativePath(rawPath: string, repoRoot?: string): s
 
   return p;
 }
+
+export interface GitPathDiagnostic {
+  path: string;
+  existsInWorkingTree: boolean;
+  statusMatch: boolean;
+  branchesContainingFile?: string[];
+  reason?: "deleted" | "other_branch" | "stale_not_found";
+  message?: string;
+}
+
+/**
+ * Diagnostica se um arquivo selecionado para commit existe no working tree atual
+ * e, caso não exista, verifica em quais outras branches locais/remotas o arquivo existe.
+ */
+export async function diagnoseGitFilePath(
+  relativePath: string,
+  repoRoot: string,
+  currentStatusFiles: string[],
+  currentBranch: string | null,
+  gitRunner: (args: string[]) => Promise<{ code: number; stdout: string; stderr: string }>
+): Promise<GitPathDiagnostic> {
+  const norm = normalizeRepoRelativePath(relativePath, repoRoot);
+  const fullPath = path.resolve(repoRoot, norm);
+  const fs = await import("node:fs");
+  const exists = fs.existsSync(fullPath);
+  const inStatus = currentStatusFiles.includes(norm);
+
+  if (exists && inStatus) {
+    return { path: norm, existsInWorkingTree: true, statusMatch: true };
+  }
+
+  if (inStatus && !exists) {
+    // Arquivo está no status (ex: deleted no working tree)
+    return {
+      path: norm,
+      existsInWorkingTree: false,
+      statusMatch: true,
+      reason: "deleted"
+    };
+  }
+
+  // Arquivo não existe no working tree e nem no status atual:
+  // Procurar se existe em outra branch (local ou remota)
+  const branches: string[] = [];
+  try {
+    const refsRes = await gitRunner(["for-each-ref", "--format=%(refname:short)", "refs/heads/", "refs/remotes/"]);
+    if (refsRes.code === 0) {
+      const allRefs = refsRes.stdout.split(/\r?\n/).map(r => r.trim()).filter(Boolean);
+      for (const ref of allRefs) {
+        if (ref === "origin" || ref === "HEAD" || ref === "origin/HEAD") continue;
+        const cleanRef = ref.startsWith("origin/") ? ref.slice(7) : ref;
+        if (currentBranch && (ref === currentBranch || cleanRef === currentBranch)) continue;
+        const lsRes = await gitRunner(["ls-tree", "--name-only", ref, "--", norm]);
+        if (lsRes.code === 0 && lsRes.stdout.trim().length > 0) {
+          branches.push(cleanRef);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(`[GitDiagnostic] erro ao pesquisar arquivo em outras branches:`, err);
+  }
+
+  if (branches.length > 0) {
+    const branchList = Array.from(new Set(branches)).join(", ");
+    return {
+      path: norm,
+      existsInWorkingTree: false,
+      statusMatch: false,
+      branchesContainingFile: Array.from(new Set(branches)),
+      reason: "other_branch",
+      message: `Este arquivo não existe na branch ${currentBranch || "atual"}. Ele existe na(s) branch(es): ${branchList}.`
+    };
+  }
+
+  return {
+    path: norm,
+    existsInWorkingTree: false,
+    statusMatch: false,
+    reason: "stale_not_found",
+    message: `Este arquivo não existe na branch ${currentBranch || "atual"} e não foi encontrado no working tree.`
+  };
+}
+

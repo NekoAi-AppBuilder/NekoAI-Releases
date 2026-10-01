@@ -40,7 +40,7 @@ import { RuntimeRequirement } from "./runtime/runtime-types";
 import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTimeoutDiagnostic } from "./opencode-diagnostics";
 import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
 import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolveConflictFile, finalizeConflictResolution, getConflictFiles, parseLinkedRepo, type GitSyncStatus, type PullResult, type GitConflictFile, type GitSyncCombineResult } from "./git-sync";
-import { normalizeRepoRelativePath } from "./git-path-normalizer";
+import { normalizeRepoRelativePath, diagnoseGitFilePath } from "./git-path-normalizer";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -6723,6 +6723,33 @@ async function performGithubCommitPush(
         console.log(`[SELECTIVE-COMMIT] git add path: ${norm}`);
         return norm;
       });
+
+      // Validação e diagnóstico pré-commit:
+      // Garante que todos os arquivos selecionados realmente existem no working tree ou no git status atual
+      const statusFiles = (status.changedFiles || []).map(cf => cf.path);
+      for (const relFile of normalizedFiles) {
+        const diag = await diagnoseGitFilePath(
+          relFile,
+          safePath,
+          statusFiles,
+          branch,
+          (args) => runGit(safePath, args, {}, 10000)
+        );
+
+        if (!diag.existsInWorkingTree && !diag.statusMatch) {
+          if (diag.reason === "other_branch") {
+            const branchesStr = (diag.branchesContainingFile || []).join(", ");
+            throw new Error(
+              `⚠️ Arquivo indisponível na branch atual: "${diag.path}".\nEste arquivo não existe na branch "${branch}". Ele foi encontrado na(s) branch(es): ${branchesStr}.\nAtualize as alterações locais ou troque para a branch correta antes de tentar o commit.`
+            );
+          } else {
+            throw new Error(
+              `⚠️ Arquivo não encontrado: "${diag.path}".\nEste arquivo não existe na branch "${branch}" e não foi encontrado no projeto.\nAtualize a lista de alterações locais.`
+            );
+          }
+        }
+      }
+
       addResult = await runGit(safePath, ["add", "--", ...normalizedFiles], {}, 20000);
     } else {
       addResult = await runGit(safePath, ["add", "-A"], {}, 20000);

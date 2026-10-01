@@ -138,6 +138,37 @@ class RendererBranchController {
     }
   }
 
+  // 3b. Trocar sem commit preservando alterações locais
+  async handleBranchCheckoutWithoutCommit(
+    checkoutApi: (b: string) => Promise<void>,
+    getStatusApi: () => Promise<GitState>
+  ): Promise<void> {
+    if (!this.pendingTargetBranch || this.isBusy) return;
+    this.isBusy = true;
+    this.lastError = "";
+    const target = this.pendingTargetBranch;
+    try {
+      this.refreshRequestId++;
+      await checkoutApi(target);
+      const git = await getStatusApi();
+      this.gitStatus = git;
+      this.currentBranch = git.branch;
+      if (git.branch && !this.branches.includes(git.branch)) {
+        this.branches.push(git.branch);
+        this.branches.sort();
+      }
+      this.modal = null;
+      this.pendingTargetBranch = null;
+      this.showToast(`Alternado para a branch "${git.branch || target}" sem commit!`);
+    } catch (error: any) {
+      const errMsg = error?.message || `Erro ao trocar para branch "${target}".`;
+      this.lastError = errMsg;
+      this.showToast(errMsg);
+    } finally {
+      this.isBusy = false;
+    }
+  }
+
   // 4. Salvar commit e trocar
   async handleBranchCommitAndCheckout(
     commitMessage: string,
@@ -697,5 +728,118 @@ describe("Fluxo de Commit Seletivo e Troca de Branch Sem Bloqueio Indevido", () 
     );
 
     assert.deepEqual(committedFiles, ["newfile.ts", "modified.ts", "deleted.ts"]);
+  });
+
+  it("TESTE 7: 6 alterações locais, 0 arquivos selecionados -> Trocar para main sem commit -> troca segura com arquivos locais preservados", async () => {
+    const controller = new RendererBranchController(["main", "feature-work"]);
+    controller.currentBranch = "feature-work";
+    controller.gitStatus.branch = "feature-work";
+    controller.gitStatus.dirty = true;
+    const sixLocalFiles = [
+      { path: ".neko/thumbnail.png", status: "untracked", staged: false },
+      { path: "dist/index.html", status: "modified", staged: false },
+      { path: "node_modules/.vite/deps/_metadata.json", status: "modified", staged: false },
+      { path: ".opencode/skills/test/SKILL.md", status: "untracked", staged: false },
+      { path: ".vscode/mcp.json", status: "modified", staged: false },
+      { path: "opencode.json", status: "modified", staged: false }
+    ];
+    controller.gitStatus.changedFiles = [...sixLocalFiles];
+    controller.pendingTargetBranch = "main";
+    controller.selectedCommitFiles = new Set(); // 0 selecionados
+
+    let checkoutCalledWith = "";
+    let commitCalled = false;
+    let discardCalled = false;
+
+    // Executa fluxo sem commit
+    await controller.handleBranchCheckoutWithoutCommit(
+      async (branch) => {
+        checkoutCalledWith = branch;
+      },
+      async () => ({
+        ...controller.gitStatus,
+        branch: "main",
+        dirty: true,
+        changedFiles: [...sixLocalFiles] // todas as 6 alterações locais preservadas intactas
+      })
+    );
+
+    assert.equal(checkoutCalledWith, "main", "Checkout direto para main deve ser executado");
+    assert.equal(commitCalled, false, "Nenhum commit deve ser feito");
+    assert.equal(discardCalled, false, "Nenhum descarte deve ser feito");
+    assert.equal(controller.currentBranch, "main", "Branch ativa deve ser main");
+    assert.equal(controller.gitStatus.dirty, true, "Dirty state preservado");
+    assert.equal(controller.gitStatus.changedFiles.length, 6, "Todos os 6 arquivos locais permanecem preservados");
+    assert.equal(controller.modal, null, "Modal fechada");
+    assert.equal(controller.pendingTargetBranch, null, "Pending branch resetada");
+    assert.match(controller.toasts[0], /Alternado para a branch "main" sem commit!/i);
+  });
+
+  it("TESTE 8: 0 arquivos selecionados + conflito real reportado pelo Git -> Git bloqueia, branch não muda e arquivos locais preservados", async () => {
+    const controller = new RendererBranchController(["main", "feature-work"]);
+    controller.currentBranch = "feature-work";
+    controller.gitStatus.branch = "feature-work";
+    controller.gitStatus.dirty = true;
+    const sixLocalFiles = [
+      { path: ".neko/thumbnail.png", status: "untracked", staged: false },
+      { path: "dist/index.html", status: "modified", staged: false },
+      { path: "node_modules/.vite/deps/_metadata.json", status: "modified", staged: false },
+      { path: ".opencode/skills/test/SKILL.md", status: "untracked", staged: false },
+      { path: ".vscode/mcp.json", status: "modified", staged: false },
+      { path: "opencode.json", status: "modified", staged: false }
+    ];
+    controller.gitStatus.changedFiles = [...sixLocalFiles];
+    controller.pendingTargetBranch = "main";
+    controller.selectedCommitFiles = new Set();
+
+    await controller.handleBranchCheckoutWithoutCommit(
+      async () => {
+        throw new Error("Troca de branch bloqueada pelo Git. As alterações locais em [dist/index.html] conflitam com a branch destino.");
+      },
+      async () => controller.gitStatus
+    );
+
+    assert.equal(controller.currentBranch, "feature-work", "Branch deve permanecer na atual (feature-work)");
+    assert.match(controller.lastError, /bloqueada pelo Git.*dist\/index\.html/i);
+    assert.equal(controller.gitStatus.dirty, true, "Alterações permanecem intactas");
+    assert.equal(controller.gitStatus.changedFiles.length, 6, "Nenhum arquivo local foi perdido");
+  });
+
+  it("TESTE 9: 6 alterações locais, alguns selecionados -> apenas os selecionados entram no commit e faz checkout", async () => {
+    const controller = new RendererBranchController(["main", "feature-work"]);
+    controller.currentBranch = "feature-work";
+    controller.gitStatus.branch = "feature-work";
+    controller.gitStatus.dirty = true;
+    controller.pendingTargetBranch = "main";
+    controller.selectedCommitFiles = new Set(["opencode.json", ".vscode/mcp.json"]);
+
+    let committedFiles: string[] = [];
+    let checkoutBranch = "";
+
+    await controller.handleBranchCommitAndCheckout(
+      "Commit seletivo de config",
+      async (_msg, files) => {
+        committedFiles = files || [];
+      },
+      async (b) => {
+        checkoutBranch = b;
+      },
+      async () => ({
+        ...controller.gitStatus,
+        branch: "main",
+        dirty: true,
+        changedFiles: [
+          { path: ".neko/thumbnail.png", status: "untracked", staged: false },
+          { path: "dist/index.html", status: "modified", staged: false },
+          { path: "node_modules/.vite/deps/_metadata.json", status: "modified", staged: false },
+          { path: ".opencode/skills/test/SKILL.md", status: "untracked", staged: false }
+        ]
+      })
+    );
+
+    assert.deepEqual(committedFiles, ["opencode.json", ".vscode/mcp.json"]);
+    assert.equal(checkoutBranch, "main");
+    assert.equal(controller.currentBranch, "main");
+    assert.equal(controller.gitStatus.changedFiles.length, 4, "Arquivos não selecionados continuam locais");
   });
 });
