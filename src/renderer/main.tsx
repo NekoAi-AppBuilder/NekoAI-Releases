@@ -646,6 +646,31 @@ function pathNormalizedEqual(a: string, b: string): boolean {
   return n(a) === n(b);
 }
 
+function GroupCheckbox({
+  checked,
+  indeterminate,
+  onChange,
+  disabled
+}: {
+  checked: boolean;
+  indeterminate: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <input
+      type="checkbox"
+      checked={checked}
+      disabled={disabled}
+      onChange={onChange}
+      ref={(el) => {
+        if (el) el.indeterminate = indeterminate;
+      }}
+      style={{ cursor: "pointer", accentColor: "#a855f7" }}
+    />
+  );
+}
+
 // CollapsibleMessageBody: recolhimento VISUAL local para mensagens de texto
 // e cards interativos com contedo longo (<320px de altura visvel). O contedo
 // completo NUNCA  truncado  o usurio recebe todas as opes/texto e apenas
@@ -1059,7 +1084,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.94");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.95");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1740,6 +1765,57 @@ function App() {
   const [branchCommitMessage, setBranchCommitMessage] = React.useState("WIP: alterações antes de trocar de branch");
   const [branchActionBusy, setBranchActionBusy] = React.useState(false);
   const [branchActionError, setBranchActionError] = React.useState("");
+  const [selectedCommitFiles, setSelectedCommitFiles] = React.useState<Set<string>>(new Set());
+
+  React.useEffect(() => {
+    if (modal === "branchChanges") {
+      setSelectedCommitFiles(new Set());
+    }
+  }, [modal]);
+
+  const allChangedFiles = React.useMemo(() => (githubLinkStatus.changedFiles || []), [githubLinkStatus.changedFiles]);
+  const modifiedFiles = React.useMemo(() => allChangedFiles.filter(f => f.status === "modified" || f.status === "renamed"), [allChangedFiles]);
+  const newFiles = React.useMemo(() => allChangedFiles.filter(f => f.status === "untracked" || f.status === "added"), [allChangedFiles]);
+  const deletedFiles = React.useMemo(() => allChangedFiles.filter(f => f.status === "deleted"), [allChangedFiles]);
+
+  const toggleFileSelection = React.useCallback((filePath: string) => {
+    setSelectedCommitFiles(prev => {
+      const next = new Set(prev);
+      if (next.has(filePath)) next.delete(filePath);
+      else next.add(filePath);
+      return next;
+    });
+  }, []);
+
+  const selectAllFiles = React.useCallback(() => {
+    setSelectedCommitFiles(new Set(allChangedFiles.map(f => f.path)));
+  }, [allChangedFiles]);
+
+  const deselectAllFiles = React.useCallback(() => {
+    setSelectedCommitFiles(new Set());
+  }, []);
+
+  const toggleGroupSelection = React.useCallback((groupFiles: GitChangedFile[]) => {
+    const groupPaths = groupFiles.map(f => f.path);
+    const allSelected = groupPaths.every(p => selectedCommitFiles.has(p));
+    setSelectedCommitFiles(prev => {
+      const next = new Set(prev);
+      if (allSelected) {
+        groupPaths.forEach(p => next.delete(p));
+      } else {
+        groupPaths.forEach(p => next.add(p));
+      }
+      return next;
+    });
+  }, [selectedCommitFiles]);
+
+  const getGroupCheckboxState = React.useCallback((groupFiles: GitChangedFile[]) => {
+    if (groupFiles.length === 0) return { checked: false, indeterminate: false };
+    const count = groupFiles.filter(f => selectedCommitFiles.has(f.path)).length;
+    if (count === 0) return { checked: false, indeterminate: false };
+    if (count === groupFiles.length) return { checked: true, indeterminate: false };
+    return { checked: false, indeterminate: true };
+  }, [selectedCommitFiles]);
   const [gitSyncStatus, setGitSyncStatus] = React.useState<any | null>(null);
   const [gitSyncBusy, setGitSyncBusy] = React.useState(false);
   const [gitSyncRefreshing, setGitSyncRefreshing] = React.useState(false);
@@ -5917,7 +5993,8 @@ function App() {
         return;
       }
 
-      await window.neko.githubCommitPush(githubCommitMessage.trim());
+      const selectedFilesArray = selectedCommitFiles.size > 0 ? Array.from(selectedCommitFiles) : undefined;
+      await window.neko.githubCommitPush(githubCommitMessage.trim(), selectedFilesArray);
       setGithubCommitSuccess(true);
       setGithubCommitMessage("");
       const git = await window.neko.githubGitStatus();
@@ -6191,7 +6268,8 @@ function App() {
         return;
       }
 
-      await window.neko.githubCommitPush(branchCommitMessage.trim());
+      const selectedFilesArray = selectedCommitFiles.size > 0 ? Array.from(selectedCommitFiles) : undefined;
+      await window.neko.githubCommitPush(branchCommitMessage.trim(), selectedFilesArray);
       await window.neko.githubCheckoutBranch(target);
       const git = await window.neko.githubGitStatus();
       setGithubLinkStatus(git);
@@ -6801,7 +6879,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.94"}</span>
+                  <span>Versão {appVersion || "0.4.95"}</span>
                 </div>
                 <button
                   type="button"
@@ -9091,44 +9169,162 @@ function App() {
           <button className="close-btn" disabled={branchActionBusy} onClick={() => { setModal(null); setPendingTargetBranch(null); }} aria-label="Fechar"><X size={17}/></button>
         </div>
         <div className="modal-scroll-body branch-changes-modal-body">
-          <div className="branch-target-banner">
-            <span>Antes de trocar para o branch <b>{pendingTargetBranch}</b>, escolha como deseja continuar:</span>
-          </div>
-
-          <div className="branch-summary-chips">
-            {githubLinkStatus.summary?.modified ? <span className="branch-chip mod"><FileText size={12}/>{githubLinkStatus.summary.modified} modificado{githubLinkStatus.summary.modified > 1 ? "s" : ""}</span> : null}
-            {githubLinkStatus.summary?.untracked ? <span className="branch-chip new"><Plus size={12}/>{githubLinkStatus.summary.untracked} novo{githubLinkStatus.summary.untracked > 1 ? "s" : ""}</span> : null}
-            {githubLinkStatus.summary?.deleted ? <span className="branch-chip del"><Trash2 size={12}/>{githubLinkStatus.summary.deleted} excluído{githubLinkStatus.summary.deleted > 1 ? "s" : ""}</span> : null}
-            {!githubLinkStatus.summary?.total ? <span className="branch-chip mod"><FileText size={12}/>Arquivos modificados</span> : null}
-          </div>
-
-          <div className="branch-diff-toggle-wrap">
-            <button className="secondary branch-toggle-diff-btn" onClick={() => setShowBranchDiffList(v => !v)}>
-              <FileCode2 size={13}/>
-              <span>{showBranchDiffList ? "Ocultar arquivos alterados" : "Ver alterações detalhadas"}</span>
-              {showBranchDiffList ? <ChevronUp size={13}/> : <ChevronDown size={13}/>}
-            </button>
-          </div>
-
-          {showBranchDiffList ? (
-            <div className="branch-files-drawer">
-              {(githubLinkStatus.changedFiles || []).length > 0 ? (
-                <div className="branch-files-list">
-                  {(githubLinkStatus.changedFiles || []).map(f => (
-                    <div className="branch-file-item" key={f.path}>
-                      <span className={`branch-file-badge ${f.status}`}>
-                        {f.status === "modified" ? "MODIFICADO" : f.status === "untracked" || f.status === "added" ? "NOVO" : f.status === "deleted" ? "EXCLUÍDO" : "ALTERADO"}
-                      </span>
-                      <span className="branch-file-path" title={f.path}>{f.path}</span>
-                      {f.staged ? <span className="branch-staged-tag">staged</span> : null}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="branch-files-empty">Nenhum arquivo listado.</div>
-              )}
+          {pendingTargetBranch ? (
+            <div className="branch-target-banner">
+              <span>Antes de trocar para a branch <b>{pendingTargetBranch}</b>, escolha as alterações que deseja comitar:</span>
             </div>
           ) : null}
+
+          {/* Barra de Ações Globais & Contador */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8, padding: "8px 12px", background: "rgba(255, 255, 255, 0.03)", borderRadius: 8, border: "1px solid rgba(255, 255, 255, 0.06)" }}>
+            <span style={{ fontSize: 12, color: "#c2b6cf", fontWeight: 600 }}>
+              {selectedCommitFiles.size} de {allChangedFiles.length} arquivo{allChangedFiles.length !== 1 ? "s" : ""} selecionado{selectedCommitFiles.size !== 1 ? "s" : ""}
+            </span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                className="secondary btn-sm"
+                onClick={selectAllFiles}
+                style={{ fontSize: 11, padding: "3px 10px" }}
+              >
+                Selecionar todos
+              </button>
+              <button
+                type="button"
+                className="secondary btn-sm"
+                onClick={deselectAllFiles}
+                style={{ fontSize: 11, padding: "3px 10px" }}
+              >
+                Desmarcar todos
+              </button>
+            </div>
+          </div>
+
+          {/* Listagem com Checkboxes dividida por Grupos */}
+          <div className="branch-files-drawer" style={{ display: "block", maxHeight: "340px", overflowY: "auto" }}>
+            {allChangedFiles.length > 0 ? (
+              <div>
+                {/* Grupo: MODIFICADOS */}
+                {modifiedFiles.length > 0 && (() => {
+                  const groupState = getGroupCheckboxState(modifiedFiles);
+                  return (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
+                        <GroupCheckbox
+                          checked={groupState.checked}
+                          indeterminate={groupState.indeterminate}
+                          onChange={() => toggleGroupSelection(modifiedFiles)}
+                        />
+                        <span style={{ fontSize: 11, fontWeight: 700, color: "#fde047", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          MODIFICADOS ({modifiedFiles.length})
+                        </span>
+                      </div>
+                      <div className="branch-files-list">
+                        {modifiedFiles.map(f => (
+                          <div
+                            className="branch-file-item"
+                            key={f.path}
+                            style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
+                            onClick={() => toggleFileSelection(f.path)}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedCommitFiles.has(f.path)}
+                              onChange={() => {}}
+                              style={{ cursor: "pointer", accentColor: "#a855f7" }}
+                            />
+                            <span className="branch-file-badge modified">MODIFICADO</span>
+                            <span className="branch-file-path" title={f.path}>{f.path}</span>
+                            {f.staged ? <span className="branch-staged-tag">staged</span> : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Grupo: NOVOS */}
+                {newFiles.length > 0 && (() => {
+                  const groupState = getGroupCheckboxState(newFiles);
+                  return (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
+                        <GroupCheckbox
+                          checked={groupState.checked}
+                          indeterminate={groupState.indeterminate}
+                          onChange={() => toggleGroupSelection(newFiles)}
+                        />
+                        <span style={{ fontSize: 11, fontWeight: 700, color: "#86efac", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          NOVOS ({newFiles.length})
+                        </span>
+                      </div>
+                      <div className="branch-files-list">
+                        {newFiles.map(f => (
+                          <div
+                            className="branch-file-item"
+                            key={f.path}
+                            style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
+                            onClick={() => toggleFileSelection(f.path)}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedCommitFiles.has(f.path)}
+                              onChange={() => {}}
+                              style={{ cursor: "pointer", accentColor: "#a855f7" }}
+                            />
+                            <span className="branch-file-badge added">NOVO</span>
+                            <span className="branch-file-path" title={f.path}>{f.path}</span>
+                            {f.staged ? <span className="branch-staged-tag">staged</span> : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Grupo: EXCLUÍDOS */}
+                {deletedFiles.length > 0 && (() => {
+                  const groupState = getGroupCheckboxState(deletedFiles);
+                  return (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
+                        <GroupCheckbox
+                          checked={groupState.checked}
+                          indeterminate={groupState.indeterminate}
+                          onChange={() => toggleGroupSelection(deletedFiles)}
+                        />
+                        <span style={{ fontSize: 11, fontWeight: 700, color: "#fca5a5", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          EXCLUÍDOS ({deletedFiles.length})
+                        </span>
+                      </div>
+                      <div className="branch-files-list">
+                        {deletedFiles.map(f => (
+                          <div
+                            className="branch-file-item"
+                            key={f.path}
+                            style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
+                            onClick={() => toggleFileSelection(f.path)}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedCommitFiles.has(f.path)}
+                              onChange={() => {}}
+                              style={{ cursor: "pointer", accentColor: "#a855f7" }}
+                            />
+                            <span className="branch-file-badge deleted">EXCLUÍDO</span>
+                            <span className="branch-file-path" title={f.path}>{f.path}</span>
+                            {f.staged ? <span className="branch-staged-tag">staged</span> : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            ) : (
+              <div className="branch-files-empty">Nenhum arquivo listado.</div>
+            )}
+          </div>
 
           {branchActionError && <div className="auth-error">{branchActionError}</div>}
         </div>
@@ -9137,8 +9333,8 @@ function App() {
           <button className="secondary danger-btn" disabled={branchActionBusy} onClick={() => setModal("branchDiscardConfirm")}>
             <Trash2 size={14}/> Descartar alterações
           </button>
-          <button className="primary" disabled={branchActionBusy} onClick={() => setModal("branchCommit")}>
-            <Check size={14}/> Fazer Commit
+          <button className="primary" disabled={branchActionBusy || selectedCommitFiles.size === 0} onClick={() => setModal("branchCommit")}>
+            <Check size={14}/> Fazer Commit ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})
           </button>
         </div>
       </>}
@@ -9198,8 +9394,8 @@ function App() {
         </div>
         <div className="modal-actions branch-modal-actions">
           <button className="secondary" disabled={branchActionBusy} onClick={() => setModal("branchChanges")}>Voltar</button>
-          <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy} onClick={() => void handleBranchCommitAndCheckout()}>
-            {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando e trocando...</> : <><Check size={14}/> Salvar e trocar para {pendingTargetBranch}</>}
+          <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0} onClick={() => void handleBranchCommitAndCheckout()}>
+            {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando e trocando...</> : <><Check size={14}/> {pendingTargetBranch ? `Salvar e trocar para ${pendingTargetBranch}` : "Salvar Commit"} ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})</>}
           </button>
         </div>
       </>}

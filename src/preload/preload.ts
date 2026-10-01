@@ -93,7 +93,7 @@ contextBridge.exposeInMainWorld("neko", {
   githubGetAutoCommit: (projectPath?: string) => ipcRenderer.invoke("github:getAutoCommit", projectPath),
   githubSetAutoCommit: (projectPath: string, enabled: boolean) => ipcRenderer.invoke("github:setAutoCommit", { projectPath, enabled }),
   githubGetDefaultBranch: () => ipcRenderer.invoke("github:getDefaultBranch"),
-  githubCommitPush: (message: string) => ipcRenderer.invoke("github:commitPush", { message }),
+  githubCommitPush: (message: string, files?: string[]) => ipcRenderer.invoke("github:commitPush", { message, files }),
   githubCreatePullRequest: (repoFullName: string, head: string, base: string, title: string, body: string) => ipcRenderer.invoke("github:createPullRequest", { repoFullName, head, base, title, body }),
   githubDiscardChanges: () => ipcRenderer.invoke("github:discardChanges"),
   githubUnlinkProject: () => ipcRenderer.invoke("github:unlinkProject"),

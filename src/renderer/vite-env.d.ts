@@ -73,7 +73,7 @@ interface Window {
     githubCloneProject(repoFullName: string, parentPath?: string, projectName?: string): Promise<any>;
     githubPublishProject(repoName: string, isPrivate?: boolean): Promise<any>;
     githubCancelPublish?(): Promise<any>;
-    githubCommitPush(message: string): Promise<any>;
+    githubCommitPush(message: string, files?: string[]): Promise<any>;
     githubAutoCommitTask?(payload?: { projectPath?: string; taskId?: string; message?: string } | string, legacyMessage?: string): Promise<{ ok: boolean; committed?: boolean; pushed?: boolean; status?: any; message?: string; skipped?: boolean; reason?: string }>;
     githubGetAutoCommit?(projectPath?: string): Promise<boolean>;
     githubSetAutoCommit?(projectPath: string, enabled: boolean): Promise<{ ok: boolean; enabled: boolean }>;

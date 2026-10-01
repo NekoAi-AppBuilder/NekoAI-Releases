@@ -6407,7 +6407,7 @@ function sanitizeAutoCommitMessage(rawMessage?: string): string {
 async function performGithubCommitPush(
   projectPath: string,
   message: string,
-  options: { isAuto?: boolean } = {}
+  options: { isAuto?: boolean; files?: string[] } = {}
 ): Promise<CommitPushResult> {
   const safePath = assertProjectRootSafe(projectPath, "git-write");
   const cleanMessage = options.isAuto ? sanitizeAutoCommitMessage(message) : String(message || "").trim();
@@ -6467,8 +6467,14 @@ async function performGithubCommitPush(
       await runGit(safePath, ["branch", "-M", branch], {}, 5000);
     }
 
-    const add = await runGit(safePath, ["add", "-A"], {}, 20000);
-    if (add.code !== 0) throw new Error(formatGitHubGitError(add, "preparar arquivos para o commit"));
+    // Stage ONLY selected files if options.files is provided and non-empty
+    let addResult;
+    if (Array.isArray(options.files) && options.files.length > 0) {
+      addResult = await runGit(safePath, ["add", "--", ...options.files], {}, 20000);
+    } else {
+      addResult = await runGit(safePath, ["add", "-A"], {}, 20000);
+    }
+    if (addResult.code !== 0) throw new Error(formatGitHubGitError(addResult, "preparar arquivos para o commit"));
 
     const commit = await runGit(safePath, ["commit", "-m", cleanMessage], {}, 20000);
     if (commit.code !== 0) {
@@ -6506,12 +6512,13 @@ async function performGithubCommitPush(
   });
 }
 
-ipcMain.handle("github:commitPush", async (_event, payload: { message: string }) => {
+ipcMain.handle("github:commitPush", async (_event, payload: { message: string; files?: string[] }) => {
   licenseManager.assertAccess("envio de commits para o GitHub");
   if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
   const projectPath = assertProjectRootSafe(currentProject, "git-write");
   const message = String(payload?.message || "").trim();
-  return await performGithubCommitPush(projectPath, message, { isAuto: false });
+  const files = Array.isArray(payload?.files) ? payload.files.map(f => String(f).trim()).filter(Boolean) : undefined;
+  return await performGithubCommitPush(projectPath, message, { isAuto: false, files });
 });
 
 ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: string; taskId?: string; message?: string }) => {
