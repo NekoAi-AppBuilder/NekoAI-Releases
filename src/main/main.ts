@@ -23,6 +23,7 @@ import { lovableCloudManager } from "./lovable/lovable-cloud-manager";
 import { lovableMcpServer, writeLovableOpenCodeConfig, removeLovableOpenCodeConfig } from "./lovable/lovable-mcp-server";
 import { detectDatabaseIntent } from "./lovable/lovable-intent-detector";
 import { GithubAccountManager, type GithubAccountRecord, type GithubAccountSummary } from "./github/github-account-manager";
+import { getPullRequestStatus, listPullRequests, mergePullRequest, preparePRConflictResolution, pushPRBranch, rawGithubFetch, type NekoPullRequestStatus } from "./github/pull-request-manager";
 import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES, VISION_FALLBACK_MODEL_CANDIDATES, resolveVisionFallbackTarget, type VisionFallbackTarget } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
 import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession, friendlyFallbackError } from "./vision-fallback";
@@ -39,7 +40,7 @@ import { RuntimeEnvironmentBuilder } from "./runtime/runtime-environment";
 import { RuntimeRequirement } from "./runtime/runtime-types";
 import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTimeoutDiagnostic } from "./opencode-diagnostics";
 import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
-import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolveConflictFile, finalizeConflictResolution, getConflictFiles, parseLinkedRepo, type GitSyncStatus, type PullResult, type GitConflictFile, type GitSyncCombineResult } from "./git-sync";
+import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolveConflictFile, finalizeConflictResolution, getConflictFiles, checkAndRefreshConflicts, parseLinkedRepo, type GitSyncStatus, type PullResult, type GitConflictFile, type GitSyncCombineResult, type ConflictRefreshResult } from "./git-sync";
 import { normalizeRepoRelativePath, diagnoseGitFilePath } from "./git-path-normalizer";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
@@ -1797,6 +1798,12 @@ async function withProjectGitLock<T>(projectPath: string, task: () => Promise<T>
       gitProjectLocks.delete(key);
     }
   }
+}
+
+function isProjectGitLocked(projectPath: string): boolean {
+  if (!projectPath) return false;
+  const key = path.resolve(projectPath);
+  return gitProjectLocks.has(key);
 }
 
 async function refreshGithubAccessToken(auth: GithubAuthRecord) {
@@ -6652,11 +6659,12 @@ function sanitizeAutoCommitMessage(rawMessage?: string): string {
 async function performGithubCommitPush(
   projectPath: string,
   message: string,
-  options: { isAuto?: boolean; files?: string[] } = {}
+  options: { isAuto?: boolean; files?: string[]; push?: boolean } = {}
 ): Promise<CommitPushResult> {
   const safePath = assertProjectRootSafe(projectPath, "git-write");
   const cleanMessage = options.isAuto ? sanitizeAutoCommitMessage(message) : String(message || "").trim();
   if (!cleanMessage) throw new Error("Digite uma mensagem para o commit.");
+  const shouldPush = options.push !== false;
 
   return withProjectGitLock(safePath, async () => {
     const status = await getGitStatus(safePath);
@@ -6760,7 +6768,7 @@ async function performGithubCommitPush(
     if (commit.code !== 0) {
       const raw = `${commit.stderr} ${commit.stdout}`.toLowerCase();
       if (raw.includes("nothing to commit")) {
-        if (hasExistingCommits) {
+        if (hasExistingCommits && shouldPush) {
           const push = await runGitWithGithubAuth(safePath, ["push", "origin", branch], token, 35000);
           if (push.code !== 0) {
             const pushTrack = await runGitWithGithubAuth(safePath, ["push", "-u", "origin", branch], token, 35000);
@@ -6768,9 +6776,19 @@ async function performGithubCommitPush(
           }
           return { ok: true, committed: false, pushed: true, status: await getGitStatus(safePath), message: "Alterações enviadas para o GitHub." };
         }
-        return { ok: true, committed: false, pushed: false, status: await getGitStatus(safePath), message: "Não há alterações para enviar." };
+        return { ok: true, committed: false, pushed: false, status: await getGitStatus(safePath), message: "Não há alterações para salvar no commit." };
       }
       throw new Error(formatGitHubGitError(commit, "criar o commit"));
+    }
+
+    if (!shouldPush) {
+      return {
+        ok: true,
+        committed: true,
+        pushed: false,
+        status: await getGitStatus(safePath),
+        message: "Commit salvo com sucesso neste projeto."
+      };
     }
 
     // Push with upstream fallback
@@ -6792,7 +6810,75 @@ async function performGithubCommitPush(
   });
 }
 
-ipcMain.handle("github:commitPush", async (_event, payload: { message: string; files?: string[] }) => {
+async function performGithubPush(projectPath: string): Promise<{ ok: boolean; pushed: boolean; status: GitStatus; message: string }> {
+  const safePath = assertProjectRootSafe(projectPath, "git-write");
+  return withProjectGitLock(safePath, async () => {
+    const status = await getGitStatus(safePath);
+    if (!status.initialized || !status.remote || !status.linkedRepo) {
+      throw new Error("Este projeto ainda não está conectado a um repositório GitHub.");
+    }
+    const token = await getGithubAccessToken();
+    const branch = status.branch || "main";
+
+    // Pre-check sync status with remote
+    const syncStatus = await checkGitSyncStatus(safePath, {
+      fetch: true,
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
+
+    if (syncStatus.behind > 0 || syncStatus.diverged) {
+      const msg = syncStatus.diverged
+        ? "O projeto possui alterações divergentes no GitHub e localmente. Sincronize antes de enviar commits."
+        : "O GitHub possui alterações que ainda não estão neste computador. Traga as alterações antes de enviar commits.";
+      throw new Error(msg);
+    }
+
+    let push = await runGitWithGithubAuth(safePath, ["push", "-u", "origin", branch], token, 35000);
+    if (push.code !== 0) {
+      push = await runGitWithGithubAuth(safePath, ["push", "origin", branch], token, 35000);
+      if (push.code !== 0) {
+        throw new Error(formatGitHubGitError(push, `enviar alterações para o GitHub na branch "${branch}"`));
+      }
+    }
+
+    const updatedStatus = await getGitStatus(safePath);
+    return {
+      ok: true,
+      pushed: true,
+      status: updatedStatus,
+      message: "Alterações enviadas para o GitHub com sucesso!"
+    };
+  });
+}
+
+ipcMain.handle("github:commit", async (_event, payload: { message: string; files?: string[] }) => {
+  licenseManager.assertAccess("criação de commits no Git");
+  if (!currentProject) throw new Error("Abra um projeto antes de salvar alterações.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  const message = String(payload?.message || "").trim();
+  const rawFiles = Array.isArray(payload?.files) ? payload.files.map(f => String(f).trim()).filter(Boolean) : undefined;
+  let files: string[] | undefined = undefined;
+  if (rawFiles) {
+    files = rawFiles.map(f => {
+      console.log(`[SELECTIVE-COMMIT] IPC path: ${f}`);
+      const norm = normalizeRepoRelativePath(f, projectPath);
+      console.log(`[SELECTIVE-COMMIT] normalized path: ${norm}`);
+      return norm;
+    });
+  }
+  return await performGithubCommitPush(projectPath, message, { isAuto: false, files, push: false });
+});
+
+ipcMain.handle("github:push", async () => {
+  licenseManager.assertAccess("envio de commits para o GitHub");
+  if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  return await performGithubPush(projectPath);
+});
+
+ipcMain.handle("github:commitPush", async (_event, payload: { message: string; files?: string[]; push?: boolean }) => {
   licenseManager.assertAccess("envio de commits para o GitHub");
   if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
   const projectPath = assertProjectRootSafe(currentProject, "git-write");
@@ -6807,7 +6893,8 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string; f
       return norm;
     });
   }
-  return await performGithubCommitPush(projectPath, message, { isAuto: false, files });
+  const shouldPush = payload?.push !== false;
+  return await performGithubCommitPush(projectPath, message, { isAuto: false, files, push: shouldPush });
 });
 
 ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: string; taskId?: string; message?: string }) => {
@@ -6822,6 +6909,12 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
   const isEnabled = await appPreferencesManager.getProjectAutoCommit(projectPath);
   if (!isEnabled) {
     return { ok: true, skipped: true, reason: "disabled", message: "Auto Commit desativado para este projeto." };
+  }
+
+  // Proteção de concorrência com operações manuais no Git Center
+  if (isProjectGitLocked(projectPath)) {
+    console.log(`[Neko/AutoCommit] Operação Git manual em andamento. Auto Commit pausado.`);
+    return { ok: false, skipped: true, reason: "git-busy", message: "Uma operação Git está em andamento. Auto Commit aguardará a conclusão." };
   }
 
   // 2. Proteção de idempotência por task
@@ -6847,7 +6940,7 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
   // 5. Verifica se há alterações externas antes do commit/push
   let token: string | undefined = undefined;
   try {
-    token = await getGithubAccessToken();
+    token = await getGithubAccessToken(projectPath);
   } catch {}
 
   const syncStatus = await checkGitSyncStatus(projectPath, {
@@ -6861,7 +6954,8 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
     console.warn(`[Neko/AutoCommit] Auto Commit pausado devido a alterações no GitHub: behind=${syncStatus.behind}, diverged=${syncStatus.diverged}`);
     return {
       ok: false,
-      skipped: true,
+      skipped: false,
+      recoverable: true,
       reason: syncStatus.diverged ? "diverged" : "remote-ahead",
       syncStatus,
       status: gitStatus,
@@ -6871,13 +6965,30 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
     };
   }
 
-  if (taskId) {
-    autoCommittedTaskIds.add(taskId);
-  }
+  return withProjectGitLock(projectPath, async () => {
+    try {
+      const commitMessage = payload?.message || "NekoAI: tarefa concluída";
+      const result = await performGithubCommitPush(projectPath, commitMessage, { isAuto: true });
+      if (taskId && result.ok) {
+        autoCommittedTaskIds.add(taskId);
+      }
+      return result;
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      console.warn(`[Neko/AutoCommit] Falha recuperável no Auto Commit: ${errMsg}`);
+      const isPushRejected = /push|rejected|non-fast-forward|failed to push/i.test(errMsg);
+      const isAuthError = /authentication|permission|denied|token|credentials/i.test(errMsg);
 
-  // 6. Executa commit e push sob lock
-  const commitMessage = payload?.message || "NekoAI: tarefa concluída";
-  return await performGithubCommitPush(projectPath, commitMessage, { isAuto: true });
+      return {
+        ok: false,
+        skipped: false,
+        recoverable: true,
+        reason: isPushRejected ? "push-rejected" : (isAuthError ? "auth-error" : "git-error"),
+        status: await getGitStatus(projectPath).catch(() => undefined),
+        message: `Falha temporária no Auto Commit: ${errMsg}`
+      };
+    }
+  });
 });
 
 ipcMain.handle("github:getAutoCommit", async (_event, projectPath?: string) => {
@@ -6901,6 +7012,183 @@ ipcMain.handle("github:setAutoCommit", async (_event, payload: { projectPath?: s
   } catch {
     return { ok: false, enabled: false };
   }
+});
+
+async function getGithubDefaultBranch(repoFullName: string): Promise<string> {
+  if (!repoFullName) return "main";
+  try {
+    const token = await getGithubAccessToken(currentProject || undefined).catch(() => "");
+    if (token) {
+      const res = await rawGithubFetch(`/repos/${repoFullName}`, { token }).then((r: Response) => r.json()).catch(() => null);
+      if (res?.default_branch) return String(res.default_branch);
+    }
+  } catch {}
+  return "main";
+}
+
+ipcMain.handle("github:getPullRequestStatus", async (_event, payload: { repoFullName?: string; head?: string; base?: string; prNumber?: number }) => {
+  licenseManager.assertAccess("consulta de Pull Requests no GitHub");
+  const projectPath = currentProject;
+  const status = await getGitStatus(projectPath || undefined);
+  const repoFullName = String(payload?.repoFullName || status.linkedRepo || "").trim();
+  const headBranch = String(payload?.head || status.branch || "").trim();
+  let baseBranch = String(payload?.base || "").trim();
+  if (!baseBranch && repoFullName) {
+    baseBranch = await getGithubDefaultBranch(repoFullName);
+  }
+  if (!baseBranch) baseBranch = "main";
+
+  let token = "";
+  try {
+    token = await getGithubAccessToken(projectPath || undefined);
+  } catch (err: any) {
+    return {
+      ok: false,
+      state: "PR_UNKNOWN",
+      headBranch,
+      baseBranch,
+      repoFullName,
+      draft: false,
+      mergeable: null,
+      mergeableState: "unknown",
+      hasConflicts: false,
+      checksApproved: false,
+      checksPending: false,
+      checksFailed: false,
+      checks: [],
+      error: err?.message || "GitHub não está conectado."
+    };
+  }
+
+  return await getPullRequestStatus({
+    repoFullName,
+    headBranch,
+    baseBranch,
+    token,
+    prNumber: payload?.prNumber
+  });
+});
+
+ipcMain.handle("github:listPullRequests", async (_event, payload: { repoFullName?: string; page?: number; perPage?: number; state?: "all" | "open" | "closed" }) => {
+  licenseManager.assertAccess("consulta de Pull Requests no GitHub");
+  const projectPath = currentProject;
+  const status = await getGitStatus(projectPath || undefined);
+  const repoFullName = String(payload?.repoFullName || status.linkedRepo || "").trim();
+  if (!repoFullName) {
+    return { ok: false, prs: [], page: 1, perPage: 10, hasMore: false, error: "Repositório do GitHub não informado." };
+  }
+  let token = "";
+  try {
+    token = await getGithubAccessToken(projectPath || undefined);
+  } catch {}
+
+  if (!token) {
+    return { ok: false, prs: [], page: 1, perPage: 10, hasMore: false, error: "Conta GitHub não conectada." };
+  }
+
+  return await listPullRequests({
+    repoFullName,
+    token,
+    page: payload?.page || 1,
+    perPage: payload?.perPage || 10,
+    state: payload?.state || "all"
+  });
+});
+
+ipcMain.handle("github:mergePullRequest", async (_event, payload: { repoFullName: string; prNumber: number; head: string; base: string; mergeMethod?: "merge" | "squash" | "rebase"; commitTitle?: string; commitMessage?: string }) => {
+  licenseManager.assertAccess("integração de Pull Requests no GitHub");
+  const repoFullName = String(payload?.repoFullName || "").trim();
+  const prNumber = Number(payload?.prNumber);
+  const head = String(payload?.head || "").trim();
+  const base = String(payload?.base || "").trim();
+
+  let token = "";
+  try {
+    token = await getGithubAccessToken();
+  } catch (err: any) {
+    return { ok: false, error: err?.message || "GitHub não está conectado." };
+  }
+
+  const result = await mergePullRequest({
+    repoFullName,
+    prNumber,
+    expectedHeadBranch: head,
+    expectedBaseBranch: base,
+    token,
+    mergeMethod: payload?.mergeMethod,
+    commitTitle: payload?.commitTitle,
+    commitMessage: payload?.commitMessage
+  });
+
+  if (result.ok && currentProject) {
+    void getGitStatus(currentProject);
+  }
+
+  return result;
+});
+
+ipcMain.handle("github:preparePRConflictResolution", async (_event, payload: { repoFullName: string; headBranch: string; baseBranch: string; prNumber?: number }) => {
+  licenseManager.assertAccess("resolução de conflitos de Pull Request no GitHub");
+  if (!currentProject) throw new Error("Abra um projeto antes de resolver conflitos.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+
+  let token = "";
+  try {
+    token = await getGithubAccessToken(projectPath);
+  } catch (err: any) {
+    return { ok: false, reason: "error", error: err?.message || "GitHub não está conectado." };
+  }
+
+  return withProjectGitLock(projectPath, async () => {
+    return await preparePRConflictResolution({
+      projectPath,
+      repoFullName: payload?.repoFullName,
+      headBranch: payload?.headBranch,
+      baseBranch: payload?.baseBranch,
+      prNumber: payload?.prNumber,
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
+  });
+});
+
+ipcMain.handle("github:pushPRBranch", async (_event, payload: { headBranch: string }) => {
+  licenseManager.assertAccess("envio de branch de Pull Request no GitHub");
+  if (!currentProject) throw new Error("Abra um projeto antes de enviar a branch.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+
+  let token = "";
+  try {
+    token = await getGithubAccessToken(projectPath);
+  } catch (err: any) {
+    return { ok: false, error: err?.message || "GitHub não está conectado." };
+  }
+
+  return withProjectGitLock(projectPath, async () => {
+    return await pushPRBranch({
+      projectPath,
+      headBranch: payload?.headBranch,
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
+  });
+});
+
+ipcMain.handle("github:abortMerge", async () => {
+  licenseManager.assertAccess("cancelamento de merge no Git");
+  if (!currentProject) throw new Error("Abra um projeto antes de abortar o merge.");
+  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+
+  return withProjectGitLock(projectPath, async () => {
+    const res = await runGit(projectPath, ["merge", "--abort"], {}, 15000).catch((err) => ({ code: 1, stdout: "", stderr: String(err?.message || err) }));
+    if (res.code !== 0 && !res.stderr.includes("no merge in progress")) {
+      throw new Error(`Falha ao abortar o merge: ${res.stderr || res.stdout}`);
+    }
+    invalidateProjectCheckpoints(projectPath);
+    return { ok: true, status: await getGitStatus(projectPath) };
+  });
 });
 
 ipcMain.handle("github:createPullRequest", async (_event, payload: { repoFullName: string; head: string; base: string; title?: string; body?: string }) => {
@@ -6945,11 +7233,20 @@ ipcMain.handle("github:createPullRequest", async (_event, payload: { repoFullNam
   }, 25000);
 
   const resJson: any = await response.json().catch(() => ({}));
+
   if (response.ok && resJson?.html_url) {
+    const prStatus = await getPullRequestStatus({
+      repoFullName,
+      headBranch: head,
+      baseBranch: base,
+      token,
+      prNumber: resJson.number
+    });
     return {
       ok: true,
       html_url: String(resJson.html_url),
-      number: typeof resJson.number === "number" ? resJson.number : undefined
+      number: typeof resJson.number === "number" ? resJson.number : undefined,
+      prStatus
     };
   }
 
@@ -6958,6 +7255,27 @@ ipcMain.handle("github:createPullRequest", async (_event, payload: { repoFullNam
     msg = resJson.message;
     if (Array.isArray(resJson?.errors) && resJson.errors[0]?.message) {
       msg = `${msg}: ${resJson.errors[0].message}`;
+    }
+  }
+
+  // Tratamento Gracioso para PR Já Existente (Requisito 12)
+  const isAlreadyExists = msg.toLowerCase().includes("a pull request already exists") || response.status === 422;
+  if (isAlreadyExists) {
+    const existingPrStatus = await getPullRequestStatus({
+      repoFullName,
+      headBranch: head,
+      baseBranch: base,
+      token
+    });
+    if (existingPrStatus.ok && existingPrStatus.prNumber) {
+      return {
+        ok: true,
+        alreadyExisted: true,
+        html_url: existingPrStatus.htmlUrl,
+        number: existingPrStatus.prNumber,
+        prStatus: existingPrStatus,
+        message: `Uma Pull Request (#${existingPrStatus.prNumber}) já existe para esta relação de branches.`
+      };
     }
   }
 
@@ -7379,6 +7697,25 @@ ipcMain.handle("github:getConflictDetails", async (_event, projectPath?: string)
 
   return withProjectGitLock(safePath, async () => {
     return await getConflictFiles(safePath, runGit);
+  });
+});
+
+ipcMain.handle("github:checkAndRefreshConflicts", async (_event, projectPath?: string) => {
+  const target = projectPath || currentProject;
+  if (!target) return { ok: false, hasConflicts: false, conflictFiles: [], remoteUpdated: false };
+  const safePath = assertProjectRootSafe(target, "git-write");
+
+  return withProjectGitLock(safePath, async () => {
+    let token: string | undefined = undefined;
+    try {
+      token = await getGithubAccessToken();
+    } catch {}
+
+    return await checkAndRefreshConflicts(safePath, {
+      token,
+      gitRunner: runGit,
+      authenticatedGitRunner: runGitWithGithubAuth
+    });
   });
 });
 

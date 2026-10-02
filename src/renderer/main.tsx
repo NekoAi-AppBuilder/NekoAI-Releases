@@ -7,7 +7,7 @@ import {
   ExternalLink, Eye, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
   Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitCommit, GitPullRequest, GitMerge, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
-  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus
+  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info
 } from "lucide-react";
 import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
@@ -19,6 +19,13 @@ import { getNekoTutorials, type NekoTutorial } from "./tutorials";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import { ReleaseNotesRenderer } from "./components/ReleaseNotesRenderer";
 import { TimelineView, type TaskTimeline, type TimelineItem, type TimelineItemType } from "./components/TimelineView";
+import { GlobalNotificationToast } from "./components/GlobalNotificationToast";
+import {
+  notificationManager,
+  type NotificationType,
+  type GlobalNotification,
+  type ContextualFeedback
+} from "./notification-system";
 
 import { notifyOnce, playNotify, soundEnabled, setSoundEnabled, unlockAudio } from "./sounds";
 import { buildAgentCaptureContext, htmlToText } from "../main/site-capture";
@@ -876,7 +883,7 @@ type GitStatus = {
   summary?: GitStatusSummary;
 };
 
-type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | "gitSync" | null;
+type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "githubMergeConfirm" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | "gitSync" | "gitCenter" | null;
 
 // Compara caminhos de projeto ignorando separador final (mesma identidade real).
 function pathNormalizedEqual(a: string, b: string): boolean {
@@ -1322,7 +1329,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.97");
+  const [appVersion, setAppVersion] = React.useState<string>("0.4.98");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1432,6 +1439,7 @@ function App() {
   const [modal, setModal] = React.useState<Modal>(null);
   const modalRef = React.useRef<Modal>(modal);
   React.useEffect(() => { modalRef.current = modal; }, [modal]);
+  const previousModalRef = React.useRef<Modal>(null);
   const [providerSearch, setProviderSearch] = React.useState("");
   const [selectedProvider, setSelectedProvider] = React.useState<Provider | null>(null);
   const [apiKey, setApiKey] = React.useState("");
@@ -2006,12 +2014,6 @@ function App() {
   const [branchActionError, setBranchActionError] = React.useState("");
   const [selectedCommitFiles, setSelectedCommitFiles] = React.useState<Set<string>>(new Set());
 
-  React.useEffect(() => {
-    if (modal === "branchChanges") {
-      setSelectedCommitFiles(new Set());
-    }
-  }, [modal]);
-
   // Limpa seleções quando a branch atual mudar
   React.useEffect(() => {
     setSelectedCommitFiles(new Set());
@@ -2091,6 +2093,7 @@ function App() {
   const [gitSelectedConflictIndex, setGitSelectedConflictIndex] = React.useState<number>(0);
   const [gitConflictBusy, setGitConflictBusy] = React.useState<boolean>(false);
   const [gitConflictError, setGitConflictError] = React.useState<string>("");
+  const [gitConflictRemoteUpdated, setGitConflictRemoteUpdated] = React.useState<boolean>(false);
   const [gitPendingSyncActive, setGitPendingSyncActive] = React.useState<boolean>(false);
   const [githubCloneRepo, setGithubCloneRepo] = React.useState<GithubStatus["repos"][number] | null>(null);
   const [githubCloneParent, setGithubCloneParent] = React.useState("");
@@ -2119,11 +2122,149 @@ function App() {
   const [githubPullSuccess, setGithubPullSuccess] = React.useState(false);
   const [githubCommitError, setGithubCommitError] = React.useState("");
   const [githubCommitSuccess, setGithubCommitSuccess] = React.useState(false);
+
+  // --- Pull Request & Smart Merge States ---
+  const [githubPrStatus, setGithubPrStatus] = React.useState<any | null>(null);
+  const [githubPrLoading, setGithubPrLoading] = React.useState(false);
+  const [githubMergeBusy, setGithubMergeBusy] = React.useState(false);
+  const [githubMergeError, setGithubMergeError] = React.useState("");
+  const [githubMergeSuccess, setGithubMergeSuccess] = React.useState(false);
+  const [prConflictContext, setPrConflictContext] = React.useState<{ headBranch: string; baseBranch: string; prNumber?: number } | null>(null);
+  const [prConflictBusy, setPrConflictBusy] = React.useState(false);
+  const [pendingPRBranchSwitch, setPendingPRBranchSwitch] = React.useState<{ currentBranch: string; targetBranch: string; repoFullName: string; baseBranch: string; prNumber?: number } | null>(null);
+  const pendingInterruptedAutoCommitRef = React.useRef<{ projectPath?: string; taskId?: string; message?: string } | null>(null);
+  const githubAccountGenRef = React.useRef(0);
+  const invalidateGithubRemoteState = React.useCallback(() => {
+    githubAccountGenRef.current++;
+    setGithubPrStatus(null);
+    setGithubPrList([]);
+    setGithubPrListHasMore(false);
+  }, []);
+
+  const refreshPullRequestStatus = React.useCallback(async (prNum?: number) => {
+    if (!githubLinkStatus.linkedRepo || !githubLinkStatus.branch) {
+      setGithubPrStatus(null);
+      return;
+    }
+    setGithubPrLoading(true);
+    try {
+      const res = await window.neko.githubGetPullRequestStatus?.({
+        repoFullName: githubLinkStatus.linkedRepo,
+        head: githubLinkStatus.branch,
+        prNumber: prNum
+      });
+      if (res && res.ok) {
+        setGithubPrStatus(res);
+      } else {
+        setGithubPrStatus(res || null);
+      }
+    } catch (err) {
+      console.warn("[GitHub/PR] Erro ao consultar estado da PR:", err);
+    } finally {
+      setGithubPrLoading(false);
+    }
+  }, [githubLinkStatus.linkedRepo, githubLinkStatus.branch]);
+
+  const [githubPrList, setGithubPrList] = React.useState<any[]>([]);
+  const [githubPrListPage, setGithubPrListPage] = React.useState(1);
+  const [githubPrListHasMore, setGithubPrListHasMore] = React.useState(false);
+  const [githubPrListLoading, setGithubPrListLoading] = React.useState(false);
+  const [githubPrListLoadingMore, setGithubPrListLoadingMore] = React.useState(false);
+
+  const refreshPullRequestList = React.useCallback(async (page: number = 1) => {
+    if (!githubLinkStatus.linkedRepo) {
+      setGithubPrList([]);
+      setGithubPrListHasMore(false);
+      return;
+    }
+    if (page === 1) {
+      setGithubPrListLoading(true);
+    } else {
+      setGithubPrListLoadingMore(true);
+    }
+    try {
+      const res = await window.neko.githubListPullRequests?.({
+        repoFullName: githubLinkStatus.linkedRepo,
+        page,
+        perPage: 10
+      });
+      if (res && res.ok && Array.isArray(res.prs)) {
+        if (page === 1) {
+          setGithubPrList(res.prs);
+        } else {
+          setGithubPrList(prev => {
+            const existingIds = new Set(prev.map((p: any) => p.prNumber));
+            const newPrs = res.prs.filter((p: any) => !existingIds.has(p.prNumber));
+            return [...prev, ...newPrs];
+          });
+        }
+        setGithubPrListPage(page);
+        setGithubPrListHasMore(Boolean(res.hasMore));
+      } else if (page === 1) {
+        setGithubPrList([]);
+        setGithubPrListHasMore(false);
+      }
+    } catch (err) {
+      console.warn("[GitHub/PRList] Erro ao consultar lista de PRs:", err);
+      if (page === 1) {
+        setGithubPrList([]);
+        setGithubPrListHasMore(false);
+      }
+    } finally {
+      setGithubPrListLoading(false);
+      setGithubPrListLoadingMore(false);
+    }
+  }, [githubLinkStatus.linkedRepo]);
+
+  const loadMorePullRequests = React.useCallback(async () => {
+    if (githubPrListLoadingMore || !githubPrListHasMore) return;
+    await refreshPullRequestList(githubPrListPage + 1);
+  }, [githubPrListLoadingMore, githubPrListHasMore, githubPrListPage, refreshPullRequestList]);
+
   const [newProjectName, setNewProjectName] = React.useState("");
   const [newProjectParent, setNewProjectParent] = React.useState("");
   const [editingMessageIndex, setEditingMessageIndex] = React.useState<number | null>(null);
-  const [toast, setToast] = React.useState<{ message: string; left: number; top: number } | null>(null);
-  const toastTimerRef = React.useRef<number | null>(null);
+  const [globalNotification, setGlobalNotification] = React.useState<GlobalNotification | null>(() => notificationManager.getGlobalNotification());
+  const [contextualFeedback, setContextualFeedback] = React.useState<ContextualFeedback | null>(() => notificationManager.getContextualFeedback());
+
+  React.useEffect(() => {
+    return notificationManager.subscribe(() => {
+      setGlobalNotification(notificationManager.getGlobalNotification());
+      setContextualFeedback(notificationManager.getContextualFeedback());
+    });
+  }, []);
+
+  const showToast = React.useCallback((
+    input: string | { message: string; type?: NotificationType; title?: string; target?: HTMLElement | null },
+    secondArg?: HTMLElement | null | NotificationType,
+    thirdArg?: string
+  ) => {
+    // 1. Feedback Contextual (quando target é fornecido via 2º argumento ou objeto)
+    if (secondArg && typeof secondArg === "object" && "getBoundingClientRect" in secondArg) {
+      const message = typeof input === "string" ? input : input.message;
+      notificationManager.showContextualFeedback(message, secondArg as HTMLElement);
+      return;
+    }
+    if (typeof input === "object" && input.target) {
+      notificationManager.showContextualFeedback(input.message, input.target);
+      return;
+    }
+
+    // 2. Notificação Global Padronizada (8s, canto superior direito, barra de progresso animada)
+    if (typeof input === "string") {
+      const explicitType = (typeof secondArg === "string" && ["success", "warning", "error", "info"].includes(secondArg))
+        ? (secondArg as NotificationType)
+        : undefined;
+      const explicitTitle = typeof thirdArg === "string" ? thirdArg : undefined;
+      notificationManager.showGlobalNotification({
+        message: input,
+        type: explicitType,
+        title: explicitTitle
+      });
+    } else if (typeof input === "object" && input.message) {
+      notificationManager.showGlobalNotification(input);
+    }
+  }, []);
   const terminalBodyRef = React.useRef<HTMLDivElement | null>(null);
   const activeTaskRef = React.useRef<{ id: string; startedAt: number; userIndex: number } | null>(null);
 
@@ -2245,18 +2386,6 @@ function App() {
   }, [supabaseState.projects, supabaseState.projectRef, supabaseState.usedProjectRefs]);
 
   // --- End computed variables (filteredSlashCommands & filteredContextResults below, after their state declarations) ---
-
-  const showToast = React.useCallback((message: string, target?: HTMLElement | null) => {
-    const rect = target?.getBoundingClientRect();
-    const left = rect ? Math.min(Math.max(rect.left + rect.width / 2, 70), window.innerWidth - 70) : window.innerWidth / 2;
-    const top = rect ? Math.min(rect.bottom + 8, window.innerHeight - 42) : 74;
-    setToast({ message, left, top });
-    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => {
-      setToast(null);
-      toastTimerRef.current = null;
-    }, 1800);
-  }, []);
 
   const loadRecentProjects = React.useCallback(async () => {
     try {
@@ -2650,7 +2779,7 @@ function App() {
   }, [terminalLines.length, terminalTab, terminalOpen]);
 
   React.useEffect(() => () => {
-    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    notificationManager.reset();
   }, []);
 
   // ==== Console do Preview (runtime) ====
@@ -2868,7 +2997,8 @@ function App() {
   const isInternalDropdownOpen = Boolean(previewRouteOpen);
   const isComposerDropdownOpen = Boolean(modelOpen || chatModeMenuOpen);
   const isTimelineOverlay = Boolean(timelineOpen && workspaceTab === "preview");
-  const isAnyOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen || isTimelineOverlay || isComposerDropdownOpen || toast);
+  const isBlockingOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen || isTimelineOverlay || isComposerDropdownOpen);
+  const isAnyOverlayOpen = Boolean(isBlockingOverlayOpen || globalNotification || contextualFeedback);
 
   React.useEffect(() => {
     if (previewSurface === "webcontents" && workspaceTab === "preview" && previewUrl) {
@@ -4038,16 +4168,19 @@ function App() {
     showToast("Enviando alterações para o GitHub...");
 
     try {
-      const result = await window.neko.githubAutoCommitTask?.({
+      const payload = {
         projectPath: activeProject,
         taskId,
         message: "NekoAI: tarefa concluída"
-      });
+      };
+      const result = await window.neko.githubAutoCommitTask?.(payload);
 
       if (!result) return;
 
       if (result.ok) {
         if (result.committed) {
+          pendingInterruptedAutoCommitRef.current = null;
+          setGitPendingSyncActive(false);
           showToast("Alterações enviadas automaticamente para o GitHub.");
           appendTerminalLine("log", "Alterações enviadas automaticamente para o GitHub com sucesso.", "GitHub");
           upsertActivity({
@@ -4065,17 +4198,28 @@ function App() {
         }
         const git = await window.neko.githubGitStatus();
         setGithubLinkStatus(git);
+        void refreshPullRequestStatus();
       } else {
-        if (result.reason === "remote-ahead" || result.reason === "diverged") {
+        if (result.recoverable || result.reason === "remote-ahead" || result.reason === "diverged" || result.reason === "push-rejected") {
+          pendingInterruptedAutoCommitRef.current = payload;
+          setGitPendingSyncActive(true);
           if (result.syncStatus) {
             setGitSyncStatus(result.syncStatus);
           }
           setGitSyncViewDiff(false);
           setGitSyncError("");
-          setModal("gitSync");
           const msg = result.message || "Alterações externas detectadas no GitHub. Auto Commit pausado.";
           showToast(msg);
           appendTerminalLine("warn", `Auto Commit pausado: ${msg}`, "GitHub");
+
+          // Busca detalhes de conflito se existirem para ativar o banner visual de notificação
+          if (result.reason === "diverged" || result.reason === "conflicts") {
+            void window.neko.githubGetConflictDetails?.().then((res: any) => {
+              if (res && Array.isArray(res.conflictFiles) && res.conflictFiles.length > 0) {
+                setGitConflictFiles(res.conflictFiles);
+              }
+            }).catch(() => {});
+          }
         } else {
           const errorMsg = result.message || "Erro no envio automático para o GitHub.";
           showToast(errorMsg);
@@ -4087,7 +4231,27 @@ function App() {
       showToast(friendly);
       appendTerminalLine("error", `Falha no Auto Commit: ${friendly}`, "GitHub");
     }
-  }, [repairState, showToast, appendTerminalLine, upsertActivity]);
+  }, [repairState, showToast, appendTerminalLine, upsertActivity, refreshPullRequestStatus]);
+
+  const checkAndResumeAutoCommit = React.useCallback(async () => {
+    const pending = pendingInterruptedAutoCommitRef.current;
+    if (!pending) return;
+    console.log("[Neko/AutoCommit] Retomando Auto Commit interrompido após resolução...", pending);
+    try {
+      const res = await window.neko.githubAutoCommitTask?.(pending);
+      if (res && res.ok) {
+        pendingInterruptedAutoCommitRef.current = null;
+        setGitPendingSyncActive(false);
+        showToast("Auto Commit retomado e concluído com sucesso!");
+        appendTerminalLine("log", "Auto Commit retomado e concluído com sucesso após resolução.", "GitHub");
+        const git = await window.neko.githubGitStatus();
+        setGithubLinkStatus(git);
+        void refreshPullRequestStatus();
+      }
+    } catch (err) {
+      console.warn("[Neko/AutoCommit] Falha ao retomar Auto Commit:", err);
+    }
+  }, [showToast, appendTerminalLine, refreshPullRequestStatus]);
 
   const runTaskValidation = React.useCallback(async () => {
     if (!sessionId || validationRunningRef.current) return;
@@ -6066,6 +6230,8 @@ function App() {
 
     if (currentGit.dirty) {
       setPendingTargetBranch(branch);
+      setBranchCommitMessage("WIP: alterações antes de trocar de branch");
+      setSelectedCommitFiles(new Set());
       setBranchActionError("");
       setGithubBranchMenuOpen(false);
       setModal("branchChanges");
@@ -6242,6 +6408,16 @@ function App() {
       );
       if (res.ok) {
         setGithubPullSuccess(true);
+        if (res.prStatus) {
+          setGithubPrStatus(res.prStatus);
+        } else {
+          void refreshPullRequestStatus(res.number);
+        }
+        if (res.alreadyExisted) {
+          showToast(`Pull Request #${res.number || ""} já existe. Estado atualizado!`);
+        } else {
+          showToast(`Pull Request #${res.number || ""} criada com sucesso!`);
+        }
       } else {
         if (res.errorCategory === "permission_update_needed" || String(res.error || "").toLowerCase().includes("resource not accessible by integration")) {
           setGithubStatus(prev => ({ ...prev, needsPermissions: true }));
@@ -6256,6 +6432,132 @@ function App() {
       setGithubPullError(msg);
     } finally {
       setGithubPullBusy(false);
+    }
+  }
+
+  const handleStartPRConflictResolution = React.useCallback(async (targetHead?: string, targetBase?: string, prNum?: number) => {
+    const repo = githubLinkStatus.linkedRepo;
+    const head = targetHead || githubPrStatus?.headBranch || githubLinkStatus.branch;
+    const base = targetBase || githubPrStatus?.baseBranch || "main";
+    const num = prNum || githubPrStatus?.prNumber;
+
+    if (!repo || !head || !base) {
+      showToast("Informações do repositório ou branch ausentes.");
+      return;
+    }
+
+    setPrConflictBusy(true);
+    try {
+      const res = await window.neko.githubPreparePRConflictResolution?.({
+        repoFullName: repo,
+        headBranch: head,
+        baseBranch: base,
+        prNumber: num
+      });
+
+      if (!res) {
+        showToast("Não foi possível preparar a resolução de conflitos.");
+        return;
+      }
+
+      if (res.reason === "requires_branch_switch") {
+        setPendingPRBranchSwitch({
+          currentBranch: res.currentBranch || githubLinkStatus.branch || "atual",
+          targetBranch: res.targetBranch || head,
+          repoFullName: repo,
+          baseBranch: base,
+          prNumber: num
+        });
+        setModal("prBranchSwitchConfirm");
+        return;
+      }
+
+      if (res.reason === "local_changes_exist") {
+        setPendingTargetBranch(head);
+        setBranchCommitMessage("WIP: alterações antes de trocar de branch");
+        setSelectedCommitFiles(new Set());
+        setBranchActionError("");
+        setModal("branchChanges");
+        showToast(res.message || "Salve ou descarte suas alterações locais antes de resolver os conflitos da PR.");
+        return;
+      }
+
+      if (res.reason === "no_longer_conflicted" || !res.hasConflicts) {
+        showToast(res.message || "A Pull Request não possui mais conflitos no GitHub!");
+        void refreshPullRequestStatus(num);
+        return;
+      }
+
+      if (res.ok && res.hasConflicts && Array.isArray(res.conflictFiles)) {
+        setGitConflictFiles(res.conflictFiles);
+        setGitSelectedConflictIndex(0);
+        setPrConflictContext({ headBranch: head, baseBranch: base, prNumber: num });
+        setModal("gitConflictResolver");
+      } else if (res.error) {
+        showToast(res.error);
+      }
+    } catch (err: any) {
+      showToast("Erro ao preparar resolução de conflitos: " + (err?.message || err));
+    } finally {
+      setPrConflictBusy(false);
+    }
+  }, [githubLinkStatus, githubPrStatus, showToast, refreshPullRequestStatus]);
+
+  React.useEffect(() => {
+    const activeAcc = githubStatus.activeAccount || githubStatus.user;
+    const isAccessible = Boolean(
+      githubStatus.connected &&
+      githubLinkStatus.linkedRepo &&
+      activeAcc &&
+      githubStatus.repos?.some((r: any) => r.fullName?.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())
+    );
+
+    if ((modal === "github" || modal === "gitCenter") && githubLinkStatus.linkedRepo && githubLinkStatus.branch && isAccessible) {
+      void refreshPullRequestStatus();
+    }
+    if (modal === "gitCenter" && githubLinkStatus.linkedRepo && isAccessible) {
+      void refreshPullRequestList(1);
+    }
+  }, [modal, githubStatus, githubLinkStatus.linkedRepo, githubLinkStatus.branch, refreshPullRequestStatus, refreshPullRequestList]);
+
+  async function handleExecuteMerge() {
+    if (!githubPrStatus?.prNumber || githubMergeBusy || !githubLinkStatus.linkedRepo) return;
+    setGithubMergeBusy(true);
+    setGithubMergeError("");
+    setGithubMergeSuccess(false);
+
+    try {
+      const res = await window.neko.githubMergePullRequest({
+        repoFullName: githubLinkStatus.linkedRepo,
+        prNumber: githubPrStatus.prNumber,
+        head: githubPrStatus.headBranch,
+        base: githubPrStatus.baseBranch,
+        mergeMethod: "merge",
+        commitTitle: `Merge pull request #${githubPrStatus.prNumber} from ${githubPrStatus.headBranch}`,
+        commitMessage: `Integrado via NekoAI.`
+      });
+
+      if (res.ok) {
+        setGithubMergeSuccess(true);
+        if (res.updatedStatus) {
+          setGithubPrStatus(res.updatedStatus);
+        } else {
+          void refreshPullRequestStatus(githubPrStatus.prNumber);
+        }
+        const git = await window.neko.githubGitStatus();
+        setGithubLinkStatus(git);
+        showToast(`Pull Request #${githubPrStatus.prNumber} mesclada com sucesso na branch "${githubPrStatus.baseBranch}"!`);
+        setModal("github");
+      } else {
+        if (res.updatedStatus) {
+          setGithubPrStatus(res.updatedStatus);
+        }
+        setGithubMergeError(res.error || "Não foi possível realizar o merge da Pull Request.");
+      }
+    } catch (error: any) {
+      setGithubMergeError(error?.message || "Erro ao mesclar Pull Request.");
+    } finally {
+      setGithubMergeBusy(false);
     }
   }
 
@@ -6288,6 +6590,8 @@ function App() {
       setGithubCommitMessage("");
       const git = await window.neko.githubGitStatus();
       setGithubLinkStatus(git);
+      void refreshPullRequestStatus();
+      void checkAndResumeAutoCommit();
     } catch (error) {
       setGithubCommitError(getUserFacingError(error, "Erro ao enviar alterações."));
       console.warn("[Github] commitPush failed", String((error as Error)?.message ?? error));
@@ -6369,6 +6673,7 @@ function App() {
 
   async function disconnectGithub() {
     try {
+      invalidateGithubRemoteState();
       await window.neko.githubDisconnect();
       setGithubStatus({ connected: false, repos: [] });
       void syncGithubContext();
@@ -6381,7 +6686,10 @@ function App() {
   async function selectGithubAccount(accountId: string) {
     try {
       setAccountDropdownOpen(false);
+      invalidateGithubRemoteState();
+      const currentGen = githubAccountGenRef.current;
       const result = await window.neko.githubSelectAccount(accountId);
+      if (currentGen !== githubAccountGenRef.current) return;
       if (result) setGithubStatus(result);
       void syncGithubContext();
     } catch (error) {
@@ -6392,7 +6700,10 @@ function App() {
   async function disconnectGithubAccount(accountId?: string) {
     try {
       setAccountDropdownOpen(false);
+      invalidateGithubRemoteState();
+      const currentGen = githubAccountGenRef.current;
       const result = await window.neko.githubDisconnectAccount(accountId);
+      if (currentGen !== githubAccountGenRef.current) return;
       if (result) setGithubStatus(result);
       void syncGithubContext();
     } catch (error) {
@@ -6402,6 +6713,7 @@ function App() {
 
   async function selectGithubAccountInClone(accountId: string) {
     const currentGen = ++cloneFetchGenRef.current;
+    invalidateGithubRemoteState();
     setGithubCloneLoadingRepos(true);
     setGithubCloneRepo(null);
     setGithubRepoSearch("");
@@ -6422,6 +6734,7 @@ function App() {
 
   async function disconnectGithubAccountInClone(accountId?: string) {
     const currentGen = ++cloneFetchGenRef.current;
+    invalidateGithubRemoteState();
     setGithubCloneLoadingRepos(true);
     setGithubCloneRepo(null);
     setGithubRepoSearch("");
@@ -6600,29 +6913,119 @@ function App() {
   }
 
   async function handleBranchDiscardAndCheckout() {
-    if (!pendingTargetBranch || branchActionBusy) return;
+    if (branchActionBusy) return;
     setBranchActionBusy(true);
     setBranchActionError("");
     const target = pendingTargetBranch;
     try {
       branchRefreshRequestIdRef.current++;
       await window.neko.githubDiscardChanges();
-      await window.neko.githubCheckoutBranch(target);
+      if (target) {
+        await window.neko.githubCheckoutBranch(target);
+      }
       const git = await window.neko.githubGitStatus();
       setGithubLinkStatus(git);
       if (git.branch) {
         setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
       }
-      setModal(null);
-      setPendingTargetBranch(null);
-      showToast(`Alterações descartadas e alternado para "${git.branch || target}" com sucesso!`);
+      setSelectedCommitFiles(new Set());
+      if (target) {
+        setModal(null);
+        setPendingTargetBranch(null);
+        showToast(`Alterações descartadas e alternado para "${git.branch || target}" com sucesso!`);
+      } else {
+        setModal("gitCenter");
+        setPendingTargetBranch(null);
+        showToast("Alterações descartadas com sucesso!");
+      }
     } catch (error: any) {
-      const errMsg = getUserFacingError(error, "Erro ao descartar e trocar de branch.");
+      const errMsg = getUserFacingError(error, target ? "Erro ao descartar e trocar de branch." : "Erro ao descartar alterações.");
       setBranchActionError(errMsg);
       showToast(errMsg);
-      console.warn("[Branch] discard+checkout failed", String((error as Error)?.message ?? error));
+      console.warn("[Branch] discard failed", String((error as Error)?.message ?? error));
     } finally {
       setBranchActionBusy(false);
+    }
+  }
+
+  const [gitPushBusy, setGitPushBusy] = React.useState(false);
+
+  async function handleManualGitCenterCommit() {
+    if (!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0) return;
+    setBranchActionBusy(true);
+    setBranchActionError("");
+    try {
+      const activeProj = projectRef.current;
+      const sync = await window.neko.githubCheckSync?.(activeProj);
+      if (sync && (sync.behind > 0 || sync.diverged)) {
+        setGitSyncStatus(sync);
+        setGitSyncViewDiff(false);
+        setGitSyncError("");
+        setModal("gitSync");
+        showToast(sync.diverged
+          ? "O projeto possui alterações diferentes no GitHub e localmente."
+          : "Existem alterações no GitHub que ainda não estão neste computador.");
+        setBranchActionBusy(false);
+        return;
+      }
+
+      const selectedFilesArray = Array.from(selectedCommitFiles);
+      selectedFilesArray.forEach(p => console.log(`[SELECTIVE-COMMIT] selected path: ${p}`));
+      if (window.neko.githubCommit) {
+        await window.neko.githubCommit(branchCommitMessage.trim(), selectedFilesArray);
+      } else {
+        await window.neko.githubCommitPush(branchCommitMessage.trim(), selectedFilesArray);
+      }
+      const git = await window.neko.githubGitStatus();
+      setGithubLinkStatus(git);
+      setSelectedCommitFiles(new Set());
+      setBranchCommitMessage("Atualizações no projeto");
+      void refreshPullRequestStatus();
+      setModal("gitCenter");
+      setPendingTargetBranch(null);
+      showToast("Commit salvo com sucesso!");
+    } catch (error: any) {
+      const errMsg = getUserFacingError(error, "Erro ao realizar commit.");
+      setBranchActionError(errMsg);
+      showToast(errMsg);
+      console.warn("[Branch] manual commit failed", String((error as Error)?.message ?? error));
+    } finally {
+      setBranchActionBusy(false);
+    }
+  }
+
+  async function handleManualGitPush() {
+    if (gitPushBusy) return;
+    setGitPushBusy(true);
+    try {
+      const activeProj = projectRef.current;
+      const sync = await window.neko.githubCheckSync?.(activeProj);
+      if (sync && (sync.behind > 0 || sync.diverged)) {
+        setGitSyncStatus(sync);
+        setGitSyncViewDiff(false);
+        setGitSyncError("");
+        setModal("gitSync");
+        showToast(sync.diverged
+          ? "O projeto possui alterações diferentes no GitHub e localmente."
+          : "Existem alterações no GitHub que ainda não estão neste computador.");
+        setGitPushBusy(false);
+        return;
+      }
+
+      const res = await window.neko.githubPush?.();
+      if (res?.ok === false) {
+        throw new Error(res.error || "Falha ao enviar alterações para o GitHub.");
+      }
+      const git = await window.neko.githubGitStatus();
+      setGithubLinkStatus(git);
+      void refreshPullRequestStatus();
+      showToast("Alterações enviadas para o GitHub com sucesso!");
+    } catch (error: any) {
+      const errMsg = getUserFacingError(error, "Erro ao enviar para o GitHub.");
+      showToast(errMsg);
+      console.warn("[GitCenter] push failed", String((error as Error)?.message ?? error));
+    } finally {
+      setGitPushBusy(false);
     }
   }
 
@@ -6656,6 +7059,7 @@ function App() {
       if (git.branch) {
         setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
       }
+      setSelectedCommitFiles(new Set());
       setModal(null);
       setPendingTargetBranch(null);
       showToast(`Commit realizado e alternado para "${git.branch || target}" com sucesso!`);
@@ -6704,11 +7108,10 @@ function App() {
         showToast("Alterações do GitHub sincronizadas com sucesso!");
         appendTerminalLine("log", "Alterações trazidas do GitHub com sucesso via git pull --ff-only.", "GitHub");
         const updatedGit = await window.neko.githubGitStatus();
-        if (reqId === gitSyncRequestIdRef.current) {
-          setGithubLinkStatus(updatedGit);
-          setGitSyncStatus(result.syncStatus || null);
-          setModal(null);
-        }
+        setGithubLinkStatus(updatedGit);
+        setGitSyncStatus(result.syncStatus || null);
+        setModal(null);
+        void refreshPullRequestStatus();
         if (projectRef.current) {
           window.neko.tree(projectRef.current).then(setTree).catch(() => {});
         }
@@ -6752,7 +7155,6 @@ function App() {
         setGitSelectedConflictIndex(0);
         setGitPendingSyncActive(true);
         setModal("gitConflictResolver");
-        showToast("Conflitos detectados. Escolha como resolver cada arquivo.");
         appendTerminalLine("warn", `Conflitos de sincronização encontrados em ${result.conflictFiles.length} arquivo(s). Aguardando resolução visual.`, "GitHub");
       } else if (!result.ok) {
         const err = result.message || "Erro ao sincronizar e combinar alterações.";
@@ -6779,7 +7181,8 @@ function App() {
       const res = await window.neko.githubResolveConflict?.({
         projectPath: projectRef.current,
         filePath: currentFile.path,
-        resolution: choice
+        resolution: choice,
+        customContent: choice === "both" ? currentFile.combinedContent : undefined
       });
       if (res?.ok) {
         const updatedFiles = gitConflictFiles.map((f, i) => {
@@ -6788,7 +7191,7 @@ function App() {
               ...f,
               resolution: choice,
               status: "resolved" as const,
-              resolutionLabel: choice === "local" ? "Manter local" : choice === "github" ? "Usar GitHub" : "Manter ambas"
+              resolutionLabel: choice === "local" ? "Minha versão mantida" : choice === "github" ? "Versão do GitHub aplicada" : "Alterações combinadas"
             };
           }
           return f;
@@ -6822,24 +7225,56 @@ function App() {
       return;
     }
 
+    // Validação extra (Requisito 10): Garantir que nenhum arquivo possui marcadores de conflito
+    for (const f of gitConflictFiles) {
+      if (f.combinedContent && /(^|\n)(<{7}|={7}|>{7})/.test(f.combinedContent)) {
+        const msg = `Este arquivo (${f.path}) ainda possui marcadores de conflito.`;
+        setGitConflictError(msg);
+        showToast(msg);
+        return;
+      }
+    }
+
     setGitConflictBusy(true);
     setGitConflictError("");
     try {
+      const commitMsg = prConflictContext
+        ? `Resolve conflitos com ${prConflictContext.baseBranch}`
+        : "NekoAI: Sincronização e resolução de conflitos concluída";
+
       const res = await window.neko.githubFinalizeSync?.({
         projectPath: projectRef.current,
-        message: "NekoAI: Sincronização e resolução de conflitos concluída"
+        message: commitMsg
       });
+
       if (res?.ok) {
-        showToast("Sincronização finalizada com sucesso!");
-        appendTerminalLine("log", "Sincronização e resolução de conflitos finalizada com sucesso.", "GitHub");
+        if (prConflictContext) {
+          const pushRes = await window.neko.githubPushPRBranch?.({ headBranch: prConflictContext.headBranch });
+          if (!pushRes?.ok) {
+            const pushErr = pushRes?.error || "Erro ao enviar a branch da PR para o GitHub.";
+            setGitConflictError(pushErr);
+            showToast(pushErr);
+            return;
+          }
+          showToast(`Conflitos resolvidos! Branch ${prConflictContext.headBranch} enviada para o GitHub.`);
+          appendTerminalLine("log", `Conflitos resolvidos e branch ${prConflictContext.headBranch} enviada para o GitHub.`, "GitHub");
+          void refreshPullRequestStatus(prConflictContext.prNumber);
+          setPrConflictContext(null);
+        } else {
+          showToast("Sincronização finalizada com sucesso!");
+          appendTerminalLine("log", "Sincronização e resolução de conflitos finalizada com sucesso.", "GitHub");
+        }
+
         setGitPendingSyncActive(false);
         setGitConflictFiles([]);
         setModal(null);
         const updatedGit = await window.neko.githubGitStatus();
         setGithubLinkStatus(updatedGit);
         if (projectRef.current) {
-          window.neko.tree(projectRef.current).then(setTree).catch(() => {});
+          window.neko.tree().then(setTree).catch(() => {});
         }
+        void refreshPullRequestStatus();
+        void checkAndResumeAutoCommit();
       } else {
         const err = res?.message || "Erro ao finalizar sincronização.";
         setGitConflictError(err);
@@ -6852,13 +7287,52 @@ function App() {
     } finally {
       setGitConflictBusy(false);
     }
-  }, [gitConflictBusy, gitConflictFiles, showToast, appendTerminalLine]);
+  }, [gitConflictBusy, gitConflictFiles, prConflictContext, showToast, appendTerminalLine, refreshPullRequestStatus]);
 
   const handleDismissConflictResolverLater = React.useCallback(() => {
     setModal(null);
     setGitPendingSyncActive(true);
+    setGitConflictRemoteUpdated(false);
     showToast("Resolução pausada. Você pode continuar a qualquer momento pela barra superior.");
   }, [showToast]);
+
+  const handleOpenConflictResolver = React.useCallback(async () => {
+    if (gitConflictBusy || !projectRef.current) return;
+    setGitConflictBusy(true);
+    setGitConflictError("");
+    try {
+      if (typeof window.neko?.githubCheckAndRefreshConflicts === "function") {
+        const res = await window.neko.githubCheckAndRefreshConflicts(projectRef.current);
+        if (res) {
+          if (res.conflictFiles && Array.isArray(res.conflictFiles)) {
+            setGitConflictFiles(res.conflictFiles);
+            setGitSelectedConflictIndex(0);
+          }
+          setGitConflictRemoteUpdated(Boolean(res.remoteUpdated));
+
+          if (res.hasConflicts && res.conflictFiles && res.conflictFiles.length > 0) {
+            setModal("gitConflictResolver");
+          } else if (!res.hasConflicts) {
+            setGitPendingSyncActive(false);
+            setModal(null);
+            showToast("Alterações do GitHub combinadas com sucesso!");
+            const updatedGit = await window.neko.githubGitStatus?.();
+            if (updatedGit) setGithubLinkStatus(updatedGit);
+            if (res.syncStatus) setGitSyncStatus(res.syncStatus);
+          }
+        } else {
+          setModal("gitConflictResolver");
+        }
+      } else {
+        setModal("gitConflictResolver");
+      }
+    } catch (err: any) {
+      console.warn("[Neko/Git] Falha ao verificar atualização remota do conflito:", err);
+      setModal("gitConflictResolver");
+    } finally {
+      setGitConflictBusy(false);
+    }
+  }, [gitConflictBusy, showToast]);
 
   async function disconnectSupabase() {
     if (supabaseBusy) return;
@@ -7259,7 +7733,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.97"}</span>
+                  <span>Versão {appVersion || "0.4.98"}</span>
                 </div>
                 <button
                   type="button"
@@ -7534,10 +8008,27 @@ function App() {
           </button>
         </div>
       </header>
-      {toast ? <div className="neko-toast" role="status" aria-live="polite" style={{ left: toast.left, top: toast.top }}>
-        <CircleAlert size={13} />
-        <span>{toast.message}</span>
-      </div> : null}
+      {/* Notificação Global Padronizada (Canto Superior Direito, 8s, Barra de Progresso Animada) */}
+      {globalNotification ? (
+        <GlobalNotificationToast
+          key={globalNotification.id}
+          notification={globalNotification}
+          onDismiss={(id) => notificationManager.dismissGlobalNotification(id)}
+        />
+      ) : null}
+
+      {/* Feedback Contextual (próximo ao elemento que disparou a ação) */}
+      {contextualFeedback ? (
+        <div
+          className="neko-contextual-feedback neko-toast"
+          role="status"
+          aria-live="polite"
+          style={{ left: contextualFeedback.left, top: contextualFeedback.top }}
+        >
+          <Check size={13} />
+          <span>{contextualFeedback.message}</span>
+        </div>
+      ) : null}
 
       <ProviderIconSprite />
 
@@ -7752,15 +8243,13 @@ function App() {
               setGithubShowRepos(false);
               setGithubCommitSuccess(false);
               void syncGithubContext();
-              if (githubStatus.connected) {
+              if (project) {
+                setModal("gitCenter");
                 void window.neko.githubStatus(true).then(st => { if (st) setGithubStatus(st); }).catch(() => {});
-              }
-              if (!githubStatus.connected) {
-                setModal("github");
-              } else if (githubStatus.needsInstallation) {
-                setModal("github");
-              } else if (project && !githubLinkStatus.linkedRepo) {
-                prepareGithubPublish();
+                void window.neko.githubGitStatus().then(setGithubLinkStatus).catch(() => {});
+                if (githubLinkStatus.linkedRepo && githubLinkStatus.branch) {
+                  void refreshPullRequestStatus();
+                }
               } else {
                 setModal("github");
               }
@@ -7918,10 +8407,11 @@ function App() {
             <button
               type="button"
               className="primary btn-sm"
+              disabled={gitConflictBusy}
               style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
-              onClick={() => setModal("gitConflictResolver")}
+              onClick={() => void handleOpenConflictResolver()}
             >
-              <GitMerge size={13} /> Resolver conflitos
+              {gitConflictBusy ? <Loader2 size={13} className="spin" /> : <GitMerge size={13} />} Resolver conflitos
             </button>
           </div>
         )}
@@ -8310,7 +8800,7 @@ function App() {
           </section>
 
           <section className="workspace">
-            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} style={isAnyOverlayOpen ? { pointerEvents: "none" } : undefined} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno" style={isAnyOverlayOpen ? { pointerEvents: "none" } : undefined}/> : null}</div></div> : <PreviewLoaderView status={previewStatus} phase={previewPhase} message={previewMessage} framework={previewFramework} packageManager={previewPackageManager} onRetry={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })} onOpenLogs={() => { setTerminalOpen(true); setTerminalTab("logs"); }} />)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
+            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} style={isBlockingOverlayOpen ? { pointerEvents: "none" } : undefined} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno" style={isBlockingOverlayOpen ? { pointerEvents: "none" } : undefined}/> : null}</div></div> : <PreviewLoaderView status={previewStatus} phase={previewPhase} message={previewMessage} framework={previewFramework} packageManager={previewPackageManager} onRetry={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })} onOpenLogs={() => { setTerminalOpen(true); setTerminalTab("logs"); }} />)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
             <div className={`terminal-panel ${terminalOpen ? "open" : "closed"}`}>
               <div className="terminal-head"><div className="terminal-tabs"><button className={terminalTab === "logs" ? "active" : ""} onClick={() => { setTerminalTab("logs"); setTerminalOpen(true); }}>Logs</button><button className={terminalTab === "console" ? "active" : ""} onClick={() => { setTerminalTab("console"); setTerminalOpen(true); }}>Console</button><button className={terminalTab === "errors" ? "active" : ""} onClick={() => { setTerminalTab("errors"); setTerminalOpen(true); }}>Erros</button></div><button className="terminal-collapse" onClick={() => setTerminalOpen(v => !v)}>{terminalOpen ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}</button></div>
               {terminalOpen && (terminalTab === "console" ? (
@@ -8606,7 +9096,7 @@ function App() {
       )}
 
     {modal && createPortal(
-      <div className="modal-backdrop" role="presentation" onClick={() => { console.log("[GitHub/UI] modal backdrop click — closing modal:", modal); if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
+      <div className="modal-backdrop" role="presentation" onClick={() => { console.log("[GitHub/UI] modal backdrop click — closing modal:", modal); if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""} ${modal === "branchChanges" ? "branch-changes-modal" : ""} ${modal === "gitConflictResolver" ? "git-conflict-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
       {modal === "tutorials" && (() => {
         const tutorials = getNekoTutorials();
         const openVideo = (tutorial: NekoTutorial) => {
@@ -8981,7 +9471,17 @@ function App() {
             <h2 id="modal-title"><GitHubIcon size={18} /> GitHub</h2>
             <p>{githubStatus.connected ? `Conectado${githubStatus.user?.login ? ` como @${githubStatus.user.login}` : ""}.` : "Conecte sua conta para acessar seus repositórios pelo NekoAI."}</p>
           </div>
-          <button className="close-btn" onClick={() => setModal(null)} aria-label="Fechar"><X size={17}/></button>
+          <button
+            className="close-btn"
+            onClick={() => {
+              const targetModal = previousModalRef.current === "gitCenter" ? "gitCenter" : null;
+              previousModalRef.current = null;
+              setModal(targetModal);
+            }}
+            aria-label="Fechar"
+          >
+            <X size={17}/>
+          </button>
         </div>
         {!githubStatus.connected ? (
           <div className="github-connect-panel">
@@ -9038,17 +9538,12 @@ function App() {
           ) : null}
           {project && githubLinkStatus.linkedRepo ? (() => {
             const isAccessible = Boolean(githubStatus.repos?.some(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase()));
-            const linkedRepoUrl = githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`;
             return <div className="github-connected-project">
               <div className="github-connected-project-head">
-                <div><b>{isAccessible ? "Projeto conectado" : "Repositório remoto detectado"}</b><small>{githubLinkStatus.linkedRepo}</small></div>
-                <span className={isAccessible ? (githubLinkStatus.dirty ? "dirty" : (githubLinkStatus.unpushed ? "dirty" : "clean")) : "idle"}>
-                  {isAccessible ? (githubLinkStatus.dirty ? "Alterado" : (githubLinkStatus.unpushed ? "Push pendente" : "Sincronizado")) : "Sem acesso"}
+                <div><b>Projeto conectado</b><small>{githubLinkStatus.linkedRepo}</small></div>
+                <span className={isAccessible ? "clean" : "idle"}>
+                  {isAccessible ? "Conectado" : "Sem acesso"}
                 </span>
-              </div>
-              <div className="github-project-meta">
-                <span><GitBranch size={12}/> {githubLinkStatus.branch || "main"}</span>
-                <span>{isAccessible ? (githubLinkStatus.dirty ? "Há alterações locais" : (githubLinkStatus.unpushed ? "Commits locais pendentes de envio" : "Nenhuma alteração pendente")) : "Repositório não autorizado para esta conta"}</span>
               </div>
 
               {!isAccessible ? (
@@ -9073,110 +9568,8 @@ function App() {
                     </button>
                   </div>
                 </div>
-              ) : (
-                <>
-                  <textarea className="github-commit-input" value={githubCommitMessage} onChange={e => { setGithubCommitMessage(e.target.value); if (githubCommitError) setGithubCommitError(""); if (githubCommitSuccess) setGithubCommitSuccess(false); }} placeholder="Mensagem do commit" rows={2} disabled={githubCommitBusy}/>
-                  {githubCommitError && (
-                    <div className="auth-error" style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 8, whiteSpace: "pre-line" }}>
-                      <div>{githubCommitError}</div>
-                      <div style={{ display: "flex", justifyContent: "flex-end" }}>
-                        <button
-                          type="button"
-                          className="secondary btn-sm"
-                          style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
-                          onClick={async () => {
-                            try {
-                              const git = await window.neko.githubGitStatus();
-                              setGithubLinkStatus(git);
-                              setGithubCommitError("");
-                              showToast("Alterações locais atualizadas.");
-                            } catch {
-                              showToast("Erro ao atualizar alterações locais.");
-                            }
-                          }}
-                        >
-                          <RefreshCw size={12}/> Atualizar alterações
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                  {githubCommitSuccess && <div className="github-linked-success" style={{ marginTop: 8 }}><Check size={16}/><div><b>Commit e Push realizado com sucesso</b><small>Alterações publicadas no GitHub com sucesso.</small></div></div>}
-                  
-                  <label className="github-auto-commit-label" style={{ display: "flex", alignItems: "center", gap: 8, margin: "12px 0 20px 0", fontSize: 13, cursor: "pointer", color: "var(--foreground-muted)", lineHeight: 1 }}>
-                    <input
-                      type="checkbox"
-                      checked={githubAutoCommit}
-                      onChange={async (e) => {
-                        const next = e.target.checked;
-                        setGithubAutoCommit(next);
-                        if (project && window.neko?.githubSetAutoCommit) {
-                          try {
-                            await window.neko.githubSetAutoCommit(project, next);
-                          } catch (err) {
-                            console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
-                          }
-                        }
-                      }}
-                      style={{ margin: 0, cursor: "pointer", width: 14, height: 14 }}
-                    />
-                    Realizar commit e push automaticamente após a tarefa
-                  </label>
-
-                  {githubPullError && (
-                    (githubPullError.includes("Permissões do GitHub precisam de aprovação") || githubPullError.toLowerCase().includes("resource not accessible by integration")) ? (
-                      <div className="github-auth-update-needed" style={{ marginBottom: 16 }}>
-                        <div className="github-auth-update-copy">
-                          <b>Permissões do GitHub precisam de aprovação</b>
-                          <small>O NekoAI solicitou novas permissões para o GitHub App, mas esta instalação ainda não aprovou a atualização no GitHub.</small>
-                        </div>
-                        <div className="github-auth-update-actions">
-                          <button className="primary" onClick={() => { console.log("[GitHub/UI] authorize github clicked"); void window.neko.githubOpen(githubStatus.installUrl || "https://github.com/settings/installations"); }}>
-                            <GitHubIcon size={14}/> Revisar permissões
-                          </button>
-                          <button className="secondary" onClick={() => void refreshGithub()}>
-                            Tentar novamente
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="auth-error" style={{ marginBottom: 12 }}>{githubPullError}</div>
-                    )
-                  )}
-                  {githubPullSuccess && <div className="github-linked-success" style={{ marginBottom: 12 }}><Check size={16}/><div><b>Pull Request criado com sucesso</b><small>O Pull Request foi aberto no GitHub com sucesso.</small></div></div>}
-                </>
-              )}
-
-              <div className="github-connected-actions" style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-                <button
-                  className="primary github-commit-btn"
-                  style={{ flex: 1, height: 32, display: "flex", justifyContent: "center", alignItems: "center", gap: 6 }}
-                  disabled={!isAccessible || (!githubLinkStatus.dirty && !githubLinkStatus.unpushed) || !githubCommitMessage.trim() || githubCommitBusy}
-                  onClick={() => void commitAndPushGithub()}
-                  title={!isAccessible ? "Repositório não acessível pela conta conectada" : undefined}
-                >
-                  {githubCommitBusy ? <><Loader2 size={15} className="spin"/> Enviando...</> : <><Check size={15}/> Commit e Push</>}
-                </button>
-                <button
-                  className="secondary github-sync-btn"
-                  style={{ flex: 1, height: 32, display: "flex", justifyContent: "center", alignItems: "center", gap: 6 }}
-                  disabled={!isAccessible || gitSyncRefreshing}
-                  onClick={() => void checkProjectSync(true)}
-                  title="Verificar se há alterações no GitHub"
-                >
-                  {gitSyncRefreshing ? <><Loader2 size={14} className="spin"/> Verificando...</> : <><RefreshCw size={14}/> Sincronizar</>}
-                </button>
-                <button
-                  className="secondary github-pull-btn"
-                  style={{ flex: 1, height: 32, display: "flex", justifyContent: "center", alignItems: "center", gap: 6 }}
-                  disabled={!isAccessible || githubPullBusy || !githubLinkStatus.linkedRepo}
-                  onClick={() => void createPullRequest()}
-                  title={!isAccessible ? "Repositório não acessível pela conta conectada" : undefined}
-                >
-                  {githubPullBusy ? <><Loader2 size={15} className="spin"/> Criando...</> : <><GitPullRequest size={15}/> Pull</>}
-                </button>
-              </div>
-
-              </div>;
+              ) : null}
+            </div>;
           })() : null}
           {project && !githubLinkStatus.linkedRepo ? (
             <div className="github-local-project-card" style={{ margin: "12px 0 16px 0" }}>
@@ -9190,6 +9583,54 @@ function App() {
               </button>
             </div>
           ) : null}
+
+          {/* SESSÃO: AUTOMAÇÃO / PREFERÊNCIAS */}
+          <div className="github-automation-card" style={{ margin: "14px 0", padding: 14, background: "rgba(255, 255, 255, 0.03)", borderRadius: 8, border: "1px solid rgba(255, 255, 255, 0.08)" }}>
+            <b style={{ fontSize: 13, color: "var(--foreground)", display: "block", marginBottom: 8 }}>Automação</b>
+            <div
+              className="auto-commit-option"
+              onClick={async (e) => {
+                if ((e.target as HTMLElement).tagName.toLowerCase() === "input") return;
+                const next = !githubAutoCommit;
+                setGithubAutoCommit(next);
+                if (project && window.neko?.githubSetAutoCommit) {
+                  try {
+                    await window.neko.githubSetAutoCommit(project, next);
+                  } catch (err) {
+                    console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
+                  }
+                }
+              }}
+              style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", userSelect: "none" }}
+            >
+              <input
+                id="github-auto-commit-checkbox"
+                type="checkbox"
+                checked={githubAutoCommit}
+                onChange={async (e) => {
+                  const next = e.target.checked;
+                  setGithubAutoCommit(next);
+                  if (project && window.neko?.githubSetAutoCommit) {
+                    try {
+                      await window.neko.githubSetAutoCommit(project, next);
+                    } catch (err) {
+                      console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
+                    }
+                  }
+                }}
+                style={{ marginTop: 2, cursor: "pointer", width: 14, height: 14, flex: "0 0 auto", flexShrink: 0, accentColor: "#a855f7" }}
+              />
+              <div className="auto-commit-text" style={{ flex: "1 1 auto", minWidth: 0, display: "flex", flexDirection: "column", gap: 3 }}>
+                <div className="auto-commit-title" style={{ fontSize: 13, color: "var(--foreground)", lineHeight: 1.4 }}>
+                  Realizar commit e push automaticamente após a tarefa
+                </div>
+                <div className="auto-commit-description" style={{ color: "var(--foreground-muted)", fontSize: 11, lineHeight: 1.4 }}>
+                  O NekoAI salvará as alterações em um commit e enviará automaticamente o commit para o GitHub ao concluir o desenvolvimento da tarefa.
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div className="github-modal-footer" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 24, paddingTop: 16, borderTop: "1px solid rgba(255, 255, 255, 0.06)" }}>
             <button className="secondary github-disconnect danger-btn" style={{ display: "flex", alignItems: "center", gap: 6, margin: 0, alignSelf: "center" }} onClick={() => void disconnectGithubAccount(githubStatus.activeAccount?.id)} title="Desconectar conta do GitHub"><Unplug size={14}/> Desconectar</button>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -9205,11 +9646,11 @@ function App() {
                 </button>
               ) : null}
               {(() => { const url = (project && githubLinkStatus.linkedRepo) ? (githubStatus.repos?.find(r => r.fullName.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())?.htmlUrl || `https://github.com/${githubLinkStatus.linkedRepo}`) : null; return url ? <button className="secondary github-view-repo-btn" style={{ display: "flex", alignItems: "center", gap: 6 }} onClick={() => void window.neko.githubOpen(url)} title="Abrir repositório no GitHub"><ExternalLinkIcon size={14}/> Ver no GitHub</button> : null; })()}
+            </div>
           </div>
         </div>
-      </div>
-    )}
-  </>}
+      )}
+    </>}
 
       {modal === "githubClone" && <>
         <div className="modal-head">
@@ -9525,6 +9966,136 @@ function App() {
         </div>
       </>}
 
+      {modal === "githubMergeConfirm" && (
+        <>
+          <div className="modal-head">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div className="branch-modal-icon-wrap" style={{ background: "rgba(168, 85, 247, 0.12)", borderColor: "rgba(168, 85, 247, 0.28)" }}>
+                <GitMerge size={18} color="#a855f7" />
+              </div>
+              <div>
+                <h2 id="modal-title">Confirmar integração</h2>
+                <p>As alterações da branch de trabalho serão integradas na branch base via API do GitHub.</p>
+              </div>
+            </div>
+            <button
+              className="close-btn"
+              disabled={githubMergeBusy}
+              onClick={() => setModal("github")}
+              aria-label="Fechar"
+            >
+              <X size={17} />
+            </button>
+          </div>
+
+          <div className="modal-scroll-body branch-changes-modal-body">
+            <div className="branch-target-banner" style={{ background: "rgba(168, 85, 247, 0.08)", borderColor: "rgba(168, 85, 247, 0.2)" }}>
+              <span>
+                Você está prestes a fazer a fusão da branch <b>{githubPrStatus?.headBranch || githubLinkStatus.branch}</b> na branch <b>{githubPrStatus?.baseBranch || "main"}</b>.
+              </span>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: 14, background: "rgba(255, 255, 255, 0.03)", borderRadius: 8, border: "1px solid rgba(255, 255, 255, 0.08)", margin: "12px 0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 11, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 700 }}>Pull Request</span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: "#a855f7" }}>
+                  {githubPrStatus?.prNumber ? `#${githubPrStatus.prNumber}` : ""}
+                </span>
+              </div>
+              {githubPrStatus?.title && (
+                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--foreground)" }}>
+                  {githubPrStatus.title}
+                </div>
+              )}
+              <div style={{ fontSize: 12, color: "var(--foreground-muted)", display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
+                <span className="branch-tag" style={{ background: "rgba(168, 85, 247, 0.15)", color: "#c084fc", padding: "2px 6px", borderRadius: 4, fontWeight: 600 }}>
+                  {githubPrStatus?.headBranch || githubLinkStatus.branch}
+                </span>
+                <span>→</span>
+                <span className="branch-tag" style={{ background: "rgba(255, 255, 255, 0.08)", color: "#e5e7eb", padding: "2px 6px", borderRadius: 4, fontWeight: 600 }}>
+                  {githubPrStatus?.baseBranch || "main"}
+                </span>
+              </div>
+            </div>
+
+            <p style={{ fontSize: 12, color: "#9ca3af", lineHeight: 1.5, margin: "0 0 12px 0" }}>
+              A branch <b>{githubPrStatus?.baseBranch || "main"}</b> receberá todos os commits da Pull Request através da API oficial do GitHub REST endpoint <code>PUT /repos/:owner/:repo/pulls/:number/merge</code> sem necessidade de ações manuais no navegador.
+            </p>
+
+            {githubMergeError && (
+              <div className="auth-error" style={{ marginBottom: 12 }}>
+                {githubMergeError}
+              </div>
+            )}
+
+            {githubMergeBusy && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, padding: 12, borderRadius: 8, background: "rgba(168, 85, 247, 0.08)", border: "1px solid rgba(168, 85, 247, 0.2)", marginBottom: 12 }}>
+                <Loader2 size={16} className="spin" style={{ color: "#a855f7" }} />
+                <span style={{ fontSize: 12, color: "var(--foreground)" }}>Concluindo mesclagem da Pull Request no GitHub...</span>
+              </div>
+            )}
+          </div>
+
+          <div className="modal-actions branch-modal-actions">
+            <button
+              className="secondary"
+              disabled={githubMergeBusy}
+              onClick={() => setModal("github")}
+            >
+              Cancelar
+            </button>
+            <button
+              className="primary"
+              disabled={githubMergeBusy}
+              onClick={() => void handleExecuteMerge()}
+            >
+              {githubMergeBusy ? (
+                <><Loader2 size={15} className="spin"/> Mesclando...</>
+              ) : (
+                <><GitMerge size={14}/> Mesclar na {githubPrStatus?.baseBranch || "main"}</>
+              )}
+            </button>
+          </div>
+        </>
+      )}
+
+      {modal === "prBranchSwitchConfirm" && pendingPRBranchSwitch && (
+        <>
+          <div className="modal-head">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div className="branch-modal-icon-wrap" style={{ background: "rgba(234, 179, 8, .12)", borderColor: "rgba(234, 179, 8, .28)" }}>
+                <GitBranch size={18} color="#eab308" />
+              </div>
+              <div>
+                <h2 id="modal-title">Alternar branch para resolver conflitos</h2>
+                <p>A Pull Request #{pendingPRBranchSwitch.prNumber} solicita mesclar <b>{pendingPRBranchSwitch.headBranch}</b> na branch <b>{pendingPRBranchSwitch.baseBranch}</b>.</p>
+              </div>
+            </div>
+            <button className="close-btn" onClick={() => { setModal("github"); setPendingPRBranchSwitch(null); }} aria-label="Fechar"><X size={17}/></button>
+          </div>
+          <div className="modal-scroll-body branch-changes-modal-body">
+            <div className="branch-target-banner">
+              <span>Você está na branch <b>{githubLinkStatus.branch || "main"}</b>. Para resolver os conflitos da Pull Request, é necessário alternar para a branch de trabalho <b>{pendingPRBranchSwitch.headBranch}</b>.</span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: 12, background: "rgba(255, 255, 255, 0.03)", borderRadius: 8, border: "1px solid rgba(255, 255, 255, 0.08)", margin: "10px 0" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, color: "var(--foreground)" }}>
+                <GitPullRequest size={15} color="#a855f7" />
+                <span>Direção da PR:</span>
+                <span className="branch-tag" style={{ background: "rgba(168, 85, 247, 0.15)", color: "#c084fc", padding: "2px 6px", borderRadius: 4, fontWeight: 600 }}>{pendingPRBranchSwitch.headBranch}</span>
+                <span>→</span>
+                <span className="branch-tag" style={{ background: "rgba(255, 255, 255, 0.08)", color: "#e5e7eb", padding: "2px 6px", borderRadius: 4, fontWeight: 600 }}>{pendingPRBranchSwitch.baseBranch}</span>
+              </div>
+            </div>
+          </div>
+          <div className="modal-actions branch-modal-actions">
+            <button className="secondary" onClick={() => { setModal("github"); setPendingPRBranchSwitch(null); }}>Cancelar</button>
+            <button className="primary" disabled={prConflictBusy} onClick={() => void chooseGithubBranch(pendingPRBranchSwitch.headBranch)}>
+              {prConflictBusy ? <><Loader2 size={15} className="spin"/> Alternando...</> : <><GitBranch size={14}/> Mudar para {pendingPRBranchSwitch.headBranch}</>}
+            </button>
+          </div>
+        </>
+      )}
+
       {modal === "githubLink" && githubLinkRepo && <>
         <div className="modal-head">
           <div>
@@ -9627,7 +10198,7 @@ function App() {
               <p>Você possui alterações locais não commitadas neste projeto.</p>
             </div>
           </div>
-          <button className="close-btn" disabled={branchActionBusy} onClick={() => { setModal(null); setPendingTargetBranch(null); }} aria-label="Fechar"><X size={17}/></button>
+          <button className="close-btn" disabled={branchActionBusy} onClick={() => { if (pendingTargetBranch) { setModal(null); setPendingTargetBranch(null); } else { setModal("gitCenter"); } }} aria-label="Fechar"><X size={17}/></button>
         </div>
         <div className="modal-scroll-body branch-changes-modal-body">
           {pendingTargetBranch ? (
@@ -9807,17 +10378,23 @@ function App() {
           {branchActionError && <div className="auth-error">{branchActionError}</div>}
         </div>
         <div className="modal-actions branch-modal-actions">
-          <button className="secondary" disabled={branchActionBusy} onClick={() => { setModal(null); setPendingTargetBranch(null); }}>Cancelar</button>
+          <button className="secondary" disabled={branchActionBusy} onClick={() => { if (pendingTargetBranch) { setModal(null); setPendingTargetBranch(null); } else { setModal("gitCenter"); } }}>Cancelar</button>
           <button className="secondary danger-btn" disabled={branchActionBusy} onClick={() => setModal("branchDiscardConfirm")}>
             <Trash2 size={14}/> Descartar alterações
           </button>
-          {selectedCommitFiles.size === 0 ? (
-            <button className="primary" disabled={branchActionBusy} onClick={() => void handleBranchCheckoutWithoutCommit()}>
-              <GitBranch size={14}/> {pendingTargetBranch ? `Trocar para ${pendingTargetBranch} sem commit` : "Trocar sem commit"}
-            </button>
+          {pendingTargetBranch ? (
+            selectedCommitFiles.size === 0 ? (
+              <button className="primary" disabled={branchActionBusy} onClick={() => void handleBranchCheckoutWithoutCommit()}>
+                <GitBranch size={14}/> Trocar para {pendingTargetBranch} sem commit
+              </button>
+            ) : (
+              <button className="primary" disabled={branchActionBusy} onClick={() => setModal("branchCommit")}>
+                <Check size={14}/> Fazer Commit e trocar para {pendingTargetBranch}
+              </button>
+            )
           ) : (
-            <button className="primary" disabled={branchActionBusy} onClick={() => setModal("branchCommit")}>
-              <Check size={14}/> Fazer Commit ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})
+            <button className="primary" disabled={branchActionBusy || selectedCommitFiles.size === 0} onClick={() => setModal("branchCommit")}>
+              <Check size={14}/> Fazer Commit {selectedCommitFiles.size > 0 ? `(${selectedCommitFiles.size} ${selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})` : ""}
             </button>
           )}
         </div>
@@ -9837,7 +10414,12 @@ function App() {
         <div className="modal-scroll-body branch-discard-modal-body">
           <div className="branch-discard-warning-card">
             <b>Atenção: Esta ação não poderá ser desfeita.</b>
-            <p>Todas as alterações no working tree que não foram salvas em um commit serão descartadas para permitir a troca para <b>{pendingTargetBranch}</b>.</p>
+            <p>
+              {pendingTargetBranch
+                ? <>Todas as alterações no working tree que não foram salvas em um commit serão descartadas para permitir a troca para <b>{pendingTargetBranch}</b>.</>
+                : <>Todas as alterações locais que não foram salvas em um commit serão descartadas permanentemente.</>
+              }
+            </p>
             <small>Arquivos de ambiente e segredos locais (como <code>.env</code>) serão preservados com segurança.</small>
           </div>
           {branchActionError && <div className="auth-error">{branchActionError}</div>}
@@ -9845,7 +10427,11 @@ function App() {
         <div className="modal-actions branch-modal-actions">
           <button className="secondary" disabled={branchActionBusy} onClick={() => setModal("branchChanges")}>Voltar</button>
           <button className="primary danger-confirm-btn" disabled={branchActionBusy} onClick={() => void handleBranchDiscardAndCheckout()}>
-            {branchActionBusy ? <><Loader2 size={15} className="spin"/> Descartando e trocando...</> : <><Trash2 size={14}/> Descartar e trocar</>}
+            {branchActionBusy ? (
+              <><Loader2 size={15} className="spin"/> {pendingTargetBranch ? "Descartando e trocando..." : "Descartando alterações..."}</>
+            ) : (
+              <><Trash2 size={14}/> {pendingTargetBranch ? "Descartar e trocar" : "Descartar alterações"}</>
+            )}
           </button>
         </div>
       </>}
@@ -9853,10 +10439,18 @@ function App() {
       {modal === "branchCommit" && <>
         <div className="modal-head">
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div className="branch-modal-icon-wrap"><GitBranch size={18} color="#a855f7"/></div>
+            <div className="branch-modal-icon-wrap">
+              {pendingTargetBranch ? <GitBranch size={18} color="#a855f7"/> : <Check size={18} color="#a855f7"/>}
+            </div>
             <div>
-              <h2 id="modal-title">Commit antes de trocar de branch</h2>
-              <p>Salve suas alterações antes de alternar para <b>{pendingTargetBranch}</b>.</p>
+              <h2 id="modal-title">{pendingTargetBranch ? "Commit antes de trocar de branch" : "Confirmar commit"}</h2>
+              <p>
+                {pendingTargetBranch ? (
+                  <>Salve suas alterações antes de alternar para <b>{pendingTargetBranch}</b>.</>
+                ) : (
+                  <>Salve as alterações selecionadas no repositório.</>
+                )}
+              </p>
             </div>
           </div>
           <button className="close-btn" disabled={branchActionBusy} onClick={() => setModal("branchChanges")} aria-label="Fechar"><X size={17}/></button>
@@ -9872,7 +10466,11 @@ function App() {
             autoFocus
           />
           <div className="branch-commit-help">
-            <span>Após o commit, o NekoAI trocará automaticamente para <b>{pendingTargetBranch}</b>.</span>
+            {pendingTargetBranch ? (
+              <span>Após o commit, o NekoAI trocará automaticamente para <b>{pendingTargetBranch}</b>.</span>
+            ) : (
+              <span>As alterações selecionadas serão salvas em um novo commit neste projeto.</span>
+            )}
           </div>
           {branchActionError && (
             <div className="auth-error" style={{ display: "flex", flexDirection: "column", gap: 8, whiteSpace: "pre-line" }}>
@@ -9901,9 +10499,15 @@ function App() {
         </div>
         <div className="modal-actions branch-modal-actions">
           <button className="secondary" disabled={branchActionBusy} onClick={() => setModal("branchChanges")}>Voltar</button>
-          <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0} onClick={() => void handleBranchCommitAndCheckout()}>
-            {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando e trocando...</> : <><Check size={14}/> {pendingTargetBranch ? `Salvar e trocar para ${pendingTargetBranch}` : "Salvar Commit"} ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})</>}
-          </button>
+          {pendingTargetBranch ? (
+            <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0} onClick={() => void handleBranchCommitAndCheckout()}>
+              {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando e trocando...</> : <><Check size={14}/> Salvar e trocar para {pendingTargetBranch} ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})</>}
+            </button>
+          ) : (
+            <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0} onClick={() => void handleManualGitCenterCommit()}>
+              {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando commit...</> : <><Check size={14}/> Salvar Commit ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})</>}
+            </button>
+          )}
         </div>
       </>}
 
@@ -9946,7 +10550,7 @@ function App() {
             ) : gitSyncStatus.workingTreeDirty ? (
               <span>O NekoAI preservou suas alterações locais e bloqueou a sincronização automática para evitar conflitos. Salve ou descarte suas alterações locais antes de sincronizar com o GitHub.</span>
             ) : (
-              <span>Essas alterações podem ter sido feitas pelo Lovable, outro computador ou outro colaborador. Você pode trazê-las com segurança usando fast-forward.</span>
+              <span>Essas alterações podem ter sido feitas pelo Lovable, outro computador ou outro colaborador. O NekoAI vai trazê-las com segurança para este computador.</span>
             )}
           </div>
 
@@ -9960,7 +10564,7 @@ function App() {
             {gitSyncStatus.workingTreeDirty ? (
               <span className="branch-chip del"><FileText size={12}/>{gitSyncStatus.changedFiles?.length || 0} arquivo{gitSyncStatus.changedFiles?.length > 1 ? "s" : ""} modificado{gitSyncStatus.changedFiles?.length > 1 ? "s" : ""}</span>
             ) : (
-              <span className="branch-chip new"><Check size={12}/>Working tree limpo</span>
+              <span className="branch-chip new"><Check size={12}/>Sem alterações locais</span>
             )}
           </div>
 
@@ -10037,7 +10641,7 @@ function App() {
               {((gitSyncStatus.changedFiles || []).length > 0) ? (
                 <div>
                   <div style={{ fontSize: 10, fontWeight: 700, color: "#fca5a5", marginBottom: 5, display: "flex", alignItems: "center", gap: 5 }}>
-                    <FileText size={12}/> Arquivos modificados localmente (não salvos):
+                    <FileText size={12}/> Alterações feitas neste computador:
                   </div>
                   <div className="branch-files-list">
                     {(gitSyncStatus.changedFiles || []).map((f: any) => (
@@ -10063,16 +10667,459 @@ function App() {
 
         <div className="modal-actions branch-modal-actions">
           <button className="secondary" disabled={gitSyncBusy} onClick={() => setModal(null)}>Cancelar</button>
-          {gitSyncStatus.canFastForward ? (
-            <button className="secondary" disabled={gitSyncBusy} onClick={() => void handlePullExternalChanges()} title="Trazer alterações diretamente via fast-forward">
-              {gitSyncBusy ? <><Loader2 size={15} className="spin"/> Trazendo...</> : <><Download size={14}/> Trazer alterações (ff-only)</>}
+          {/* Cenário simples: apenas atrás, working tree limpa, sem divergência → UX leiga */}
+          {gitSyncStatus.canFastForward && !gitSyncStatus.workingTreeDirty && !gitSyncStatus.diverged ? (
+            <button className="primary" disabled={gitSyncBusy} onClick={() => void handlePullExternalChanges()}>
+              {gitSyncBusy ? <><Loader2 size={15} className="spin"/> Atualizando...</> : <><Download size={14}/> Atualizar projeto</>}
             </button>
-          ) : null}
-          <button className="primary" disabled={gitSyncBusy} onClick={() => void handleSyncAndCombine()} title="Preserva o estado local com segurança, traz o GitHub e combina as alterações">
-            {gitSyncBusy ? <><Loader2 size={15} className="spin"/> Sincronizando...</> : <><GitMerge size={14}/> Sincronizar e combinar</>}
-          </button>
+          ) : (
+            /* Cenário complexo: dirty tree ou divergência → manter fluxo existente */
+            <button className="primary" disabled={gitSyncBusy} onClick={() => void handleSyncAndCombine()} title="Preserva o estado local com segurança, traz o GitHub e combina as alterações">
+              {gitSyncBusy ? <><Loader2 size={15} className="spin"/> Sincronizando...</> : <><GitMerge size={14}/> Sincronizar e combinar</>}
+            </button>
+          )}
         </div>
       </>}
+
+      {modal === "gitCenter" && (() => {
+        const activeAcc = githubStatus.activeAccount || githubStatus.user;
+        const isRepoLinked = Boolean(githubLinkStatus.linkedRepo);
+        const isAccessible = Boolean(
+          githubStatus.connected &&
+          isRepoLinked &&
+          activeAcc &&
+          githubStatus.repos?.some((r: any) => r.fullName?.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())
+        );
+        const branchName = githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main");
+        const isDirty = Boolean(githubLinkStatus.dirty);
+        const changedCount = (githubLinkStatus.changedFiles || []).length;
+        const ahead = githubLinkStatus.ahead || 0;
+        const behind = isAccessible ? (githubLinkStatus.behind || 0) : 0;
+        const diverged = isAccessible && Boolean(githubLinkStatus.diverged);
+
+        const pr = isAccessible ? githubPrStatus : null;
+        const isPrContextual = Boolean(pr && pr.headBranch === branchName);
+
+        let statusBadgeColor = "#22c55e";
+        let statusBadgeText = "Tudo em dia";
+        let statusMessage = "O workspace local está sincronizado e pronto para trabalho.";
+
+        if (isRepoLinked && !isAccessible) {
+          statusBadgeColor = "#f97316";
+          statusBadgeText = "Sem acesso ao repositório";
+          statusMessage = activeAcc?.login
+            ? `A conta @${activeAcc.login} não possui acesso ao repositório ${githubLinkStatus.linkedRepo}. As informações locais do projeto continuam disponíveis, mas o NekoAI não pode confirmar o estado remoto.`
+            : `A conta selecionada não possui acesso ao repositório ${githubLinkStatus.linkedRepo}. As informações locais do projeto continuam disponíveis, mas o NekoAI não pode confirmar o estado remoto.`;
+        } else if (diverged || (isPrContextual && pr?.hasConflicts)) {
+          statusBadgeColor = "#ef4444";
+          statusBadgeText = "Ação necessária";
+          statusMessage = (isPrContextual && pr?.hasConflicts)
+            ? `Existem alterações incompatíveis entre esta branch e a ${pr.baseBranch}.`
+            : "O projeto possui alterações locais e remotas divergentes.";
+        } else if (isDirty) {
+          statusBadgeColor = "#eab308";
+          statusBadgeText = "Alterações locais pendentes";
+          statusMessage = `Existem ${changedCount} arquivo(s) modificado(s) não commitado(s).`;
+        } else if (behind > 0) {
+          statusBadgeColor = "#38bdf8";
+          statusBadgeText = "Atualização disponível";
+          statusMessage = `Há ${behind} alteração(ões) nova(s) no remoto aguardando sincronização.`;
+        } else if (ahead > 0) {
+          statusBadgeColor = "#a855f7";
+          statusBadgeText = "Commits prontos para envio";
+          statusMessage = `Há ${ahead} commit(s) local(is) pronto(s) para ser(em) enviado(s) ao GitHub.`;
+        }
+
+        return (
+          <>
+            <div className="modal-head">
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div className="branch-modal-icon-wrap" style={{ background: "rgba(168, 85, 247, 0.12)", borderColor: "rgba(168, 85, 247, 0.28)" }}>
+                  <GitHubIcon size={20} />
+                </div>
+                <div>
+                  <h2 id="modal-title">NekoAI Git Center</h2>
+                  <p>Central de sincronização, branches e Pull Requests do projeto <b>{projectDisplayName}</b></p>
+                </div>
+              </div>
+              <button className="close-btn" onClick={() => setModal(null)} aria-label="Fechar"><X size={17}/></button>
+            </div>
+
+            <div className="modal-scroll-body branch-changes-modal-body" style={{ gap: 14, display: "flex", flexDirection: "column" }}>
+              {/* Banner Sintético de Situação */}
+              <div style={{
+                padding: "12px 14px",
+                borderRadius: 8,
+                background: `${statusBadgeColor}12`,
+                border: `1px solid ${statusBadgeColor}40`,
+                display: "flex",
+                alignItems: "center",
+                gap: 12
+              }}>
+                <div style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  background: statusBadgeColor,
+                  flexShrink: 0,
+                  boxShadow: `0 0 10px ${statusBadgeColor}`
+                }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: "var(--foreground)" }}>
+                    {statusBadgeText}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "var(--foreground-muted)", marginTop: 2 }}>
+                    {statusMessage}
+                  </div>
+                </div>
+              </div>
+
+              {/* Card 1: Repositório & Conta GitHub */}
+              <div className="settings-section-card" style={{ padding: 14 }}>
+                <div className="settings-section-head" style={{ paddingBottom: 8, marginBottom: 8 }}>
+                  <div className="settings-section-title" style={{ fontSize: 12.5 }}>
+                    <GitHubIcon size={15} /> <span>Repositório & Conexão GitHub</span>
+                  </div>
+                  {githubStatus.connected && activeAcc ? (
+                    <span className="branch-tag" style={{ background: "rgba(168, 85, 247, 0.15)", color: "#c084fc", fontSize: 11, padding: "2px 8px", borderRadius: 4, fontWeight: 600 }}>
+                      @{activeAcc.login}
+                    </span>
+                  ) : (
+                    <span className="branch-tag" style={{ background: "rgba(239, 68, 68, 0.15)", color: "#fca5a5", fontSize: 11, padding: "2px 8px", borderRadius: 4, fontWeight: 600 }}>
+                      Desconectado
+                    </span>
+                  )}
+                </div>
+
+                {!githubStatus.connected ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    <span style={{ fontSize: 12, color: "#9ca3af" }}>
+                      Este projeto não possui uma conta GitHub conectada/associada no NekoAI.
+                    </span>
+                    <button
+                      type="button"
+                      className="primary btn-sm"
+                      style={{ alignSelf: "flex-start", marginTop: 4 }}
+                      onClick={() => setModal("github")}
+                    >
+                      <GitHubIcon size={14} /> Conectar conta GitHub
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ color: "#9ca3af" }}>Repositório Remoto:</span>
+                      {isRepoLinked ? (
+                        <code style={{ background: "rgba(255, 255, 255, 0.06)", padding: "2px 6px", borderRadius: 4, color: "#fff" }}>
+                          {githubLinkStatus.linkedRepo}
+                        </code>
+                      ) : (
+                        <span style={{ color: "#eab308" }}>Projeto local (não publicado)</span>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ color: "#9ca3af" }}>Conta Ativa:</span>
+                      <span><b>@{activeAcc?.login}</b> {activeAcc?.name ? `(${activeAcc.name})` : ""}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Card 2: Estado Git Local & Branch */}
+              <div className="settings-section-card" style={{ padding: 14 }}>
+                <div className="settings-section-head" style={{ paddingBottom: 8, marginBottom: 8 }}>
+                  <div className="settings-section-title" style={{ fontSize: 12.5 }}>
+                    <GitBranch size={15} color="#a855f7" /> <span>Estado Local & Branch</span>
+                  </div>
+                  <span className="branch-tag" style={{ background: "rgba(255, 255, 255, 0.08)", color: "#e5e7eb", fontSize: 11, padding: "2px 8px", borderRadius: 4, fontWeight: 600 }}>
+                    🌿 {branchName}
+                  </span>
+                </div>
+
+                <div className="branch-summary-chips" style={{ marginBottom: 8 }}>
+                  {ahead > 0 && <span className="branch-chip new"><GitCommit size={12}/> {ahead} {ahead === 1 ? "commit pronto para enviar" : "commits prontos para enviar"}</span>}
+                  {behind > 0 && <span className="branch-chip mod"><GitCommit size={12}/> {behind === 1 ? "Há 1 atualização nova no remoto" : `Há ${behind} atualizações novas no remoto`}</span>}
+                  {isDirty ? (
+                    <span className="branch-chip del"><FileText size={12}/> {changedCount} arquivo(s) modificado(s)</span>
+                  ) : (behind === 0 && ahead === 0 && !diverged) ? (
+                    /* Estado global sincronizado: sem pendências locais nem remotas */
+                    <span className="branch-chip new"><Check size={12}/> {isAccessible ? "Tudo sincronizado" : "Arquivos locais em dia"}</span>
+                  ) : (
+                    /* Working tree limpa, mas ainda existem pendências remotas/locais */
+                    <span className="branch-chip new"><Check size={12}/> Sem alterações locais</span>
+                  )}
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+                  {isDirty && (
+                    <button
+                      type="button"
+                      className="primary btn-sm"
+                      style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
+                      onClick={() => {
+                        setPendingTargetBranch(null);
+                        setBranchCommitMessage("Atualizações no projeto");
+                        setSelectedCommitFiles(new Set());
+                        setBranchActionError("");
+                        setModal("branchChanges");
+                      }}
+                    >
+                      <Check size={12} /> Comitar alterações ({changedCount})
+                    </button>
+                  )}
+                  {ahead > 0 && isAccessible && (
+                    <button
+                      type="button"
+                      className="primary btn-sm"
+                      disabled={gitPushBusy}
+                      style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5, background: "#a855f7", borderColor: "#a855f7" }}
+                      onClick={() => void handleManualGitPush()}
+                      title="Enviar commits locais para o repositório no GitHub"
+                    >
+                      {gitPushBusy ? <><Loader2 size={12} className="spin" /> Enviando...</> : <><CloudUpload size={12} /> Enviar para o GitHub ({ahead})</>}
+                    </button>
+                  )}
+                  {(behind > 0 || diverged) && (
+                    <button
+                      type="button"
+                      className="secondary btn-sm"
+                      style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
+                      onClick={async () => {
+                        try {
+                          const activeProj = projectRef.current;
+                          const sync = await window.neko.githubCheckSync?.(activeProj);
+                          if (sync) {
+                            setGitSyncStatus(sync);
+                            setModal("gitSync");
+                          }
+                        } catch {
+                          showToast("Erro ao verificar sincronização.");
+                        }
+                      }}
+                    >
+                      <RefreshCw size={12} /> Sincronizar com remote
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Card 3: Pull Requests */}
+              {(() => {
+                const contextualPrList = (githubPrList || []).filter((pr: any) => pr.headBranch === branchName);
+                if (!isRepoLinked || !isAccessible || (!githubPrListLoading && contextualPrList.length === 0)) {
+                  return null;
+                }
+                return (
+                  <div className="settings-section-card" style={{ padding: 14 }}>
+                    <div className="settings-section-head" style={{ paddingBottom: 8, marginBottom: 8 }}>
+                      <div className="settings-section-title" style={{ fontSize: 12.5 }}>
+                        <GitPullRequest size={15} color="#38bdf8" /> <span>Pull Requests</span>
+                      </div>
+                      {githubPrListLoading && contextualPrList.length === 0 ? (
+                        <Loader2 size={13} className="spin" color="#9ca3af" />
+                      ) : (
+                        <span className="branch-tag" style={{ background: "rgba(56, 189, 248, 0.15)", color: "#38bdf8", fontSize: 11, padding: "2px 8px", borderRadius: 4, fontWeight: 600 }}>
+                          {contextualPrList.length} PR(s)
+                        </span>
+                      )}
+                    </div>
+
+                    {githubPrListLoading && contextualPrList.length === 0 ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 8, fontSize: 12, color: "#9ca3af" }}>
+                        <Loader2 size={14} className="spin" /> Consultando Pull Requests no GitHub...
+                      </div>
+                    ) : (
+                      <div
+                        className="pr-scroll-container"
+                        style={{
+                          maxHeight: 340,
+                          overflowY: "auto",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: 12,
+                          paddingRight: 4
+                        }}
+                        onScroll={(e: any) => {
+                          const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+                          if (scrollHeight - scrollTop - clientHeight < 40 && githubPrListHasMore && !githubPrListLoadingMore) {
+                            void loadMorePullRequests();
+                          }
+                        }}
+                      >
+                        {contextualPrList.map((pr: any, idx: number) => {
+                          const prState = pr.state || "PR_OPEN";
+                          const isMergedState = prState === "PR_MERGED";
+                          const isReadyState = prState === "PR_READY_TO_MERGE";
+                          const isConflictState = prState === "PR_CONFLICTS" || pr.hasConflicts;
+                          const isClosedState = prState === "PR_CLOSED";
+                          const isBlockedState = prState === "PR_BLOCKED" || pr.checksPending || pr.checksFailed;
+
+                          let badgeColor = "#38bdf8";
+                          let badgeBg = "rgba(56, 189, 248, 0.15)";
+                          let badgeLabel = `🔵 PR #${pr.prNumber} (Pull Request aberto)`;
+
+                          if (isMergedState) {
+                            badgeColor = "#4ade80";
+                            badgeBg = "rgba(34, 197, 94, 0.15)";
+                            badgeLabel = `🟢 PR #${pr.prNumber} (Resolvido)`;
+                          } else if (isReadyState) {
+                            badgeColor = "#4ade80";
+                            badgeBg = "rgba(34, 197, 94, 0.15)";
+                            badgeLabel = `🟢 PR #${pr.prNumber} (Pronto para integrar)`;
+                          } else if (isConflictState) {
+                            badgeColor = "#ef4444";
+                            badgeBg = "rgba(239, 68, 68, 0.15)";
+                            badgeLabel = `🔴 PR #${pr.prNumber} (Precisa resolver conflitos)`;
+                          } else if (isClosedState) {
+                            badgeColor = "#9ca3af";
+                            badgeBg = "rgba(156, 163, 175, 0.15)";
+                            badgeLabel = `⚪ PR #${pr.prNumber} (Encerrado)`;
+                          } else if (pr.checksPending) {
+                            badgeColor = "#fbbf24";
+                            badgeBg = "rgba(234, 179, 8, 0.15)";
+                            badgeLabel = `🟡 PR #${pr.prNumber} (Aguardando verificações)`;
+                          } else if (pr.checksFailed) {
+                            badgeColor = "#ef4444";
+                            badgeBg = "rgba(239, 68, 68, 0.15)";
+                            badgeLabel = `🔴 PR #${pr.prNumber} (Falha nas verificações)`;
+                          }
+
+                          return (
+                            <div key={pr.prNumber || idx} style={{
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: 8,
+                              padding: 12,
+                              background: "rgba(255, 255, 255, 0.03)",
+                              borderRadius: 8,
+                              border: "1px solid rgba(255, 255, 255, 0.08)"
+                            }}>
+                              {/* TÍTULO À ESQUERDA + TAG À DIREITA */}
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: "#fff", flex: "1 1 180px", minWidth: 0, wordBreak: "break-word" }}>
+                                  {pr.title || `Pull Request #${pr.prNumber}`}
+                                </div>
+                                <span className="branch-tag" style={{ background: badgeBg, color: badgeColor, fontSize: 11, padding: "2px 8px", borderRadius: 4, fontWeight: 600, whiteSpace: "nowrap" }}>
+                                  {badgeLabel}
+                                </span>
+                              </div>
+
+                              {/* DIREÇÃO DA BRANCH */}
+                              <div style={{ fontSize: 11.5, color: "#9ca3af", display: "flex", alignItems: "center", gap: 6 }}>
+                                <span className="branch-tag" style={{ background: "rgba(168, 85, 247, 0.15)", color: "#c084fc", padding: "1px 5px", borderRadius: 3, fontWeight: 600 }}>
+                                  {pr.headBranch}
+                                </span>
+                                <span>→</span>
+                                <span className="branch-tag" style={{ background: "rgba(255, 255, 255, 0.08)", color: "#e5e7eb", padding: "1px 5px", borderRadius: 3, fontWeight: 600 }}>
+                                  {pr.baseBranch}
+                                </span>
+                              </div>
+
+                              {/* DESCRIÇÃO EM LINGUAGEM HUMANA + BOTÕES DE AÇÃO */}
+                              {isMergedState && (
+                                <div style={{ fontSize: 11.5, color: "#e2e8f0", lineHeight: 1.4, background: "rgba(34, 197, 94, 0.06)", border: "1px solid rgba(34, 197, 94, 0.2)", padding: 8, borderRadius: 6 }}>
+                                  As alterações de <code style={{ background: "rgba(255,255,255,0.08)", padding: "1px 4px", borderRadius: 3 }}>{pr.headBranch}</code> já foram integradas à <code style={{ background: "rgba(255,255,255,0.08)", padding: "1px 4px", borderRadius: 3 }}>{pr.baseBranch}</code>.
+                                </div>
+                              )}
+
+                              {isReadyState && (
+                                <div style={{ display: "flex", flexDirection: "column", gap: 6, background: "rgba(34, 197, 94, 0.06)", border: "1px solid rgba(34, 197, 94, 0.2)", padding: 8, borderRadius: 6 }}>
+                                  <div style={{ fontSize: 11.5, color: "#e2e8f0", lineHeight: 1.4 }}>
+                                    Não há conflitos. O Pull Request pode ser integrado à <b>{pr.baseBranch}</b>.
+                                  </div>
+                                  {pr.checksApproved && (
+                                    <div style={{ fontSize: 11, color: "#86efac" }}>
+                                      Checks aprovados ({pr.checks?.length || 0})
+                                    </div>
+                                  )}
+                                  <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                                    <button
+                                      type="button"
+                                      className="primary btn-sm"
+                                      onClick={() => {
+                                        setGithubPrStatus(pr);
+                                        setModal("githubMergeConfirm");
+                                      }}
+                                    >
+                                      <GitMerge size={13} /> Integrar na {pr.baseBranch}
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+
+                              {isConflictState && !isMergedState && (
+                                <div style={{ display: "flex", flexDirection: "column", gap: 6, background: "rgba(239, 68, 68, 0.06)", border: "1px solid rgba(239, 68, 68, 0.2)", padding: 8, borderRadius: 6 }}>
+                                  <div style={{ fontSize: 11.5, color: "#fca5a5", lineHeight: 1.4 }}>
+                                    Existem alterações incompatíveis entre esta branch e a <b>{pr.baseBranch}</b>.
+                                  </div>
+                                  <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                                    <button
+                                      type="button"
+                                      className="primary btn-sm danger-confirm-btn"
+                                      disabled={prConflictBusy}
+                                      onClick={() => void handleStartPRConflictResolution(pr.headBranch, pr.baseBranch, pr.prNumber)}
+                                    >
+                                      {prConflictBusy ? <Loader2 size={13} className="spin" /> : <GitMerge size={13} />} Resolver conflitos
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+
+                              {isBlockedState && !isMergedState && !isConflictState && !isReadyState && !isClosedState && (
+                                <div style={{ fontSize: 11.5, color: "#e2e8f0", lineHeight: 1.4, background: pr.checksPending ? "rgba(234, 179, 8, 0.06)" : "rgba(239, 68, 68, 0.06)", border: pr.checksPending ? "1px solid rgba(234, 179, 8, 0.2)" : "1px solid rgba(239, 68, 68, 0.2)", padding: 8, borderRadius: 6 }}>
+                                  {pr.checksPending
+                                    ? "Algumas verificações ainda estão em andamento."
+                                    : "Algumas verificações obrigatórias no GitHub não passaram."}
+                                </div>
+                              )}
+
+                              {prState === "PR_OPEN" && !isBlockedState && !isConflictState && !isReadyState && !isMergedState && (
+                                <div style={{ fontSize: 11.5, color: "#e2e8f0", lineHeight: 1.4, background: "rgba(56, 189, 248, 0.06)", border: "1px solid rgba(56, 189, 248, 0.2)", padding: 8, borderRadius: 6 }}>
+                                  Este Pull Request está aberto e aguardando novas alterações ou verificações.
+                                </div>
+                              )}
+
+                              {isClosedState && (
+                                <div style={{ fontSize: 11.5, color: "#9ca3af", lineHeight: 1.4, background: "rgba(156, 163, 175, 0.06)", border: "1px solid rgba(156, 163, 175, 0.2)", padding: 8, borderRadius: 6 }}>
+                                  Este Pull Request foi encerrado e não foi integrado.
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+
+                        {githubPrListHasMore && (
+                          <div style={{ display: "flex", justifyContent: "center", paddingTop: 4, paddingBottom: 4 }}>
+                            <button
+                              type="button"
+                              className="secondary btn-sm"
+                              disabled={githubPrListLoadingMore}
+                              onClick={() => void loadMorePullRequests()}
+                              style={{ fontSize: 11, height: 26, padding: "0 10px", gap: 5 }}
+                            >
+                              {githubPrListLoadingMore ? <><Loader2 size={12} className="spin" /> Carregando...</> : "Carregar mais Pull Requests"}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            <div className="modal-actions branch-modal-actions">
+              <button className="secondary" onClick={() => setModal(null)}>Fechar</button>
+              <button className="secondary" onClick={() => {
+                previousModalRef.current = "gitCenter";
+                setModal("github");
+              }}>
+                Configurações do GitHub...
+              </button>
+            </div>
+          </>
+        );
+      })()}
 
       {modal === "gitConflictResolver" && gitConflictFiles.length > 0 && (() => {
         const resolvedCount = gitConflictFiles.filter(f => f.status === "resolved").length;
@@ -10088,45 +11135,66 @@ function App() {
                   <GitMerge size={18} color="#eab308" />
                 </div>
                 <div>
-                  <h2 id="modal-title">Resolver conflitos de sincronização</h2>
-                  <p>O GitHub e seu trabalho local modificaram o mesmo arquivo. Escolha qual versão deseja manter.</p>
+                  <h2 id="modal-title">{totalCount > 1 ? "Resolver conflitos" : "Resolver conflito"}</h2>
+                  <p>O GitHub e este computador alteraram o mesmo arquivo. Escolha como deseja resolver.</p>
                 </div>
               </div>
               <button className="close-btn" disabled={gitConflictBusy} onClick={handleDismissConflictResolverLater} aria-label="Fechar"><X size={17}/></button>
             </div>
 
             <div className="modal-scroll-body git-conflict-modal-body">
-              {/* Progress bar */}
+              {/* Notificação contextual suave quando o remoto foi atualizado enquanto pausado */}
+              {gitConflictRemoteUpdated && (
+                <div style={{
+                  padding: "8px 12px",
+                  borderRadius: 8,
+                  background: "rgba(59, 130, 246, 0.08)",
+                  border: "1px solid rgba(59, 130, 246, 0.25)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  fontSize: 12,
+                  color: "var(--foreground, #e2e8f0)",
+                  marginBottom: 10
+                }}>
+                  <Info size={14} color="#60a5fa" style={{ flexShrink: 0 }} />
+                  <span>Há uma atualização mais recente no GitHub. O conflito foi atualizado.</span>
+                </div>
+              )}
+
+              {/* Barra de Progresso Compacta */}
               <div className="git-conflict-progress-wrap">
                 <div className="git-conflict-progress-header">
-                  <span>Progresso da resolução:</span>
-                  <strong>{resolvedCount} de {totalCount} arquivo{totalCount > 1 ? "s" : ""} resolvido{resolvedCount > 1 ? "s" : ""}</strong>
+                  <span>{allResolved ? <strong style={{ color: "#4ade80" }}>Todos os conflitos foram resolvidos.</strong> : <span>{totalCount > 1 ? `${resolvedCount} de ${totalCount} conflitos resolvidos` : resolvedCount === 1 ? "1 de 1 conflito resolvido" : "1 arquivo precisa da sua decisão"}</span>}</span>
+                  {allResolved && <span className="git-conflict-resolved-pill" style={{ fontSize: 10 }}>Pronto para finalizar</span>}
                 </div>
                 <div className="git-conflict-progress-bar">
                   <div className="git-conflict-progress-fill" style={{ width: `${totalCount > 0 ? (resolvedCount / totalCount) * 100 : 0}%` }} />
                 </div>
               </div>
 
-              {/* Tabs dos arquivos com conflito */}
-              <div className="git-conflict-file-tabs">
-                {gitConflictFiles.map((f, idx) => {
-                  const fileName = f.path.split(/[/\\]/).pop() || f.path;
-                  const isSelected = idx === gitSelectedConflictIndex;
-                  const isResolved = f.status === "resolved";
-                  return (
-                    <button
-                      key={f.path}
-                      type="button"
-                      className={`git-conflict-file-tab ${isSelected ? "active" : ""} ${isResolved ? "resolved" : ""}`}
-                      onClick={() => setGitSelectedConflictIndex(idx)}
-                    >
-                      {isResolved ? <Check size={12} className="text-success" /> : <CircleAlert size={12} className="text-warning" />}
-                      <span className="git-conflict-tab-name" title={f.path}>{fileName}</span>
-                      {isResolved && <span className="git-conflict-resolved-pill">Resolvido</span>}
-                    </button>
-                  );
-                })}
-              </div>
+              {/* Tabs para múltiplos arquivos */}
+              {totalCount > 1 && (
+                <div className="git-conflict-file-tabs">
+                  {gitConflictFiles.map((f, idx) => {
+                    const fileName = f.path.split(/[/\\]/).pop() || f.path;
+                    const isSelected = idx === gitSelectedConflictIndex;
+                    const isResolved = f.status === "resolved";
+                    return (
+                      <button
+                        key={f.path}
+                        type="button"
+                        className={`git-conflict-file-tab ${isSelected ? "active" : ""} ${isResolved ? "resolved" : ""}`}
+                        onClick={() => setGitSelectedConflictIndex(idx)}
+                      >
+                        {isResolved ? <Check size={12} className="text-success" /> : <CircleAlert size={12} className="text-warning" />}
+                        <span className="git-conflict-tab-name" title={f.path}>{fileName}</span>
+                        {isResolved && <span className="git-conflict-resolved-pill">Resolvido</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
 
               {/* Detalhes do arquivo selecionado */}
               {currentConflict && (
@@ -10137,26 +11205,28 @@ function App() {
                     </span>
                     {currentConflict.status === "resolved" ? (
                       <span className="git-conflict-chosen-badge">
-                        <Check size={12} /> Resolução: <strong>{currentConflict.resolutionLabel || currentConflict.resolution}</strong>
+                        <Check size={12} /> {currentConflict.resolutionLabel || "Resolvido"}
                       </span>
                     ) : (
                       <span className="git-conflict-pending-badge">
-                        <AlertTriangle size={12} /> Aguardando sua escolha
+                        <AlertTriangle size={12} /> Decisão pendente
                       </span>
                     )}
                   </div>
 
-                  {/* Cards comparativos para o arquivo */}
+                  {/* Grid das Opções A (Minha versão) e B (Versão do GitHub) */}
                   <div className="git-conflict-cards-grid">
-                    {/* Card 1: Local */}
+                    {/* Card 1: Minhas alterações */}
                     <div className={`git-conflict-card ${currentConflict.resolution === "local" ? "chosen" : ""}`}>
                       <div className="git-conflict-card-head">
-                        <div className="git-conflict-card-tag local">LOCAL</div>
-                        <strong>Minhas alterações</strong>
+                        <div className="git-conflict-card-tag local">{prConflictContext ? prConflictContext.headBranch.toUpperCase() : "MINHA VERSÃO"}</div>
+                        <strong>{prConflictContext ? `Branch ${prConflictContext.headBranch}` : "Minhas alterações"}</strong>
                       </div>
-                      <span className="git-conflict-card-desc">Manter o código exatamente como está no seu computador.</span>
+                      <span className="git-conflict-card-desc">
+                        {prConflictContext ? `Manter o código da branch ${prConflictContext.headBranch}.` : "Preservar o que foi feito neste computador."}
+                      </span>
                       <div className="git-conflict-code-container">
-                        <pre className="git-conflict-code-box">{currentConflict.localContent || "(arquivo vazio ou novo localmente)"}</pre>
+                        <pre className="git-conflict-code-box">{currentConflict.localContent || "(arquivo vazio ou novo neste computador)"}</pre>
                       </div>
                       <button
                         type="button"
@@ -10164,17 +11234,19 @@ function App() {
                         disabled={gitConflictBusy}
                         onClick={() => void handleResolveConflictChoice("local")}
                       >
-                        {currentConflict.resolution === "local" ? <><Check size={14}/> Manter local (Selecionado)</> : "Manter local"}
+                        {currentConflict.resolution === "local" ? <><Check size={14}/> Manter minha versão (Selecionado)</> : "Manter minha versão"}
                       </button>
                     </div>
 
-                    {/* Card 2: GitHub */}
+                    {/* Card 2: Versão do GitHub */}
                     <div className={`git-conflict-card ${currentConflict.resolution === "github" ? "chosen" : ""}`}>
                       <div className="git-conflict-card-head">
-                        <div className="git-conflict-card-tag github">GITHUB</div>
-                        <strong>Versão do GitHub</strong>
+                        <div className="git-conflict-card-tag github">{prConflictContext ? prConflictContext.baseBranch.toUpperCase() : "VERSÃO DO GITHUB"}</div>
+                        <strong>{prConflictContext ? `Branch ${prConflictContext.baseBranch}` : "Versão do GitHub"}</strong>
                       </div>
-                      <span className="git-conflict-card-desc">Usar as alterações mais recentes vindas do GitHub.</span>
+                      <span className="git-conflict-card-desc">
+                        {prConflictContext ? `Usar as alterações da branch base (${prConflictContext.baseBranch}).` : "Usar as alterações mais recentes do GitHub."}
+                      </span>
                       <div className="git-conflict-code-container">
                         <pre className="git-conflict-code-box">{currentConflict.githubContent || "(arquivo vazio ou novo no GitHub)"}</pre>
                       </div>
@@ -10184,43 +11256,57 @@ function App() {
                         disabled={gitConflictBusy}
                         onClick={() => void handleResolveConflictChoice("github")}
                       >
-                        {currentConflict.resolution === "github" ? <><Check size={14}/> Usar GitHub (Selecionado)</> : "Usar GitHub"}
-                      </button>
-                    </div>
-
-                    {/* Card 3: Ambas (Combinar) */}
-                    <div className={`git-conflict-card ${currentConflict.resolution === "both" ? "chosen" : ""} ${currentConflict.canCombineSafely === false ? "disabled-card" : ""}`}>
-                      <div className="git-conflict-card-head">
-                        <div className="git-conflict-card-tag combined">COMBINADO</div>
-                        <strong>Manter ambas</strong>
-                      </div>
-                      <span className="git-conflict-card-desc">
-                        {currentConflict.canCombineSafely !== false
-                          ? "O NekoAI identificou que as alterações não se sobrepõem e podem ser combinadas automaticamente."
-                          : "As alterações modificam as mesmas linhas e não podem ser mescladas automaticamente com segurança."}
-                      </span>
-                      <div className="git-conflict-code-container">
-                        <pre className="git-conflict-code-box">
-                          {currentConflict.canCombineSafely !== false
-                            ? (currentConflict.combinedContent || "(combinando ambas as partes...)")
-                            : (currentConflict.combinedContent || "Conflito direto nas mesmas linhas.\nEscolha 'Manter local' ou 'Usar GitHub' acima.")}
-                        </pre>
-                      </div>
-                      <button
-                        type="button"
-                        className={`secondary git-conflict-pick-btn ${currentConflict.resolution === "both" ? "active" : ""}`}
-                        disabled={gitConflictBusy || currentConflict.canCombineSafely === false}
-                        onClick={() => void handleResolveConflictChoice("both")}
-                        title={currentConflict.canCombineSafely === false ? "Não é possível combinar automaticamente sem sobreposição de linhas." : undefined}
-                      >
-                        {currentConflict.resolution === "both" ? <><Check size={14}/> Manter ambas (Selecionado)</> : "Manter ambas"}
+                        {currentConflict.resolution === "github" ? <><Check size={14}/> Usar versão do GitHub (Selecionado)</> : "Usar versão do GitHub"}
                       </button>
                     </div>
                   </div>
+
+                  {/* Opção C: Combinar alterações */}
+                  {currentConflict.canCombineSafely !== false && currentConflict.combinedContent ? (
+                    <div className={`git-conflict-card combine-card ${currentConflict.resolution === "both" ? "chosen" : ""}`} style={{ marginTop: 4 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                        <div className="git-conflict-card-head">
+                          <div className="git-conflict-card-tag combined">COMBINAR</div>
+                          <strong>Combinar alterações</strong>
+                        </div>
+                        <button
+                          type="button"
+                          className={`primary git-conflict-pick-btn ${currentConflict.resolution === "both" ? "active" : ""}`}
+                          disabled={gitConflictBusy}
+                          style={{ width: "auto", padding: "4px 14px", height: 30 }}
+                          onClick={() => void handleResolveConflictChoice("both")}
+                        >
+                          {currentConflict.resolution === "both" ? <><Check size={14}/> Alterações combinadas (Selecionado)</> : "Confirmar combinação"}
+                        </button>
+                      </div>
+                      <span className="git-conflict-card-desc">
+                        O NekoAI conseguiu preservar as alterações dos dois lados.
+                      </span>
+                      <div className="git-conflict-code-container" style={{ maxHeight: 110 }}>
+                        <pre className="git-conflict-code-box">{currentConflict.combinedContent}</pre>
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{
+                      padding: "8px 12px",
+                      borderRadius: 8,
+                      background: "rgba(255, 255, 255, 0.02)",
+                      border: "1px solid rgba(255, 255, 255, 0.06)",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontSize: 11.5,
+                      color: "var(--foreground-muted)",
+                      marginTop: 2
+                    }}>
+                      <CircleAlert size={14} color="#a89bb6" />
+                      <span>As alterações modificam exatamente o mesmo trecho. Escolha <b>Manter minha versão</b> ou <b>Usar versão do GitHub</b> acima.</span>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {gitConflictError && <div className="auth-error" style={{ marginTop: 12 }}>{gitConflictError}</div>}
+              {gitConflictError && <div className="auth-error" style={{ marginTop: 10 }}>{gitConflictError}</div>}
             </div>
 
             <div className="modal-actions git-conflict-modal-actions">
@@ -10237,7 +11323,7 @@ function App() {
                 className="primary"
                 disabled={gitConflictBusy || !allResolved}
                 onClick={() => void handleFinalizeSync()}
-                title={!allResolved ? "Resolva todos os arquivos com conflito para finalizar" : undefined}
+                title={!allResolved ? "Resolva todos os conflitos para finalizar" : undefined}
               >
                 {gitConflictBusy ? <><Loader2 size={15} className="spin"/> Finalizando...</> : <><Check size={14}/> Finalizar sincronização</>}
               </button>

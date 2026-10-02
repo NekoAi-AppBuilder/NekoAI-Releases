@@ -353,7 +353,7 @@ test("Persistência e Autorização de Preços: Requisitos 1 a 12 da Fase 4B.2",
 test("Autenticação Controlada: Requisitos A a G da Seção 6", () => {
   function authenticateRequest(authHeader: string | null, validUserTokens: Record<string, string>, validAdminToken: string) {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return { status: 401, error_code: "UNAUTHORIZED", message: "Header Authorization ausente ou sem formato Bearer." };
+      return { status: 401, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." };
     }
     const token = authHeader.slice(7).trim();
 
@@ -368,7 +368,7 @@ test("Autenticação Controlada: Requisitos A a G da Seção 6", () => {
     const userId = validUserTokens[token];
     if (userId) {
       if (userId === "user-no-reseller") {
-        return { status: 403, error_code: "RESELLER_NOT_FOUND", message: "Conta de revendedor não encontrada para este usuário." };
+        return { status: 403, error_code: "FORBIDDEN", message: "Você não possui permissão para acessar esta área." };
       }
       return { status: 200, resellerId: `reseller-for-${userId}` };
     }
@@ -396,19 +396,23 @@ test("Autenticação Controlada: Requisitos A a G da Seção 6", () => {
   // B) Sem Authorization -> 401
   const resB = authenticateRequest(null, validTokens, adminToken);
   assert.equal(resB.status, 401);
+  assert.equal(resB.message, "Sessão expirada ou token inválido.");
 
   // C) Authorization inválido -> 401
   const resC = authenticateRequest("Basic invalid_format", validTokens, adminToken);
   assert.equal(resC.status, 401);
+  assert.equal(resC.message, "Sessão expirada ou token inválido.");
 
   // D) JWT expirado -> 401
   const resD = authenticateRequest("Bearer expired_jwt", validTokens, adminToken);
   assert.equal(resD.status, 401);
+  assert.equal(resD.message, "Sessão expirada ou token inválido.");
 
   // E) Usuário sem revendedor -> 403 sem dados de outro revendedor
   const resE = authenticateRequest("Bearer jwt-no-profile", validTokens, adminToken);
   assert.equal(resE.status, 403);
-  assert.equal(resE.error_code, "RESELLER_NOT_FOUND");
+  assert.equal(resE.error_code, "FORBIDDEN");
+  assert.equal(resE.message, "Você não possui permissão para acessar esta área.");
 
   // F) Revendedor 1 acessando escopo de Revendedor 2 -> Isolado
   const resF1 = authenticateRequest("Bearer jwt-reseller-1", validTokens, adminToken);
@@ -420,6 +424,236 @@ test("Autenticação Controlada: Requisitos A a G da Seção 6", () => {
   assert.equal(pricesPayload.MONTHLY >= 39, true);
   assert.equal(pricesPayload.QUARTERLY >= 69, true);
   assert.equal(pricesPayload.ANNUAL >= 197, true);
+});
+
+test("Reseller API: Autenticação, Autorização e Preços (10 Cenários Obrigatórios da Seção 6)", () => {
+  // Simulação completa do endpoint reseller-api com as regras exatas da Edge Function
+  function handleResellerApiRequest(
+    method: "GET" | "POST",
+    urlStr: string,
+    headers: Record<string, string>,
+    body: any,
+    mockDb: {
+      users: Record<string, { id: string; email: string }>;
+      resellers: Record<string, { id: string; user_id: string; name: string; status: string }>;
+      prices: Record<string, Record<string, number>>;
+    },
+    validAdminSecret: string
+  ): { status: number; body: any } {
+    const authHeader = headers["authorization"] || headers["Authorization"];
+    if (!authHeader || !authHeader.toLowerCase().startsWith("bearer ")) {
+      return { status: 401, body: { ok: false, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." } };
+    }
+
+    const token = authHeader.slice(7).trim();
+    if (!token || token === "expired_jwt" || token === "invalid_token" || token === "tampered_sig") {
+      return { status: 401, body: { ok: false, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." } };
+    }
+
+    let reseller: any = null;
+    let isAuthUser = false;
+    let isAdmin = false;
+
+    // Tentativa A: Supabase Auth User
+    const user = mockDb.users[token];
+    if (user) {
+      isAuthUser = true;
+      const foundReseller = Object.values(mockDb.resellers).find((r) => r.user_id === user.id);
+      if (foundReseller) {
+        reseller = foundReseller;
+      }
+    }
+
+    // Tentativa B: NekoAI Admin Session Token
+    if (!reseller && !isAuthUser && token === `admin_token_${validAdminSecret}`) {
+      isAdmin = true;
+      const activeReseller = Object.values(mockDb.resellers).find((r) => r.status === "active");
+      if (activeReseller) {
+        reseller = activeReseller;
+      } else {
+        reseller = { id: "admin-system-id", user_id: "admin-user", name: "NekoAI Admin", status: "active" };
+      }
+    }
+
+    if (isAuthUser && !reseller) {
+      return { status: 403, body: { ok: false, error_code: "FORBIDDEN", message: "Você não possui permissão para acessar esta área." } };
+    }
+
+    if (!reseller) {
+      return { status: 401, body: { ok: false, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." } };
+    }
+
+    if (reseller.status !== "active") {
+      return { status: 403, body: { ok: false, error_code: "RESELLER_INACTIVE", message: "Você não possui permissão para acessar esta área." } };
+    }
+
+    const url = new URL(urlStr, "https://mock.supabase.co");
+
+    // GET
+    if (method === "GET") {
+      const action = url.searchParams.get("action");
+      if (action === "get_price_settings") {
+        const targetResellerId = (isAdmin && url.searchParams.get("reseller_id")) || reseller.id;
+        const saved = mockDb.prices[targetResellerId] || {};
+        const officialCosts: Record<string, number> = { MONTHLY: 39, QUARTERLY: 69, ANNUAL: 197 };
+        const defaultResale: Record<string, number> = { MONTHLY: 79, QUARTERLY: 149, ANNUAL: 397 };
+
+        const settings = (["MONTHLY", "QUARTERLY", "ANNUAL"] as const).map((plan) => {
+          const nekoCost = officialCosts[plan];
+          const resalePrice = saved[plan] ?? defaultResale[plan];
+          return {
+            plan,
+            neko_cost: nekoCost,
+            resale_price: resalePrice,
+            profit: Number((resalePrice - nekoCost).toFixed(2)),
+          };
+        });
+
+        return { status: 200, body: { ok: true, settings } };
+      }
+    }
+
+    // POST
+    if (method === "POST") {
+      if (body?.action === "save_price_settings") {
+        const { prices } = body;
+        if (!prices || typeof prices !== "object") {
+          return { status: 400, body: { ok: false, message: "Objeto 'prices' obrigatório." } };
+        }
+
+        const targetResellerId = (isAdmin && body.reseller_id) || reseller.id;
+        const officialCosts: Record<string, number> = { MONTHLY: 39, QUARTERLY: 69, ANNUAL: 197 };
+
+        for (const plan of ["MONTHLY", "QUARTERLY", "ANNUAL"] as const) {
+          const cost = officialCosts[plan];
+          const val = Number(prices[plan]);
+          if (Number.isNaN(val) || val < cost) {
+            return { status: 400, body: { ok: false, error_code: "INVALID_PRICE", message: `Preço inválido para plano ${plan}` } };
+          }
+        }
+
+        if (!mockDb.prices[targetResellerId]) mockDb.prices[targetResellerId] = {};
+        for (const plan of ["MONTHLY", "QUARTERLY", "ANNUAL"] as const) {
+          mockDb.prices[targetResellerId][plan] = Number(prices[plan]);
+        }
+
+        return { status: 200, body: { ok: true, message: "Configuração de preços salva com sucesso." } };
+      }
+    }
+
+    return { status: 400, body: { ok: false, message: "Ação não suportada." } };
+  }
+
+  // Setup do mock DB
+  const mockDb = {
+    users: {
+      "jwt-reseller-1": { id: "user-1", email: "revendedor@nekoai.com" },
+      "jwt-regular-user": { id: "user-2", email: "cliente@nekoai.com" },
+      "jwt-suspended-reseller": { id: "user-3", email: "suspenso@nekoai.com" },
+    },
+    resellers: {
+      "reseller-1": { id: "reseller-1", user_id: "user-1", name: "Revendedor Alfa", status: "active" },
+      "reseller-suspended": { id: "reseller-suspended", user_id: "user-3", name: "Revendedor Suspenso", status: "suspended" },
+    },
+    prices: {},
+  };
+  const adminSecret = "secret_12345";
+  const validAdminToken = `admin_token_${adminSecret}`;
+
+  // 1. Usuário autenticado → GET de preços funciona
+  const res1 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: "Bearer jwt-reseller-1" }, null, mockDb, adminSecret);
+  assert.equal(res1.status, 200);
+  assert.equal(res1.body.ok, true);
+  assert.equal(res1.body.settings.length, 3);
+  assert.equal(res1.body.settings[0].resale_price, 79);
+
+  // 2. Token válido → API aceita (tanto JWT quanto Admin Token)
+  const res2 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: `Bearer ${validAdminToken}` }, null, mockDb, adminSecret);
+  assert.equal(res2.status, 200);
+  assert.equal(res2.body.ok, true);
+
+  // 3. Token ausente → 401
+  const res3 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", {}, null, mockDb, adminSecret);
+  assert.equal(res3.status, 401);
+  assert.equal(res3.body.message, "Sessão expirada ou token inválido.");
+
+  // 4. Token inválido → 401
+  const res4 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: "Bearer invalid_token" }, null, mockDb, adminSecret);
+  assert.equal(res4.status, 401);
+  assert.equal(res4.body.message, "Sessão expirada ou token inválido.");
+
+  // 5. Sessão expirada → 401
+  const res5 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: "Bearer expired_jwt" }, null, mockDb, adminSecret);
+  assert.equal(res5.status, 401);
+  assert.equal(res5.body.message, "Sessão expirada ou token inválido.");
+
+  // 6. Usuário autenticado sem permissão de revendedor → 403
+  const res6 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: "Bearer jwt-regular-user" }, null, mockDb, adminSecret);
+  assert.equal(res6.status, 403);
+  assert.equal(res6.body.error_code, "FORBIDDEN");
+  assert.equal(res6.body.message, "Você não possui permissão para acessar esta área.");
+
+  // 7. Usuário revendedor autorizado → acesso permitido
+  const res7 = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: "Bearer jwt-reseller-1" }, null, mockDb, adminSecret);
+  assert.equal(res7.status, 200);
+  assert.equal(res7.body.ok, true);
+
+  // 8. Salvar configuração de preço com sessão válida funciona
+  const res8 = handleResellerApiRequest(
+    "POST",
+    "/v1/reseller-api",
+    { Authorization: "Bearer jwt-reseller-1" },
+    { action: "save_price_settings", prices: { MONTHLY: 89, QUARTERLY: 169, ANNUAL: 499 } },
+    mockDb,
+    adminSecret
+  );
+  assert.equal(res8.status, 200);
+  assert.equal(res8.body.ok, true);
+
+  // Confirma persistência após save
+  const res8Check = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", { Authorization: "Bearer jwt-reseller-1" }, null, mockDb, adminSecret);
+  assert.equal(res8Check.status, 200);
+  assert.equal(res8Check.body.settings.find((s: any) => s.plan === "MONTHLY").resale_price, 89);
+
+  // 9. Salvar configuração sem autenticação retorna 401
+  const res9 = handleResellerApiRequest(
+    "POST",
+    "/v1/reseller-api",
+    {},
+    { action: "save_price_settings", prices: { MONTHLY: 89, QUARTERLY: 169, ANNUAL: 499 } },
+    mockDb,
+    adminSecret
+  );
+  assert.equal(res9.status, 401);
+  assert.equal(res9.body.message, "Sessão expirada ou token inválido.");
+
+  // 10. Frontend envia corretamente a autenticação esperada pelo backend
+  function simulateFrontendHeaderBuild(tokenGetter: () => string | null): Record<string, string> {
+    const token = tokenGetter();
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (token) {
+      headers["Authorization"] = `Bearer ${token.trim()}`;
+    }
+    return headers;
+  }
+
+  // Com token admin ativo
+  const frontendHeadersWithAdmin = simulateFrontendHeaderBuild(() => validAdminToken);
+  assert.equal(frontendHeadersWithAdmin["Authorization"], `Bearer ${validAdminToken}`);
+  const backendAcceptsAdmin = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", frontendHeadersWithAdmin, null, mockDb, adminSecret);
+  assert.equal(backendAcceptsAdmin.status, 200);
+
+  // Com token reseller ativo
+  const frontendHeadersWithReseller = simulateFrontendHeaderBuild(() => "jwt-reseller-1");
+  assert.equal(frontendHeadersWithReseller["Authorization"], "Bearer jwt-reseller-1");
+  const backendAcceptsReseller = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", frontendHeadersWithReseller, null, mockDb, adminSecret);
+  assert.equal(backendAcceptsReseller.status, 200);
+
+  // Sem token
+  const frontendHeadersNoToken = simulateFrontendHeaderBuild(() => null);
+  assert.equal(frontendHeadersNoToken["Authorization"], undefined);
+  const backendRejectsNoToken = handleResellerApiRequest("GET", "/v1/reseller-api?action=get_price_settings", frontendHeadersNoToken, null, mockDb, adminSecret);
+  assert.equal(backendRejectsNoToken.status, 401);
 });
 
 

@@ -970,9 +970,10 @@ export function parseConflictMarkers(content: string): {
   let hasMarkers = false;
 
   let inConflict = false;
-  let inTheirs = false;
-  let currentOurs: string[] = [];
-  let currentTheirs: string[] = [];
+  let inSecondPart = false;
+  let currentTop: string[] = [];
+  let currentBottom: string[] = [];
+  let topIsGithub = false;
   let startLine = 1;
 
   const localLinesAll: string[] = [];
@@ -983,33 +984,45 @@ export function parseConflictMarkers(content: string): {
     if (line.startsWith("<<<<<<<")) {
       hasMarkers = true;
       inConflict = true;
-      inTheirs = false;
-      currentOurs = [];
-      currentTheirs = [];
+      inSecondPart = false;
+      currentTop = [];
+      currentBottom = [];
       startLine = i + 1;
+      topIsGithub = line.toLowerCase().includes("updated upstream");
     } else if (line.startsWith("=======") && inConflict) {
-      inTheirs = true;
+      inSecondPart = true;
     } else if (line.startsWith(">>>>>>>") && inConflict) {
       inConflict = false;
       const hunkId = `hunk-${hunks.length + 1}`;
-      // In git conflict markers: HEAD (ours) is first, incoming (theirs) is second
-      const oursChunk = currentOurs.join("\n");
-      const theirsChunk = currentTheirs.join("\n");
+      if (line.toLowerCase().includes("stashed changes")) {
+        topIsGithub = true;
+      }
+
+      const topChunk = currentTop.join("\n");
+      const bottomChunk = currentBottom.join("\n");
+
+      const localChunk = topIsGithub ? bottomChunk : topChunk;
+      const githubChunk = topIsGithub ? topChunk : bottomChunk;
 
       hunks.push({
         id: hunkId,
-        localContent: oursChunk,
-        githubContent: theirsChunk,
+        localContent: localChunk,
+        githubContent: githubChunk,
         startLine
       });
 
-      localLinesAll.push(...currentOurs);
-      githubLinesAll.push(...currentTheirs);
-    } else if (inConflict) {
-      if (inTheirs) {
-        currentTheirs.push(line);
+      if (topIsGithub) {
+        githubLinesAll.push(...currentTop);
+        localLinesAll.push(...currentBottom);
       } else {
-        currentOurs.push(line);
+        localLinesAll.push(...currentTop);
+        githubLinesAll.push(...currentBottom);
+      }
+    } else if (inConflict) {
+      if (inSecondPart) {
+        currentBottom.push(line);
+      } else {
+        currentTop.push(line);
       }
     } else {
       localLinesAll.push(line);
@@ -1055,18 +1068,29 @@ export async function getConflictFiles(
   }
 
   const conflicts: GitConflictFile[] = [];
+  const isMerge = fs.existsSync(path.join(projectPath, ".git", "MERGE_HEAD"));
 
   for (const relPath of fileList) {
     // Stage 1: Base/Ancestor
     const baseRes = await runner(projectPath, ["show", `:1:${relPath}`], {}, 5000).catch(() => ({ code: 1, stdout: "", stderr: "" }));
-    // Stage 2: Ours (HEAD -> Remote after ff pull)
+    // Stage 2: Ours
     const stage2Res = await runner(projectPath, ["show", `:2:${relPath}`], {}, 5000).catch(() => ({ code: 1, stdout: "", stderr: "" }));
-    // Stage 3: Theirs (Stash -> Local)
+    // Stage 3: Theirs
     const stage3Res = await runner(projectPath, ["show", `:3:${relPath}`], {}, 5000).catch(() => ({ code: 1, stdout: "", stderr: "" }));
 
-    let localContent = stage3Res.code === 0 ? stage3Res.stdout : "";
-    let githubContent = stage2Res.code === 0 ? stage2Res.stdout : "";
+    let localContent = "";
+    let githubContent = "";
     const baseContent = baseRes.code === 0 ? baseRes.stdout : "";
+
+    if (isMerge) {
+      // In a git merge (commit vs commit): Stage 2 is HEAD (Local), Stage 3 is Remote (GitHub)
+      localContent = stage2Res.code === 0 ? stage2Res.stdout : "";
+      githubContent = stage3Res.code === 0 ? stage3Res.stdout : "";
+    } else {
+      // In a stash apply (uncommitted local vs remote ff): Stage 2 is HEAD (GitHub), Stage 3 is Stash (Local)
+      localContent = stage3Res.code === 0 ? stage3Res.stdout : "";
+      githubContent = stage2Res.code === 0 ? stage2Res.stdout : "";
+    }
 
     // Fallback: If stages are not populated, check file on disk for conflict markers
     if (stage2Res.code !== 0 && stage3Res.code !== 0) {
@@ -1082,7 +1106,7 @@ export async function getConflictFiles(
       } catch {}
     }
 
-    const smart = trySmartCombine(baseContent, localContent, githubContent);
+    const smart = trySmartCombine(localContent, githubContent, baseContent);
 
     conflicts.push({
       path: relPath,
@@ -1281,12 +1305,15 @@ export async function resolveConflictFile(
   let contentToWrite = customContent;
 
   if (contentToWrite === undefined) {
+    const isMerge = fs.existsSync(path.join(projectPath, ".git", "MERGE_HEAD"));
     if (resolution === "local") {
-      const stage3 = await runner(projectPath, ["show", `:3:${normRelPath}`], {}, 5000);
-      if (stage3.code === 0) contentToWrite = stage3.stdout;
+      const stage = isMerge ? ":2:" : ":3:";
+      const stageRes = await runner(projectPath, ["show", `${stage}${normRelPath}`], {}, 5000);
+      if (stageRes.code === 0) contentToWrite = stageRes.stdout;
     } else if (resolution === "github") {
-      const stage2 = await runner(projectPath, ["show", `:2:${normRelPath}`], {}, 5000);
-      if (stage2.code === 0) contentToWrite = stage2.stdout;
+      const stage = isMerge ? ":3:" : ":2:";
+      const stageRes = await runner(projectPath, ["show", `${stage}${normRelPath}`], {}, 5000);
+      if (stageRes.code === 0) contentToWrite = stageRes.stdout;
     }
   }
 
@@ -1366,3 +1393,148 @@ export async function finalizeConflictResolution(
     syncStatus
   };
 }
+
+export interface ConflictRefreshResult {
+  ok: boolean;
+  hasConflicts: boolean;
+  conflictFiles: GitConflictFile[];
+  remoteUpdated: boolean;
+  message?: string;
+  syncStatus?: GitSyncStatus;
+}
+
+/**
+ * Verifica se o estado remoto do GitHub avançou enquanto um conflito estava pausado.
+ * Se o remoto mudou:
+ *  - Atualiza os stages de forma segura sem git reset --hard, git clean ou force push;
+ *  - Preserva 100% o commit local;
+ *  - Recalcula base, local, github, canCombineSafely e combinedContent.
+ * Se o remoto não mudou:
+ *  - Mantém o snapshot atual sem alterações.
+ */
+export async function checkAndRefreshConflicts(
+  projectPath: string,
+  options: SyncCombineOptions = {}
+): Promise<ConflictRefreshResult> {
+  const runner = options.gitRunner || createDefaultGitRunner();
+  const mergeHeadFile = path.join(projectPath, ".git", "MERGE_HEAD");
+  const hasMergeHead = fs.existsSync(mergeHeadFile);
+
+  // 1. Se não houver merge pausado com MERGE_HEAD ativo
+  if (!hasMergeHead) {
+    const existingConflicts = await getConflictFiles(projectPath, runner);
+    return {
+      ok: true,
+      hasConflicts: existingConflicts.length > 0,
+      conflictFiles: existingConflicts,
+      remoteUpdated: false
+    };
+  }
+
+  // 2. Lê o commit gravado em MERGE_HEAD
+  let previousMergeHeadCommit = "";
+  try {
+    const rawMergeHead = await fs.promises.readFile(mergeHeadFile, "utf8");
+    previousMergeHeadCommit = rawMergeHead.trim().split(/\s+/)[0];
+  } catch {}
+
+  // 3. Determina a branch atual
+  const branchRes = await runner(projectPath, ["rev-parse", "--abbrev-ref", "HEAD"], {}, 5000, options.signal);
+  const branch = (branchRes.stdout || "").trim();
+  if (!branch || branch === "HEAD") {
+    const existingConflicts = await getConflictFiles(projectPath, runner);
+    return {
+      ok: true,
+      hasConflicts: existingConflicts.length > 0,
+      conflictFiles: existingConflicts,
+      remoteUpdated: false
+    };
+  }
+
+  // 4. Executa fetch da branch remota para verificar se avançou
+  let fetchOk = false;
+  try {
+    let fetchRes: GitRunnerResult;
+    if (options.token && options.authenticatedGitRunner) {
+      fetchRes = await options.authenticatedGitRunner(projectPath, ["fetch", "origin", branch], options.token, 25000, options.signal);
+    } else {
+      fetchRes = await runner(projectPath, ["fetch", "origin", branch], {}, 25000, options.signal);
+    }
+    fetchOk = fetchRes.code === 0;
+  } catch {
+    fetchOk = false;
+  }
+
+  if (!fetchOk) {
+    const existingConflicts = await getConflictFiles(projectPath, runner);
+    return {
+      ok: true,
+      hasConflicts: existingConflicts.length > 0,
+      conflictFiles: existingConflicts,
+      remoteUpdated: false
+    };
+  }
+
+  // 5. Obtém o commit mais recente do remoto
+  const remoteCommitRes = await runner(projectPath, ["rev-parse", `origin/${branch}`], {}, 5000, options.signal);
+  const latestRemoteCommit = (remoteCommitRes.stdout || "").trim();
+
+  // 6. Se o commit remoto não mudou, o snapshot atual permanece intacto
+  if (!latestRemoteCommit || latestRemoteCommit === previousMergeHeadCommit) {
+    const existingConflicts = await getConflictFiles(projectPath, runner);
+    return {
+      ok: true,
+      hasConflicts: existingConflicts.length > 0,
+      conflictFiles: existingConflicts,
+      remoteUpdated: false
+    };
+  }
+
+  // 7. O remoto avançou! Reinicia a tentativa de merge com segurança:
+  // a) Desfaz a tentativa de merge anterior (preservando o commit local HEAD)
+  const abortRes = await runner(projectPath, ["merge", "--abort"], {}, 15000, options.signal);
+  if (abortRes.code !== 0) {
+    const existingConflicts = await getConflictFiles(projectPath, runner);
+    return {
+      ok: true,
+      hasConflicts: existingConflicts.length > 0,
+      conflictFiles: existingConflicts,
+      remoteUpdated: false
+    };
+  }
+
+  // b) Tenta o merge com a versão mais recente de origin/${branch}
+  const newMergeRes = await runner(
+    projectPath,
+    ["merge", `origin/${branch}`, "--no-edit", "-m", `NekoAI: sincronização com origin/${branch}`],
+    {},
+    35000,
+    options.signal
+  );
+
+  if (newMergeRes.code !== 0) {
+    // Merge resultou em conflitos contra o novo remoto: recalcula tudo
+    const updatedConflicts = await getConflictFiles(projectPath, runner);
+    const updatedStatus = await checkGitSyncStatus(projectPath, { fetch: false, gitRunner: runner, signal: options.signal });
+    return {
+      ok: true,
+      hasConflicts: updatedConflicts.length > 0,
+      conflictFiles: updatedConflicts,
+      remoteUpdated: true,
+      message: "Há uma atualização mais recente no GitHub. O conflito foi atualizado.",
+      syncStatus: updatedStatus
+    };
+  }
+
+  // Se o novo merge não gerou conflitos (resolveu de forma limpa)
+  const finalStatus = await checkGitSyncStatus(projectPath, { fetch: false, gitRunner: runner, signal: options.signal });
+  return {
+    ok: true,
+    hasConflicts: false,
+    conflictFiles: [],
+    remoteUpdated: true,
+    message: "As novas alterações do GitHub foram combinadas com sucesso.",
+    syncStatus: finalStatus
+  };
+}
+

@@ -128,20 +128,27 @@ Deno.serve(async (req: Request) => {
   // 1. Validação de Autenticação (Supabase Auth User JWT ou NekoAI Admin Token)
   const authHeader = req.headers.get("authorization") || req.headers.get("Authorization");
   if (!authHeader || !authHeader.toLowerCase().startsWith("bearer ")) {
-    return json({ ok: false, error_code: "UNAUTHORIZED", message: "Header Authorization ausente ou sem formato Bearer." }, 401);
+    return json({ ok: false, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." }, 401);
   }
 
   const token = authHeader.slice(7).trim();
+  if (!token) {
+    return json({ ok: false, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." }, 401);
+  }
+
   let reseller: { id: string; name: string; email: string; phone?: string | null; status: string } | null = null;
+  let isAuthUser = false;
+  let isAdmin = false;
 
   // Tentativa A: Supabase Auth User JWT
   const { data: { user }, error: authErr } = await supabaseAdmin.auth.getUser(token);
   if (user && !authErr) {
+    isAuthUser = true;
     const { data: foundReseller } = await supabaseAdmin
       .from("resellers")
       .select("id, name, email, phone, status")
       .eq("user_id", user.id)
-      .single();
+      .maybeSingle();
 
     if (foundReseller) {
       reseller = foundReseller;
@@ -149,9 +156,10 @@ Deno.serve(async (req: Request) => {
   }
 
   // Tentativa B: NekoAI Admin Session Token (Admin logado via secret key)
-  if (!reseller && adminSecret) {
+  if (!reseller && !isAuthUser && adminSecret) {
     const adminCheck = await verifyAdminToken(authHeader, adminSecret.trim());
     if (adminCheck.valid) {
+      isAdmin = true;
       const { data: activeReseller } = await supabaseAdmin
         .from("resellers")
         .select("id, name, email, phone, status")
@@ -162,17 +170,42 @@ Deno.serve(async (req: Request) => {
 
       if (activeReseller) {
         reseller = activeReseller;
+      } else {
+        const { data: anyReseller } = await supabaseAdmin
+          .from("resellers")
+          .select("id, name, email, phone, status")
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (anyReseller) {
+          reseller = anyReseller;
+        } else {
+          // Perfil de sistema administrativo para acesso à plataforma
+          reseller = {
+            id: "00000000-0000-0000-0000-000000000000",
+            name: "NekoAI Admin",
+            email: "admin@nekoai.com",
+            status: "active",
+          };
+        }
       }
     }
   }
 
+  // Se o usuário foi autenticado pelo Supabase Auth mas não possui perfil de revendedor -> 403
+  if (isAuthUser && !reseller) {
+    return json({ ok: false, error_code: "FORBIDDEN", message: "Você não possui permissão para acessar esta área." }, 403);
+  }
+
+  // Se não foi autenticado nem como usuário nem como admin -> 401
   if (!reseller) {
     console.warn(`[reseller-api] Autenticação rejeitada para IP ${extractIp(req)}: Nenhuma sessão válida de revendedor ou admin identificada.`);
     return json({ ok: false, error_code: "UNAUTHORIZED", message: "Sessão expirada ou token inválido." }, 401);
   }
 
   if (reseller.status !== "active") {
-    return json({ ok: false, error_code: "RESELLER_INACTIVE", message: "Sua conta de revendedor está suspensa ou inativa." }, 403);
+    return json({ ok: false, error_code: "RESELLER_INACTIVE", message: "Você não possui permissão para acessar esta área." }, 403);
   }
 
   const url = new URL(req.url);
@@ -210,10 +243,15 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "get_price_settings") {
-      const { data: settings } = await supabaseAdmin
-        .from("reseller_price_settings")
-        .select("plan, neko_cost, resale_price")
-        .eq("reseller_id", reseller.id);
+      const targetResellerId = (isAdmin && url.searchParams.get("reseller_id")) || reseller.id;
+      let settings: any[] | null = null;
+      if (targetResellerId && targetResellerId !== "00000000-0000-0000-0000-000000000000") {
+        const { data } = await supabaseAdmin
+          .from("reseller_price_settings")
+          .select("plan, neko_cost, resale_price")
+          .eq("reseller_id", targetResellerId);
+        settings = data;
+      }
 
       const existingMap: Record<string, number> = {};
       if (settings) {
@@ -410,6 +448,43 @@ Deno.serve(async (req: Request) => {
         return json({ ok: false, message: "Objeto 'prices' obrigatório." }, 400);
       }
 
+      let targetResellerId = (isAdmin && body.reseller_id) || reseller.id;
+
+      // Se for Admin e o targetResellerId for o ID sintético (00000000-0000-0000-0000-000000000000),
+      // assegura a existência de um registro em resellers no banco para satisfazer a foreign key
+      if (isAdmin && targetResellerId === "00000000-0000-0000-0000-000000000000") {
+        try {
+          const { data: usersData } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1 });
+          let targetUserId = usersData?.users?.[0]?.id;
+          if (!targetUserId) {
+            const { data: newUser } = await supabaseAdmin.auth.admin.createUser({
+              email: "admin@nekoai.com",
+              email_confirm: true,
+            });
+            targetUserId = newUser?.user?.id;
+          }
+          if (targetUserId) {
+            const { data: createdReseller } = await supabaseAdmin
+              .from("resellers")
+              .insert({
+                user_id: targetUserId,
+                name: "NekoAI Admin",
+                email: "admin@nekoai.com",
+                status: "active",
+              })
+              .select("id, name, email, phone, status")
+              .maybeSingle();
+
+            if (createdReseller) {
+              targetResellerId = createdReseller.id;
+              reseller = createdReseller;
+            }
+          }
+        } catch (bootstrapErr) {
+          console.warn("[reseller-api] Aviso ao assegurar perfil de revendedor para admin:", bootstrapErr);
+        }
+      }
+
       const upsertRows = [];
       const updatedSettings = [];
 
@@ -427,7 +502,7 @@ Deno.serve(async (req: Request) => {
         }
 
         upsertRows.push({
-          reseller_id: reseller.id,
+          reseller_id: targetResellerId,
           plan,
           neko_cost: officialNekoCost,
           resale_price: resalePrice,

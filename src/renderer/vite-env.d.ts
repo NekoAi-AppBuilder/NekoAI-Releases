@@ -75,6 +75,8 @@ interface Window {
     githubCloneProject(repoFullName: string, parentPath?: string, projectName?: string): Promise<any>;
     githubPublishProject(repoName: string, isPrivate?: boolean): Promise<any>;
     githubCancelPublish?(): Promise<any>;
+    githubCommit?(message: string, files?: string[]): Promise<any>;
+    githubPush?(): Promise<any>;
     githubCommitPush(message: string, files?: string[]): Promise<any>;
     githubAutoCommitTask?(payload?: { projectPath?: string; taskId?: string; message?: string } | string, legacyMessage?: string): Promise<{ ok: boolean; committed?: boolean; pushed?: boolean; status?: any; message?: string; skipped?: boolean; reason?: string }>;
     githubGetAutoCommit?(projectPath?: string): Promise<boolean>;
@@ -90,6 +92,7 @@ interface Window {
     githubResolveConflict?(payload: { projectPath?: string; filePath: string; resolution: "local" | "github" | "both"; customContent?: string }): Promise<any>;
     githubFinalizeSync?(payload?: { projectPath?: string; message?: string }): Promise<any>;
     githubGetConflictDetails?(projectPath?: string): Promise<any[]>;
+    githubCheckAndRefreshConflicts?(projectPath?: string): Promise<{ ok: boolean; hasConflicts: boolean; conflictFiles: any[]; remoteUpdated: boolean; message?: string }>;
     githubCheckRepoAccess?(repoFullName: string): Promise<{ accessible: boolean; status: number }>;
     supabaseGetState(): Promise<any>;
     supabaseConnectWithToken(token: string): Promise<any>;
