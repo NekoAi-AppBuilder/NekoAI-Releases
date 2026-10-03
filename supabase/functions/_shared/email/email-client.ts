@@ -8,6 +8,12 @@ import {
   generateLicenseEmailPlainText,
 } from "./license-email-template.ts";
 
+import {
+  generateRecoveryEmailSubject,
+  generateRecoveryEmailHtml,
+  generateRecoveryEmailPlainText
+} from "./reseller-recovery-template.ts";
+
 export interface SendEmailResult {
   ok: boolean;
   email_id?: string;
@@ -117,6 +123,68 @@ export class EmailClient {
         ok: false,
         error_code: "NETWORK_ERROR",
         message: err.message || "Falha de rede ao conectar com o serviço de e-mail.",
+      };
+    }
+  }
+
+  /**
+   * Envia o e-mail transacional de redefinição de acesso (revendedores).
+   */
+  public async sendRecoveryEmail(email: string, recoveryLink: string): Promise<SendEmailResult> {
+    if (!email || !email.includes("@")) {
+      return { ok: false, error_code: "INVALID_EMAIL", message: "Endereço de e-mail inválido." };
+    }
+
+    const apiKey = this.resendApiKey || Deno.env.get("RESEND_API_KEY");
+    if (!apiKey) {
+      return { ok: false, error_code: "RESEND_KEY_MISSING", message: "Serviço de e-mail não configurado." };
+    }
+
+    // Os templates de email de recuperaÃ§Ã£o jÃ¡ foram importados de forma estÃ¡tica no topo do ficheiro.
+
+    const data = { email, recoveryLink };
+    const subject = generateRecoveryEmailSubject();
+    const html = generateRecoveryEmailHtml(data);
+    const text = generateRecoveryEmailPlainText(data);
+
+    try {
+      const response = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: Deno.env.get("RESELLER_EMAIL_FROM") || "NekoAI <revenda@lovinfinity.com.br>",
+          to: [email.trim().toLowerCase()],
+          subject,
+          html,
+          text,
+        }),
+      });
+
+      const responseBody = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        console.error(`[EmailClient] Erro na API do Resend:`, responseBody);
+        return {
+          ok: false,
+          error_code: "RESEND_API_ERROR",
+          message: responseBody.message || "Erro ao enviar e-mail.",
+        };
+      }
+
+      return {
+        ok: true,
+        email_id: responseBody.id,
+        message: "E-mail de acesso enviado com sucesso.",
+      };
+    } catch (err: any) {
+      console.error("[EmailClient] Falha de rede ao enviar e-mail:", err);
+      return {
+        ok: false,
+        error_code: "NETWORK_ERROR",
+        message: "Falha de rede ao conectar com o provedor de e-mail.",
       };
     }
   }
