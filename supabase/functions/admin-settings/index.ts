@@ -140,9 +140,13 @@ Deno.serve(async (req: Request) => {
       let pricing = { ...DEFAULT_PRICING_SETTINGS };
 
       try {
-        const { data: dbSettings } = await supabaseAdmin
+        const { data: dbSettings, error: selectErr } = await supabaseAdmin
           .from("admin_settings")
           .select("key, value");
+
+        if (selectErr) {
+          console.warn("[admin-settings] Falha ao recuperar configuracoes:", selectErr.message);
+        }
 
         if (dbSettings && Array.isArray(dbSettings)) {
           dbSettings.forEach((item: { key: string; value: any }) => {
@@ -224,7 +228,7 @@ Deno.serve(async (req: Request) => {
           reseller_email_from: String(payload.reseller_email_from || DEFAULT_GENERAL_SETTINGS.reseller_email_from).trim(),
         };
 
-        const { error: dbErr } = await supabaseAdmin
+        const { data: dbData, error: dbErr } = await supabaseAdmin
           .from("admin_settings")
           .upsert({
             key: "general",
@@ -232,7 +236,7 @@ Deno.serve(async (req: Request) => {
             description: "Configurações operacionais e remetentes de e-mail transacional",
             updated_at: new Date().toISOString(),
             updated_by: "admin",
-          });
+          }).select("value").single();
         if (dbErr) {
           console.warn("[admin-settings] Falha no banco de dados:", dbErr.message);
           return json({ ok: false, message: `Erro ao salvar configuraÃ§Ãµes operacionais: ${dbErr.message}` }, 500);
@@ -240,7 +244,7 @@ Deno.serve(async (req: Request) => {
         return json({
           ok: true,
           message: "Configurações gerais atualizadas com sucesso.",
-          general: updatedGeneral,
+          general: dbData ? dbData.value : updatedGeneral,
         });
       }
 
@@ -279,7 +283,7 @@ Deno.serve(async (req: Request) => {
 
         const updatedPricing = { plans: validatedPlans };
 
-        const { error: dbErr } = await supabaseAdmin
+        const { data: dbDataPrice, error: dbErr } = await supabaseAdmin
           .from("admin_settings")
           .upsert({
             key: "pricing",
@@ -287,7 +291,7 @@ Deno.serve(async (req: Request) => {
             description: "Tabela oficial de custos base NekoAI e preÃ§os sugeridos de revenda",
             updated_at: new Date().toISOString(),
             updated_by: "admin",
-          });
+          }).select("value").single();
         if (dbErr) {
           console.warn("[admin-settings] Falha no banco de dados:", dbErr.message);
           return json({ ok: false, message: `Erro ao salvar preÃ§os: ${dbErr.message}` }, 500);
@@ -295,7 +299,7 @@ Deno.serve(async (req: Request) => {
         return json({
           ok: true,
           message: "Tabela de preços atualizada com sucesso.",
-          pricing: updatedPricing,
+          pricing: dbDataPrice ? dbDataPrice.value : updatedPricing,
         });
       }
 
