@@ -39,6 +39,114 @@ export function getPlanCommercialName(plan: string): string {
   return PLAN_COMMERCIAL_NAMES[plan] || `NekoAI - App Builder ${plan}`;
 }
 
+/**
+ * Extrai dados do PIX (Copia e Cola, QR Code Base64 e Ticket URL) da resposta da Orders API do Mercado Pago.
+ * Suporta a estrutura canônica (transactions.payments[].point_of_interaction.transaction_data),
+ * estruturas legadas na raiz e fallbacks profundos.
+ */
+export function extractOrderPixData(mpData: any): {
+  pixQrCode: string | null;
+  pixQrCodeBase64: string | null;
+  ticketUrl: string | null;
+  orderId: string | null;
+  paymentId: string | null;
+  status: string | null;
+  statusDetail: string | null;
+} {
+  if (!mpData || typeof mpData !== "object") {
+    return {
+      pixQrCode: null,
+      pixQrCodeBase64: null,
+      ticketUrl: null,
+      orderId: null,
+      paymentId: null,
+      status: null,
+      statusDetail: null,
+    };
+  }
+
+  const orderId = mpData.id ? String(mpData.id) : null;
+  let paymentId: string | null = null;
+  let pixQrCode: string | null = null;
+  let pixQrCodeBase64: string | null = null;
+  let ticketUrl: string | null = null;
+  let status: string | null = mpData.status ? String(mpData.status) : null;
+  let statusDetail: string | null = mpData.status_detail ? String(mpData.status_detail) : null;
+
+  // 1. Procurar nas transações de pagamento (estrutura oficial da Orders API: transactions.payments)
+  const payments = Array.isArray(mpData.transactions?.payments)
+    ? mpData.transactions.payments
+    : Array.isArray(mpData.transactions)
+    ? mpData.transactions.flatMap((t: any) => t?.payments || (t ? [t] : []))
+    : Array.isArray(mpData.payments)
+    ? mpData.payments
+    : [];
+
+  for (const p of payments) {
+    if (!p || typeof p !== "object") continue;
+
+    if (p.id && !paymentId) paymentId = String(p.id);
+    if (p.status && !status) status = String(p.status);
+    if (p.status_detail && !statusDetail) statusDetail = String(p.status_detail);
+
+    // Prioridade 1: point_of_interaction.transaction_data do pagamento (padrão oficial Mercado Pago)
+    const poi = p.point_of_interaction?.transaction_data;
+    if (poi?.qr_code && !pixQrCode) pixQrCode = String(poi.qr_code);
+    if (poi?.qr_code_base64 && !pixQrCodeBase64) pixQrCodeBase64 = String(poi.qr_code_base64);
+    if (poi?.ticket_url && !ticketUrl) ticketUrl = String(poi.ticket_url);
+
+    // Prioridade 2: payment_method do pagamento
+    const pm = p.payment_method;
+    if (pm?.qr_code && !pixQrCode) pixQrCode = String(pm.qr_code);
+    if (pm?.qr_code_base64 && !pixQrCodeBase64) pixQrCodeBase64 = String(pm.qr_code_base64);
+    if (pm?.ticket_url && !ticketUrl) ticketUrl = String(pm.ticket_url);
+
+    // Prioridade 3: campos diretos no objeto de pagamento
+    if (p.qr_code && !pixQrCode) pixQrCode = String(p.qr_code);
+    if (p.qr_code_base64 && !pixQrCodeBase64) pixQrCodeBase64 = String(p.qr_code_base64);
+    if (p.ticket_url && !ticketUrl) ticketUrl = String(p.ticket_url);
+  }
+
+  // 2. Prioridade 4: point_of_interaction na raiz da Order
+  const rootPoi = mpData.point_of_interaction?.transaction_data;
+  if (rootPoi?.qr_code && !pixQrCode) pixQrCode = String(rootPoi.qr_code);
+  if (rootPoi?.qr_code_base64 && !pixQrCodeBase64) pixQrCodeBase64 = String(rootPoi.qr_code_base64);
+  if (rootPoi?.ticket_url && !ticketUrl) ticketUrl = String(rootPoi.ticket_url);
+
+  // 3. Prioridade 5: qr_data na raiz (modelo QR dinâmico)
+  if (mpData.qr_data && !pixQrCode) {
+    pixQrCode = String(mpData.qr_data);
+  }
+
+  // 4. Busca profunda de contingência (fallback profundo em toda a árvore de propriedades)
+  if (!pixQrCode || !pixQrCodeBase64) {
+    const deepFind = (obj: any, depth = 0) => {
+      if (!obj || typeof obj !== "object" || depth > 5) return;
+      if (Array.isArray(obj)) {
+        for (const item of obj) deepFind(item, depth + 1);
+        return;
+      }
+      for (const [k, v] of Object.entries(obj)) {
+        if (!pixQrCode && (k === "qr_code" || k === "qr_data") && typeof v === "string" && v.length >= 20) {
+          pixQrCode = v;
+        }
+        if (!pixQrCodeBase64 && k === "qr_code_base64" && typeof v === "string" && v.length >= 30) {
+          pixQrCodeBase64 = v;
+        }
+        if (!ticketUrl && k === "ticket_url" && typeof v === "string" && v.startsWith("http")) {
+          ticketUrl = v;
+        }
+        if (v && typeof v === "object") {
+          deepFind(v, depth + 1);
+        }
+      }
+    };
+    deepFind(mpData);
+  }
+
+  return { pixQrCode, pixQrCodeBase64, ticketUrl, orderId, paymentId, status, statusDetail };
+}
+
 function json(data: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -387,6 +495,35 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      // Auto-recuperação de PIX pendente caso tenha ficado nulo anteriormente
+      if (sale.status === "pending" && !sale.pix_qr_code && sale.mp_payment_id && mpAccessToken) {
+        try {
+          const getOrderRes = await fetch(`https://api.mercadopago.com/v1/orders/${sale.mp_payment_id}`, {
+            headers: { Authorization: `Bearer ${mpAccessToken.trim()}` },
+          });
+          if (getOrderRes.ok) {
+            const orderData = await getOrderRes.json();
+            const recovered = extractOrderPixData(orderData);
+            if (recovered.pixQrCode) {
+              sale.pix_qr_code = recovered.pixQrCode;
+              sale.pix_qr_code_base64 = recovered.pixQrCodeBase64;
+              sale.ticket_url = recovered.ticketUrl;
+              await supabaseAdmin
+                .from("reseller_sales")
+                .update({
+                  pix_qr_code: recovered.pixQrCode,
+                  pix_qr_code_base64: recovered.pixQrCodeBase64,
+                  ticket_url: recovered.ticketUrl,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq("id", sale.id);
+            }
+          }
+        } catch (e) {
+          console.warn("[reseller-api] Erro ao auto-recuperar PIX durante get_sale:", e);
+        }
+      }
+
       const salePrice = Number(sale.resale_price_snapshot || 0);
       const nekoCost = Number(sale.neko_cost_snapshot || 0);
       const resellerProfit = Number(sale.profit_snapshot || 0);
@@ -415,6 +552,7 @@ Deno.serve(async (req: Request) => {
           license_status: licenseStatus,
           pix_qr_code: sale.pix_qr_code || null,
           pix_qr_code_base64: sale.pix_qr_code_base64 || null,
+          ticket_url: sale.ticket_url || null,
           expires_at: sale.expires_at || null,
           paid_at: sale.paid_at || null,
           created_at: sale.created_at,
@@ -1044,24 +1182,69 @@ Deno.serve(async (req: Request) => {
         .limit(1)
         .maybeSingle();
 
-      if (existingPendingSale && existingPendingSale.pix_qr_code) {
-        console.log(`[reseller-api] Reutilizando cobrança PIX pendente ativa (sale_id: ${existingPendingSale.id})`);
-        return json({
-          ok: true,
-          reused: true,
-          sale_id: existingPendingSale.id,
-          plan: existingPendingSale.plan,
-          neko_cost: existingPendingSale.neko_cost_snapshot,
-          resale_price: existingPendingSale.resale_price_snapshot,
-          profit: existingPendingSale.profit_snapshot,
-          neko_cost_snapshot: existingPendingSale.neko_cost_snapshot,
-          resale_price_snapshot: existingPendingSale.resale_price_snapshot,
-          profit_snapshot: existingPendingSale.profit_snapshot,
-          pix_qr_code: existingPendingSale.pix_qr_code,
-          pix_qr_code_base64: existingPendingSale.pix_qr_code_base64,
-          expires_at: existingPendingSale.expires_at,
-          message: "Cobrança PIX pendente localizada. Exibindo QR Code existente.",
-        });
+      if (existingPendingSale) {
+        if (existingPendingSale.pix_qr_code) {
+          console.log(`[reseller-api] Reutilizando cobrança PIX pendente ativa (sale_id: ${existingPendingSale.id})`);
+          return json({
+            ok: true,
+            reused: true,
+            sale_id: existingPendingSale.id,
+            plan: existingPendingSale.plan,
+            neko_cost: existingPendingSale.neko_cost_snapshot,
+            resale_price: existingPendingSale.resale_price_snapshot,
+            profit: existingPendingSale.profit_snapshot,
+            neko_cost_snapshot: existingPendingSale.neko_cost_snapshot,
+            resale_price_snapshot: existingPendingSale.resale_price_snapshot,
+            profit_snapshot: existingPendingSale.profit_snapshot,
+            pix_qr_code: existingPendingSale.pix_qr_code,
+            pix_qr_code_base64: existingPendingSale.pix_qr_code_base64,
+            expires_at: existingPendingSale.expires_at,
+            message: "Cobrança PIX pendente localizada. Exibindo QR Code existente.",
+          });
+        }
+
+        // Se a venda pendente possui mp_payment_id mas faltou o código PIX anteriormente, recupera na Orders API
+        if (existingPendingSale.mp_payment_id && mpAccessToken) {
+          try {
+            const getOrderRes = await fetch(`https://api.mercadopago.com/v1/orders/${existingPendingSale.mp_payment_id}`, {
+              headers: { Authorization: `Bearer ${mpAccessToken.trim()}` },
+            });
+            if (getOrderRes.ok) {
+              const orderData = await getOrderRes.json();
+              const recovered = extractOrderPixData(orderData);
+              if (recovered.pixQrCode) {
+                await supabaseAdmin
+                  .from("reseller_sales")
+                  .update({
+                    pix_qr_code: recovered.pixQrCode,
+                    pix_qr_code_base64: recovered.pixQrCodeBase64,
+                    updated_at: new Date().toISOString(),
+                  })
+                  .eq("id", existingPendingSale.id);
+
+                return json({
+                  ok: true,
+                  reused: true,
+                  sale_id: existingPendingSale.id,
+                  plan: existingPendingSale.plan,
+                  neko_cost: existingPendingSale.neko_cost_snapshot,
+                  resale_price: existingPendingSale.resale_price_snapshot,
+                  profit: existingPendingSale.profit_snapshot,
+                  neko_cost_snapshot: existingPendingSale.neko_cost_snapshot,
+                  resale_price_snapshot: existingPendingSale.resale_price_snapshot,
+                  profit_snapshot: existingPendingSale.profit_snapshot,
+                  pix_qr_code: recovered.pixQrCode,
+                  pix_qr_code_base64: recovered.pixQrCodeBase64,
+                  ticket_url: recovered.ticketUrl,
+                  expires_at: existingPendingSale.expires_at,
+                  message: "Cobrança PIX pendente recuperada com sucesso.",
+                });
+              }
+            }
+          } catch (recErr) {
+            console.warn("[reseller-api] Erro ao recuperar PIX de order pendente existente:", recErr);
+          }
+        }
       }
 
       // 5. Criação da Venda com Snapshots Financeiros Congelados
@@ -1150,18 +1333,37 @@ Deno.serve(async (req: Request) => {
 
           const mpData = await mpResponse.json();
 
-          if (mpResponse.ok && mpData.id) {
-            mpPaymentId = String(mpData.id);
-            const paymentTx = mpData.transactions?.payments?.[0];
-            const paymentMethod = paymentTx?.payment_method;
-            pixQrCode = paymentMethod?.qr_code || mpData.point_of_interaction?.transaction_data?.qr_code || null;
-            pixQrCodeBase64 = paymentMethod?.qr_code_base64 || mpData.point_of_interaction?.transaction_data?.qr_code_base64 || null;
-            ticketUrl = paymentMethod?.ticket_url || mpData.point_of_interaction?.transaction_data?.ticket_url || null;
+          if (mpResponse.ok && mpData) {
+            const extracted = extractOrderPixData(mpData);
+            mpPaymentId = extracted.paymentId || extracted.orderId || String(mpData.id || "");
+            pixQrCode = extracted.pixQrCode;
+            pixQrCodeBase64 = extracted.pixQrCodeBase64;
+            ticketUrl = extracted.ticketUrl;
+
+            if (!pixQrCode) {
+              console.error("[reseller-api] Resposta da Orders API não continha código PIX válido para a Order:", mpData.id);
+              return json({
+                ok: false,
+                error_code: "PIX_DATA_UNAVAILABLE",
+                message: "O pedido foi criado no Mercado Pago, mas o código PIX não pôde ser gerado. Tente novamente.",
+              }, 502);
+            }
           } else {
-            console.error("[reseller-api] Erro na resposta do Mercado Pago Orders:", mpData);
+            const errorMsg = mpData?.message || mpData?.error || `Erro HTTP ${mpResponse.status}`;
+            console.error("[reseller-api] Falha na criação de Order no Mercado Pago:", mpResponse.status, errorMsg);
+            return json({
+              ok: false,
+              error_code: "MP_ORDER_ERROR",
+              message: `Erro ao gerar cobrança no Mercado Pago: ${errorMsg}`,
+            }, 400);
           }
-        } catch (mpErr) {
+        } catch (mpErr: any) {
           console.error("[reseller-api] Exceção na chamada de API Mercado Pago Orders:", mpErr);
+          return json({
+            ok: false,
+            error_code: "MP_CONNECTION_ERROR",
+            message: "Erro de comunicação com o Mercado Pago. Verifique sua conexão e tente novamente.",
+          }, 502);
         }
       } else {
         console.warn("[reseller-api] MERCADOPAGO_ACCESS_TOKEN não configurado nas variáveis de ambiente. Simulação local ativada.");
