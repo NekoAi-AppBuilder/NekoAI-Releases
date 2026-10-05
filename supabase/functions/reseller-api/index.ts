@@ -29,6 +29,16 @@ const DEFAULT_RESALE_PRICES: Record<string, number> = {
   ANNUAL: FALLBACK_ADMIN_PRICING.ANNUAL.suggested_resale_price,
 };
 
+export const PLAN_COMMERCIAL_NAMES: Record<string, string> = {
+  MONTHLY: "NekoAI - App Builder Mensal",
+  QUARTERLY: "NekoAI - App Builder Trimestral",
+  ANNUAL: "NekoAI - App Builder Anual",
+};
+
+export function getPlanCommercialName(plan: string): string {
+  return PLAN_COMMERCIAL_NAMES[plan] || `NekoAI - App Builder ${plan}`;
+}
+
 function json(data: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -187,12 +197,11 @@ Deno.serve(async (req: Request) => {
 
       if (salesErr) return json({ ok: false, message: salesErr.message }, 500);
 
-      let totalSales = 0;
+      const totalSales = (sales || []).length;
       let resellerProfit = 0;
       if (sales) {
         for (const s of sales) {
           if (s.status === "paid" || s.status === "license_delivered") {
-            totalSales += 1;
             resellerProfit += Number(s.profit_snapshot || 0);
           }
         }
@@ -392,6 +401,9 @@ Deno.serve(async (req: Request) => {
           sale_price: salePrice,
           neko_cost: nekoCost,
           reseller_profit: resellerProfit,
+          neko_cost_snapshot: nekoCost,
+          resale_price_snapshot: salePrice,
+          profit_snapshot: resellerProfit,
           status: sale.status,
           customer_name: sale.customer_name || "Cliente",
           customer_email: sale.customer_email || "—",
@@ -416,8 +428,12 @@ Deno.serve(async (req: Request) => {
     // --------------------------------------------------------------------------
     if (action === "list_sales") {
       const search = url.searchParams.get("search")?.trim().toLowerCase() || "";
-      const planFilter = url.searchParams.get("plan")?.trim().toUpperCase() || "all";
-      const statusFilter = url.searchParams.get("status")?.trim().toLowerCase() || "all";
+      const rawPlan = url.searchParams.get("plan")?.trim().toUpperCase();
+      const planFilter = (!rawPlan || rawPlan === "ALL") ? null : rawPlan;
+
+      const rawStatus = url.searchParams.get("status")?.trim().toLowerCase();
+      const statusFilter = (!rawStatus || rawStatus === "all") ? null : rawStatus;
+
       const dateFrom = url.searchParams.get("date_from")?.trim() || "";
       const dateTo = url.searchParams.get("date_to")?.trim() || "";
       const pageStr = url.searchParams.get("page");
@@ -525,12 +541,12 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-      if (planFilter !== "ALL") {
-        filtered = filtered.filter((s: any) => s.plan === planFilter);
+      if (planFilter) {
+        filtered = filtered.filter((s: any) => s.plan?.toUpperCase() === planFilter);
       }
 
-      if (statusFilter !== "all") {
-        filtered = filtered.filter((s: any) => s.status === statusFilter);
+      if (statusFilter) {
+        filtered = filtered.filter((s: any) => s.status?.toLowerCase() === statusFilter);
       }
 
       if (dateFrom) {
@@ -1038,6 +1054,9 @@ Deno.serve(async (req: Request) => {
           neko_cost: existingPendingSale.neko_cost_snapshot,
           resale_price: existingPendingSale.resale_price_snapshot,
           profit: existingPendingSale.profit_snapshot,
+          neko_cost_snapshot: existingPendingSale.neko_cost_snapshot,
+          resale_price_snapshot: existingPendingSale.resale_price_snapshot,
+          profit_snapshot: existingPendingSale.profit_snapshot,
           pix_qr_code: existingPendingSale.pix_qr_code,
           pix_qr_code_base64: existingPendingSale.pix_qr_code_base64,
           expires_at: existingPendingSale.expires_at,
@@ -1084,16 +1103,26 @@ Deno.serve(async (req: Request) => {
           const firstName = nameParts[0] || "Revendedor";
           const lastName = nameParts.slice(1).join(" ") || undefined;
           const formattedAmount = officialNekoCost.toFixed(2);
+          const commercialName = getPlanCommercialName(plan);
 
           const orderPayload = {
             type: "online",
             total_amount: formattedAmount, // O PIX é estritamente no valor do custo NekoAI (neko_cost_snapshot)
+            description: commercialName,
             external_reference: newSale.id,
             processing_mode: "automatic",
+            items: [
+              {
+                title: commercialName,
+                quantity: 1,
+                unit_price: formattedAmount,
+              },
+            ],
             transactions: {
               payments: [
                 {
                   amount: formattedAmount,
+                  description: commercialName,
                   payment_method: {
                     id: "pix",
                     type: "bank_transfer",
@@ -1160,6 +1189,9 @@ Deno.serve(async (req: Request) => {
         neko_cost: officialNekoCost,
         resale_price: configuredResalePrice,
         profit: calculatedProfit,
+        neko_cost_snapshot: officialNekoCost,
+        resale_price_snapshot: configuredResalePrice,
+        profit_snapshot: calculatedProfit,
         mp_payment_id: mpPaymentId,
         pix_qr_code: pixQrCode,
         pix_qr_code_base64: pixQrCodeBase64,
