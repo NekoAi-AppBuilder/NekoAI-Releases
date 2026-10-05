@@ -68,6 +68,7 @@ export async function verifyMercadoPagoSignature(
   }
 
   // Manifesto Oficial do Mercado Pago: id:<data.id>;request-id:<x-request-id>;ts:<ts>;
+  // Utiliza exatamente o data.id recebido sem normalização para lowercase
   const manifest = `id:${dataId};request-id:${xRequestId};ts:${ts};`;
 
   try {
@@ -79,9 +80,11 @@ export async function verifyMercadoPagoSignature(
       false,
       ["sign"]
     );
+
     const sigBuffer = await crypto.subtle.sign("HMAC", key, encoder.encode(manifest));
-    const sigArray = Array.from(new Uint8Array(sigBuffer));
-    const computedHex = sigArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+    const computedHex = Array.from(new Uint8Array(sigBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
 
     const isMatch = timingSafeEqualHex(computedHex.toLowerCase(), v1.toLowerCase());
     if (!isMatch) {
@@ -138,57 +141,72 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  // 3. Extração do ID do Pagamento do Payload / Query String
-  const paymentId = bodyDataId || url.searchParams.get("data.id") || url.searchParams.get("id");
+  // 3. Extração do ID do Pedido (Order ID) do Payload / Query String
+  const orderId = bodyDataId || url.searchParams.get("data.id") || url.searchParams.get("id");
 
-  if (!paymentId) {
-    console.warn("[mercadopago-webhook] Webhook recebido sem ID de pagamento.");
-    return json({ ok: true, message: "Notificação recebida sem ID de pagamento relevante." }, 200);
+  if (!orderId) {
+    console.warn("[mercadopago-webhook] Webhook recebido sem ID de order/recurso.");
+    return json({ ok: true, message: "Notificação recebida sem ID de recurso relevante." }, 200);
   }
 
   const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, { auth: { persistSession: false } });
 
-  // 4. Consulta Detalhes Oficiais do Pagamento na API do Mercado Pago
-  let paymentDetails: any = null;
+  // 4. Consulta Detalhes Oficiais da Order na API do Mercado Pago (Orders API)
+  let orderDetails: any = null;
 
   if (mpAccessToken) {
     try {
-      const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      const mpRes = await fetch(`https://api.mercadopago.com/v1/orders/${orderId}`, {
         headers: {
           "Authorization": `Bearer ${mpAccessToken.trim()}`,
         },
       });
       if (mpRes.ok) {
-        paymentDetails = await mpRes.json();
+        orderDetails = await mpRes.json();
       } else {
-        console.error(`[mercadopago-webhook] Falha ao buscar pagamento ${paymentId} na API MP: ${mpRes.status}`);
+        console.error(`[mercadopago-webhook] Falha ao buscar order ${orderId} na API MP: ${mpRes.status}`);
       }
     } catch (err) {
-      console.error(`[mercadopago-webhook] Exceção ao consultar API do Mercado Pago:`, err);
+      console.error(`[mercadopago-webhook] Exceção ao consultar API Orders do Mercado Pago:`, err);
     }
   } else {
     // Modo simulação local / testes unitários quando token não está configurado
     console.warn("[mercadopago-webhook] MERCADOPAGO_ACCESS_TOKEN não configurado. Usando dados do payload para simulação.");
-    paymentDetails = {
-      id: paymentId,
-      status: body?.action === "payment.created" ? "pending" : (body?.status || "approved"),
-      transaction_amount: body?.transaction_amount,
-      payment_method_id: body?.payment_method_id || "pix",
+    const simStatus = body?.status ?? (body?.action === "order.processed" ? "processed" : "pending");
+    const simStatusDetail = body?.status_detail ?? (body?.action === "order.processed" ? "accredited" : "waiting_transfer");
+    const simAmount = body?.total_amount ?? body?.transaction_amount;
+
+    orderDetails = {
+      id: orderId,
+      status: simStatus,
+      status_detail: simStatusDetail,
+      total_amount: simAmount,
       external_reference: body?.external_reference || body?.data?.external_reference,
+      transactions: {
+        payments: [
+          {
+            id: `pay_${orderId}`,
+            amount: simAmount,
+            status: simStatus,
+            status_detail: simStatusDetail,
+          },
+        ],
+      },
     };
   }
 
-  if (!paymentDetails) {
-    return json({ ok: false, error_code: "PAYMENT_NOT_FOUND", message: "Não foi possível validar os detalhes do pagamento no Mercado Pago." }, 404);
+  if (!orderDetails) {
+    return json({ ok: false, error_code: "ORDER_NOT_FOUND", message: "Não foi possível validar os detalhes da order no Mercado Pago." }, 404);
   }
 
-  const mpStatus = paymentDetails.status;
-  const externalReference = paymentDetails.external_reference;
-  const paidAmount = Number(paymentDetails.transaction_amount);
+  const externalReference =
+    orderDetails.external_reference ||
+    orderDetails.metadata?.external_reference ||
+    orderDetails.transactions?.payments?.[0]?.external_reference;
 
   if (!externalReference) {
-    console.warn(`[mercadopago-webhook] Pagamento ${paymentId} não possui external_reference de venda.`);
-    return json({ ok: true, message: "Pagamento ignorado: sem external_reference." }, 200);
+    console.warn(`[mercadopago-webhook] Order ${orderId} não possui external_reference de venda.`);
+    return json({ ok: true, message: "Order ignorada: sem external_reference." }, 200);
   }
 
   // 5. Localiza a Venda em reseller_sales via external_reference (UUID da venda)
@@ -215,12 +233,46 @@ Deno.serve(async (req: Request) => {
     }, 200);
   }
 
-  // 7. Trata Status Não Aprovados (Pending / Rejected / Cancelled / Expired)
-  if (mpStatus !== "approved") {
-    console.log(`[mercadopago-webhook] Pagamento ${paymentId} com status Mercado Pago '${mpStatus}'. Atualizando venda ${sale.id}.`);
+  // 7. Determina se o pedido / pagamento foi aprovado estritamente conforme Orders API:
+  // Sucesso documentado exige a combinação válida de status + status_detail:
+  // - Order: status = "processed" E status_detail = "accredited"
+  // - OU Transação: status = "processed" (ou "approved") E status_detail = "accredited"
+  // Estados como "paid" ou "completed" isoladamente NÃO confirmam pagamento sem status_detail = "accredited".
+  const orderStatus = String(orderDetails.status || "");
+  const orderStatusDetail = String(orderDetails.status_detail || "");
+
+  const paymentTx = orderDetails.transactions?.payments?.[0];
+  const txStatus = String(paymentTx?.status || "");
+  const txStatusDetail = String(paymentTx?.status_detail || "");
+
+  const isOrderAccredited =
+    orderStatus === "processed" && orderStatusDetail === "accredited";
+
+  const isTxAccredited =
+    (txStatus === "processed" || txStatus === "approved") &&
+    txStatusDetail === "accredited";
+
+  const hasAnyPaymentAccredited = Boolean(
+    orderDetails.transactions?.payments?.some(
+      (p: any) =>
+        (p?.status === "processed" || p?.status === "approved") &&
+        p?.status_detail === "accredited"
+    )
+  );
+
+  const isApproved = isOrderAccredited || isTxAccredited || hasAnyPaymentAccredited;
+
+  const paidAmount = Number(
+    paymentTx?.amount ?? orderDetails.total_amount ?? paymentTx?.transaction_amount ?? 0
+  );
+
+  // 8. Trata Status Não Aprovados (Pending / Action Required / Rejected / Cancelled / Expired)
+  if (!isApproved) {
+    const mpStatus = orderStatus || txStatus || "pending";
+    console.log(`[mercadopago-webhook] Order ${orderId} com status Mercado Pago '${mpStatus}' (${orderStatusDetail || txStatusDetail}). Venda ${sale.id} não aprovada.`);
     
     let newStatus = sale.status;
-    if (mpStatus === "cancelled" || mpStatus === "rejected") {
+    if (mpStatus === "cancelled" || mpStatus === "canceled" || mpStatus === "rejected") {
       newStatus = "cancelled";
     } else if (mpStatus === "expired") {
       newStatus = "expired";
@@ -229,7 +281,7 @@ Deno.serve(async (req: Request) => {
     if (newStatus !== sale.status) {
       await supabaseAdmin
         .from("reseller_sales")
-        .update({ status: newStatus, mp_payment_id: String(paymentId), updated_at: new Date().toISOString() })
+        .update({ status: newStatus, mp_payment_id: String(orderId), updated_at: new Date().toISOString() })
         .eq("id", sale.id);
     }
 
@@ -242,7 +294,7 @@ Deno.serve(async (req: Request) => {
     }, 200);
   }
 
-  // 8. VALIDAÇÃO RIGOROSA DO VALOR PAGO VS CUSTO NEKOAI ESPERADO
+  // 9. VALIDAÇÃO RIGOROSA DO VALOR PAGO VS CUSTO NEKOAI ESPERADO
   const expectedCost = Number(sale.neko_cost_snapshot);
   if (Math.abs(paidAmount - expectedCost) > 0.01) {
     console.error(`[mercadopago-webhook] DIVERGÊNCIA DE VALOR! Esperado: R$${expectedCost}, Pago: R$${paidAmount} para venda ${sale.id}. Bloqueando aprovação.`);
@@ -262,13 +314,13 @@ Deno.serve(async (req: Request) => {
     }, 400);
   }
 
-  // 9. TRANSIÇÃO DE ESTADO PARA 'paid' (Idempotente e Segura - NENHUMA LICENÇA GERADA NESTA FASE)
+  // 10. TRANSIÇÃO DE ESTADO PARA 'paid' (Idempotente e Segura - NENHUMA LICENÇA GERADA NESTA FASE)
   const { error: updateErr } = await supabaseAdmin
     .from("reseller_sales")
     .update({
       status: "paid",
       paid_at: new Date().toISOString(),
-      mp_payment_id: String(paymentId),
+      mp_payment_id: String(orderId),
       updated_at: new Date().toISOString(),
     })
     .eq("id", sale.id);
@@ -278,13 +330,13 @@ Deno.serve(async (req: Request) => {
     return json({ ok: false, error_code: "DB_ERROR", message: "Erro ao atualizar status de pagamento no banco." }, 500);
   }
 
-  console.log(`[mercadopago-webhook] SUCESSO: Venda ${sale.id} confirmada como PAGA via Webhook do Mercado Pago (Payment ID: ${paymentId}).`);
+  console.log(`[mercadopago-webhook] SUCESSO: Venda ${sale.id} confirmada como PAGA via Webhook do Mercado Pago Orders (Order ID: ${orderId}).`);
 
   return json({
     ok: true,
     action_performed: "marked_as_paid",
     sale_id: sale.id,
     status: "paid",
-    message: "Pagamento confirmado com sucesso via Webhook.",
+    message: "Pagamento confirmado com sucesso via Webhook Orders.",
   }, 200);
 });
