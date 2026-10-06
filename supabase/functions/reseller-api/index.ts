@@ -306,6 +306,60 @@ function extractIp(req: Request): string {
          "unknown";
 }
 
+export function extractSessionIdFromJwt(token: string): string | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const b64Payload = parts[1];
+    const base64 = b64Payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padLen = (4 - (base64.length % 4)) % 4;
+    const padded = base64 + "=".repeat(padLen);
+    const decoded = atob(padded);
+    const parsed = JSON.parse(decoded);
+    return parsed.session_id || parsed.sid || null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseUserAgent(userAgent: string): { browser: string; os: string; device_type: string } {
+  const ua = userAgent || "";
+  let browser = "Navegador Web";
+  if (ua.includes("Edg/")) {
+    browser = "Edge";
+  } else if (ua.includes("Chrome/") && !ua.includes("Edg/")) {
+    browser = "Google Chrome";
+  } else if (ua.includes("Firefox/")) {
+    browser = "Firefox";
+  } else if (ua.includes("Safari/") && !ua.includes("Chrome/")) {
+    browser = "Safari";
+  } else if (ua.includes("Opera/") || ua.includes("OPR/")) {
+    browser = "Opera";
+  }
+
+  let os = "Dispositivo";
+  if (ua.includes("Windows")) {
+    os = "Windows";
+  } else if (ua.includes("Macintosh") || ua.includes("Mac OS")) {
+    os = "macOS";
+  } else if (ua.includes("Linux")) {
+    os = "Linux";
+  } else if (ua.includes("Android")) {
+    os = "Android";
+  } else if (ua.includes("iPhone") || ua.includes("iPad")) {
+    os = "iOS";
+  }
+
+  let device_type = "Desktop";
+  if (ua.includes("Mobile") || ua.includes("Android") || ua.includes("iPhone")) {
+    device_type = "Mobile";
+  } else if (ua.includes("iPad") || ua.includes("Tablet")) {
+    device_type = "Tablet";
+  }
+
+  return { browser, os, device_type };
+}
+
 function validateCpf(rawCpf: string): boolean {
   const digits = rawCpf.replace(/\D/g, "");
   if (digits.length !== 11) return false;
@@ -417,6 +471,30 @@ Deno.serve(async (req: Request) => {
 
     if (reseller.status !== "active") {
       return json({ ok: false, error_code: "RESELLER_INACTIVE", message: "Você não possui permissão para acessar esta área." }, 403);
+    }
+
+    // 2. Verificação de Revogação de Sessão Ativa
+    const currentSessionId = extractSessionIdFromJwt(token);
+    if (currentSessionId) {
+      try {
+        const { data: sessionRec, error: sessionErr } = await supabaseAdmin
+          .from("reseller_sessions")
+          .select("id, is_revoked")
+          .eq("session_id", currentSessionId)
+          .maybeSingle();
+
+        if (!sessionErr && sessionRec && sessionRec.is_revoked) {
+          console.warn(`[reseller-api] Sessão revogada detectada (${currentSessionId}) para revendedor ${reseller.id}. Rejeitando com 401.`);
+          return json({
+            ok: false,
+            error_code: "SESSION_REVOKED",
+            message: "Esta sessão foi desconectada em outro dispositivo. Faça login novamente.",
+          }, 401);
+        }
+      } catch (err) {
+        // Fallback resiliente caso a migration não tenha sido aplicada remotamente
+        console.warn("[reseller-api] Falha silenciosa ao verificar reseller_sessions:", err);
+      }
     }
 
   const url = new URL(req.url);
@@ -573,25 +651,97 @@ Deno.serve(async (req: Request) => {
       // Fallback de polling seguro: se a venda ainda está pendente mas tem mp_payment_id, consulta Orders API
       if (sale.status === "pending" && sale.mp_payment_id && mpAccessToken) {
         try {
+          let orderData: any = null;
           const mpRes = await fetch(`https://api.mercadopago.com/v1/orders/${sale.mp_payment_id}`, {
             headers: {
               "Authorization": `Bearer ${mpAccessToken.trim()}`,
             },
           });
           if (mpRes.ok) {
-            const orderData = await mpRes.json();
-            const isOrderAccredited =
-              orderData?.status === "processed" && orderData?.status_detail === "accredited";
-            const isPaymentAccredited = orderData?.transactions?.payments?.some((p: any) =>
-              (p?.status === "approved" || p?.status === "processed") && p?.status_detail === "accredited"
-            );
-            const isApproved = isOrderAccredited || Boolean(isPaymentAccredited);
+            orderData = await mpRes.json();
+          } else if (mpRes.status === 404 && sale.id) {
+            // Se o ID armazenado gerou 404 (ex: ID de pagamento legado de checkout anterior), busca a order por external_reference
+            try {
+              const now = new Date();
+              const beginDate = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+              const endDate = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+              const searchRes = await fetch(
+                `https://api.mercadopago.com/v1/orders/search?begin_date=${encodeURIComponent(beginDate)}&end_date=${encodeURIComponent(endDate)}&external_reference=${encodeURIComponent(sale.id)}`,
+                {
+                  headers: { "Authorization": `Bearer ${mpAccessToken.trim()}` },
+                }
+              );
+              if (searchRes.ok) {
+                const searchData = await searchRes.json();
+                const matchedOrder = searchData?.data?.[0] || searchData?.results?.[0];
+                if (matchedOrder) {
+                  orderData = matchedOrder;
+                  sale.mp_payment_id = String(matchedOrder.id);
+                  await supabaseAdmin
+                    .from("reseller_sales")
+                    .update({ mp_payment_id: sale.mp_payment_id, updated_at: new Date().toISOString() })
+                    .eq("id", sale.id);
+                }
+              }
+            } catch (searchErr) {
+              console.warn("[reseller-api] Fallback search de order por external_reference falhou:", searchErr);
+            }
+          }
 
-            const paymentTx = orderData?.transactions?.payments?.[0];
+          if (orderData) {
+            // Suporte completo a formato de transactions como array ou objeto
+            const payments = Array.isArray(orderData?.transactions?.payments)
+              ? orderData.transactions.payments
+              : Array.isArray(orderData?.transactions)
+              ? orderData.transactions.flatMap((t: any) => (Array.isArray(t?.payments) ? t.payments : t ? [t] : []))
+              : Array.isArray(orderData?.payments)
+              ? orderData.payments
+              : [];
+
+            const orderStatus = String(orderData?.status || "");
+            const orderStatusDetail = String(orderData?.status_detail || "");
+
+            const paymentTx = payments[0];
+            const txStatus = String(paymentTx?.status || "");
+            const txStatusDetail = String(paymentTx?.status_detail || "");
+
+            const isOrderAccredited =
+              (orderData?.status === "processed" && orderData?.status_detail === "accredited") ||
+              ((orderStatus === "closed" || orderStatus === "approved") && (orderStatusDetail === "accredited" || orderStatusDetail === "approved"));
+
+            const isTxAccredited =
+              (txStatus === "processed" || txStatus === "approved") &&
+              (txStatusDetail === "accredited" || txStatusDetail === "approved");
+
+            const isPaymentAccredited = payments.some((p: any) =>
+              (p?.status === "approved" || p?.status === "processed") &&
+              (p?.status_detail === "accredited" || p?.status_detail === "approved")
+            );
+
+            const isApproved = isOrderAccredited || isTxAccredited || Boolean(isPaymentAccredited);
+
             const paidAmount = Number(
-              paymentTx?.amount ?? orderData?.total_amount ?? paymentTx?.transaction_amount ?? 0
+              paymentTx?.amount ??
+              paymentTx?.transaction_amount ??
+              paymentTx?.total_amount ??
+              orderData?.total_amount ??
+              orderData?.amount ??
+              0
             );
             const expectedCost = Number(sale.neko_cost_snapshot);
+
+            // Log seguro de diagnóstico do polling (sem tokens, sem secrets, sem CPF)
+            console.log("[reseller-api] Diagnóstico de polling Order:", {
+              saleId: sale.id,
+              orderId: sale.mp_payment_id,
+              orderStatus,
+              orderStatusDetail,
+              txStatus,
+              txStatusDetail,
+              isApproved,
+              paidAmount,
+              expectedCost,
+            });
 
             if (isApproved && Math.abs(paidAmount - expectedCost) <= 0.01) {
               const nowIso = new Date().toISOString();
@@ -605,6 +755,22 @@ Deno.serve(async (req: Request) => {
                   updated_at: nowIso,
                 })
                 .eq("id", sale.id);
+
+              console.log(`[reseller-api] SUCESSO: Venda ${sale.id} confirmada como PAGA via Polling da Orders API (Order ID: ${sale.mp_payment_id}).`);
+            } else if (!isApproved) {
+              let newStatus = sale.status;
+              if (orderStatus === "cancelled" || orderStatus === "canceled" || orderStatus === "rejected") {
+                newStatus = "cancelled";
+              } else if (orderStatus === "expired") {
+                newStatus = "expired";
+              }
+              if (newStatus !== sale.status) {
+                sale.status = newStatus;
+                await supabaseAdmin
+                  .from("reseller_sales")
+                  .update({ status: newStatus, updated_at: new Date().toISOString() })
+                  .eq("id", sale.id);
+              }
             }
           }
         } catch (pollErr) {
@@ -1095,6 +1261,43 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // --------------------------------------------------------------------------
+    // AÇÃO GET: LISTAGEM DE SESSÕES/DISPOSITIVOS ATIVOS DO REVENDEDOR (list_sessions)
+    // --------------------------------------------------------------------------
+    if (action === "list_sessions") {
+      try {
+        const { data: dbSessions, error: listErr } = await supabaseAdmin
+          .from("reseller_sessions")
+          .select("id, session_id, device_name, browser, operating_system, ip_address, approximate_location, is_revoked, created_at, last_active_at")
+          .eq("reseller_id", reseller.id)
+          .eq("is_revoked", false)
+          .order("last_active_at", { ascending: false });
+
+        if (listErr) {
+          console.warn("[reseller-api] Erro ao listar reseller_sessions:", listErr);
+          return json({ ok: true, sessions: [] });
+        }
+
+        const sessions = (dbSessions || []).map((s: any) => ({
+          id: s.id,
+          session_id: s.session_id,
+          device_name: s.device_name,
+          browser: s.browser,
+          operating_system: s.operating_system,
+          ip_address: s.ip_address || null,
+          approximate_location: s.approximate_location || null,
+          is_current: currentSessionId ? String(s.session_id).toLowerCase() === String(currentSessionId).toLowerCase() : false,
+          created_at: s.created_at,
+          last_active_at: s.last_active_at,
+        }));
+
+        return json({ ok: true, sessions });
+      } catch (err: any) {
+        console.warn("[reseller-api] Exceção em list_sessions (fallback resiliente):", err);
+        return json({ ok: true, sessions: [] });
+      }
+    }
+
     return json({ ok: false, message: "Ação GET não suportada." }, 400);
   }
 
@@ -1465,7 +1668,8 @@ Deno.serve(async (req: Request) => {
 
           if (mpResponse.ok && mpData) {
             const extracted = extractOrderPixData(typeof mpData === "object" ? mpData : null);
-            mpPaymentId = extracted.paymentId || extracted.orderId || String(mpData.id || "");
+            const orderId = String(mpData.id || extracted.orderId || "");
+            mpPaymentId = orderId || extracted.paymentId || "";
             pixQrCode = extracted.pixQrCode;
             pixQrCodeBase64 = extracted.pixQrCodeBase64;
             ticketUrl = extracted.ticketUrl;
@@ -1936,6 +2140,125 @@ Deno.serve(async (req: Request) => {
         message: "Configurações salvas com sucesso.",
         reseller: returnedReseller,
       });
+    }
+
+    // --------------------------------------------------------------------------
+    // AÇÃO POST: REGISTRO/ATUALIZAÇÃO DE SESSÃO ATIVA (register_session)
+    // --------------------------------------------------------------------------
+    if (action === "register_session") {
+      try {
+        const userAgent = req.headers.get("user-agent") || body.user_agent || "";
+        const { browser, os } = parseUserAgent(userAgent);
+        const ip = extractIp(req);
+
+        // Extrai headers de geolocalização se fornecidos pelo proxy/edge (sem dados inventados)
+        const city = req.headers.get("cf-ipcity") || req.headers.get("x-vercel-ip-city");
+        const region = req.headers.get("cf-region") || req.headers.get("x-vercel-ip-country-region");
+        const country = req.headers.get("cf-ipcountry") || req.headers.get("x-vercel-ip-country");
+        const approximateLocation = [city, region, country].filter(Boolean).join(", ") || null;
+
+        // Session ID prioritariamente do JWT; se ausente, do body se UUID válido
+        const sessionIdToUse = currentSessionId || (body.session_id && /^[0-9a-f-]{36}$/i.test(body.session_id) ? body.session_id : null);
+
+        if (!sessionIdToUse) {
+          return json({ ok: false, error_code: "MISSING_SESSION_ID", message: "Não foi possível identificar o ID da sessão." }, 400);
+        }
+
+        const deviceName = body.device_name || `Novo login em ${browser}`;
+
+        const upsertPayload: Record<string, any> = {
+          reseller_id: reseller.id,
+          session_id: sessionIdToUse,
+          device_name: deviceName,
+          browser,
+          operating_system: os,
+          user_agent: userAgent ? userAgent.slice(0, 500) : null,
+          ip_address: ip !== "unknown" ? ip : null,
+          approximate_location: approximateLocation,
+          is_revoked: false,
+          last_active_at: new Date().toISOString(),
+        };
+
+        const { data: savedSession, error: upsertErr } = await supabaseAdmin
+          .from("reseller_sessions")
+          .upsert(upsertPayload, { onConflict: "session_id" })
+          .select("id, session_id, device_name, browser, operating_system, ip_address, approximate_location, is_revoked, created_at, last_active_at")
+          .single();
+
+        if (upsertErr) {
+          console.warn("[reseller-api] Erro ao registrar reseller_sessions (possível tabela inexistente):", upsertErr);
+          return json({ ok: true, registered: false, note: "Sessão não persistida (migration pendente)" });
+        }
+
+        return json({
+          ok: true,
+          registered: true,
+          session: {
+            ...savedSession,
+            is_current: true,
+          },
+        });
+      } catch (err: any) {
+        console.warn("[reseller-api] Exceção em register_session:", err);
+        return json({ ok: true, registered: false, note: err?.message });
+      }
+    }
+
+    // --------------------------------------------------------------------------
+    // AÇÃO POST: REVOGAÇÃO DE SESSÃO ESPECÍFICA (revoke_session)
+    // --------------------------------------------------------------------------
+    if (action === "revoke_session") {
+      const { session_record_id, session_id: targetSessionId } = body;
+      if (!session_record_id && !targetSessionId) {
+        return json({ ok: false, error_code: "INVALID_PARAMS", message: "ID da sessão a revogar não informado." }, 400);
+      }
+
+      try {
+        // Busca a sessão garantindo estritamente que pertence a este revendedor (multi-tenant safety)
+        let query = supabaseAdmin
+          .from("reseller_sessions")
+          .select("id, session_id, reseller_id, is_revoked")
+          .eq("reseller_id", reseller.id);
+
+        if (session_record_id) {
+          query = query.eq("id", session_record_id);
+        } else if (targetSessionId) {
+          query = query.eq("session_id", targetSessionId);
+        }
+
+        const { data: targetRecord, error: findErr } = await query.maybeSingle();
+
+        if (findErr) {
+          return json({ ok: false, message: findErr.message }, 500);
+        }
+
+        if (!targetRecord) {
+          return json({ ok: false, error_code: "SESSION_NOT_FOUND", message: "Dispositivo não encontrado ou não pertence a esta conta." }, 404);
+        }
+
+        const nowIso = new Date().toISOString();
+        const { error: revokeErr } = await supabaseAdmin
+          .from("reseller_sessions")
+          .update({
+            is_revoked: true,
+            revoked_at: nowIso,
+          })
+          .eq("id", targetRecord.id)
+          .eq("reseller_id", reseller.id);
+
+        if (revokeErr) {
+          return json({ ok: false, message: revokeErr.message }, 500);
+        }
+
+        return json({
+          ok: true,
+          message: "Dispositivo desconectado com sucesso.",
+          revoked_id: targetRecord.id,
+        });
+      } catch (err: any) {
+        console.error("[reseller-api] Exceção em revoke_session:", err);
+        return json({ ok: false, message: err?.message || "Erro ao revogar sessão." }, 500);
+      }
     }
 
     return json({ ok: false, message: "Ação POST desconhecida." }, 400);
