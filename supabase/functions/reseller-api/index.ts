@@ -147,6 +147,139 @@ export function extractOrderPixData(mpData: any): {
   return { pixQrCode, pixQrCodeBase64, ticketUrl, orderId, paymentId, status, statusDetail };
 }
 
+function maskCpf(cpf: string): string {
+  const digits = cpf.replace(/\D/g, "");
+  if (digits.length === 11) {
+    return `${digits.slice(0, 3)}.***.***-${digits.slice(9)}`;
+  }
+  return "***";
+}
+
+function sanitizeForDiagnostics(data: any, depth = 0): any {
+  if (depth > 6 || data === null || data === undefined) return data;
+  if (typeof data === "string") {
+    if (
+      data.startsWith("APP_USR-") ||
+      data.startsWith("TEST-") ||
+      (data.length > 50 && !data.startsWith("000201") && !data.startsWith("iVBORw0KGgo"))
+    ) {
+      return "[REDACTED_SECRET]";
+    }
+    const digits = data.replace(/\D/g, "");
+    if (digits.length === 11 && (data.includes(".") || data.length === 11)) {
+      return maskCpf(digits);
+    }
+    return data;
+  }
+  if (typeof data !== "object") return data;
+
+  if (Array.isArray(data)) {
+    return data.map((item) => sanitizeForDiagnostics(item, depth + 1));
+  }
+
+  const sanitized: Record<string, any> = {};
+  for (const [key, value] of Object.entries(data)) {
+    const lowerKey = key.toLowerCase();
+    if (
+      lowerKey.includes("token") ||
+      lowerKey.includes("secret") ||
+      lowerKey.includes("auth") ||
+      lowerKey === "authorization"
+    ) {
+      sanitized[key] = "[REDACTED]";
+    } else if (lowerKey === "identification" && value && typeof value === "object") {
+      sanitized[key] = {
+        type: (value as any).type,
+        number: typeof (value as any).number === "string" ? maskCpf((value as any).number) : "***",
+      };
+    } else if (lowerKey === "number" && typeof value === "string" && value.replace(/\D/g, "").length === 11) {
+      sanitized[key] = maskCpf(value);
+    } else {
+      sanitized[key] = sanitizeForDiagnostics(value, depth + 1);
+    }
+  }
+  return sanitized;
+}
+
+function extractMercadoPagoErrorDetails(mpData: any, status?: number): string {
+  if (!mpData) {
+    return status ? `Status HTTP ${status}` : "Resposta vazia do Mercado Pago";
+  }
+  if (typeof mpData === "string") {
+    const cleaned = mpData.replace(/<[^>]*>?/gm, "").trim();
+    return cleaned.slice(0, 300) || (status ? `Status HTTP ${status}` : "Erro desconhecido");
+  }
+
+  const parts: string[] = [];
+
+  // 1. Process cause (Mercado Pago v1 error schema)
+  if (Array.isArray(mpData.cause) && mpData.cause.length > 0) {
+    const causes = mpData.cause.map((c: any) => {
+      if (!c) return "";
+      if (typeof c === "string") return c;
+      const desc = c.description || c.message || "";
+      const code = c.code ? `[${c.code}]` : "";
+      return [code, desc].filter(Boolean).join(" ");
+    }).filter(Boolean);
+    if (causes.length > 0) {
+      parts.push(causes.join("; "));
+    }
+  } else if (mpData.cause && typeof mpData.cause === "object") {
+    const c = mpData.cause;
+    const desc = c.description || c.message || "";
+    const code = c.code ? `[${c.code}]` : "";
+    const causeStr = [code, desc].filter(Boolean).join(" ");
+    if (causeStr) parts.push(causeStr);
+  }
+
+  // 2. Process details (newer Mercado Pago API schemas)
+  if (Array.isArray(mpData.details) && mpData.details.length > 0) {
+    const details = mpData.details.map((d: any) => {
+      if (!d) return "";
+      if (typeof d === "string") return d;
+      const field = d.field ? `${d.field}: ` : "";
+      const msg = d.message || d.description || JSON.stringify(d);
+      return `${field}${msg}`;
+    }).filter(Boolean);
+    if (details.length > 0) {
+      parts.push(details.join("; "));
+    }
+  }
+
+  // 3. Process errors array
+  if (Array.isArray(mpData.errors) && mpData.errors.length > 0) {
+    const errs = mpData.errors.map((e: any) => {
+      if (!e) return "";
+      if (typeof e === "string") return e;
+      return e.message || e.description || JSON.stringify(e);
+    }).filter(Boolean);
+    if (errs.length > 0) {
+      parts.push(errs.join("; "));
+    }
+  }
+
+  // 4. Message or error property
+  const mainMsg = mpData.message || mpData.error_description || (typeof mpData.error === "string" ? mpData.error : "");
+  if (mainMsg && !parts.some((p) => p.includes(mainMsg))) {
+    parts.unshift(mainMsg);
+  }
+
+  if (parts.length > 0) {
+    return parts.join(" - ");
+  }
+
+  try {
+    const jsonStr = JSON.stringify(mpData);
+    if (jsonStr !== "{}" && jsonStr.length < 300) {
+      return jsonStr;
+    }
+  } catch {
+    // ignore
+  }
+
+  return status ? `Erro HTTP ${status}` : "Erro desconhecido retornado pelo Mercado Pago";
+}
+
 function json(data: Record<string, unknown>, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -1285,27 +1418,18 @@ Deno.serve(async (req: Request) => {
           const nameParts = (reseller.name || "").trim().split(/\s+/);
           const firstName = nameParts[0] || "Revendedor";
           const lastName = nameParts.slice(1).join(" ") || undefined;
+          const cleanCpfDigits = activeCpf ? activeCpf.replace(/\D/g, "") : null;
           const formattedAmount = officialNekoCost.toFixed(2);
-          const commercialName = getPlanCommercialName(plan);
 
           const orderPayload = {
             type: "online",
             total_amount: formattedAmount, // O PIX é estritamente no valor do custo NekoAI (neko_cost_snapshot)
-            description: commercialName,
             external_reference: newSale.id,
             processing_mode: "automatic",
-            items: [
-              {
-                title: commercialName,
-                quantity: 1,
-                unit_price: formattedAmount,
-              },
-            ],
             transactions: {
               payments: [
                 {
                   amount: formattedAmount,
-                  description: commercialName,
                   payment_method: {
                     id: "pix",
                     type: "bank_transfer",
@@ -1317,7 +1441,7 @@ Deno.serve(async (req: Request) => {
               email: reseller.email,
               first_name: firstName,
               ...(lastName ? { last_name: lastName } : {}),
-              ...(activeCpf ? { identification: { type: "CPF", number: activeCpf } } : {}),
+              ...(cleanCpfDigits && cleanCpfDigits.length === 11 ? { identification: { type: "CPF", number: cleanCpfDigits } } : {}),
             },
           };
 
@@ -1331,10 +1455,16 @@ Deno.serve(async (req: Request) => {
             body: JSON.stringify(orderPayload),
           });
 
-          const mpData = await mpResponse.json();
+          const rawText = await mpResponse.text();
+          let mpData: any = null;
+          try {
+            mpData = rawText ? JSON.parse(rawText) : null;
+          } catch {
+            mpData = rawText;
+          }
 
           if (mpResponse.ok && mpData) {
-            const extracted = extractOrderPixData(mpData);
+            const extracted = extractOrderPixData(typeof mpData === "object" ? mpData : null);
             mpPaymentId = extracted.paymentId || extracted.orderId || String(mpData.id || "");
             pixQrCode = extracted.pixQrCode;
             pixQrCodeBase64 = extracted.pixQrCodeBase64;
@@ -1349,20 +1479,28 @@ Deno.serve(async (req: Request) => {
               }, 502);
             }
           } else {
-            const errorMsg = mpData?.message || mpData?.error || `Erro HTTP ${mpResponse.status}`;
-            console.error("[reseller-api] Falha na criação de Order no Mercado Pago:", mpResponse.status, errorMsg);
+            const detailedError = extractMercadoPagoErrorDetails(mpData, mpResponse.status);
+            const sanitizedDiagnostics = sanitizeForDiagnostics(mpData);
+            console.error("[reseller-api] Falha na criação de Order no Mercado Pago:", {
+              status: mpResponse.status,
+              details: detailedError,
+              diagnostics: sanitizedDiagnostics,
+            });
             return json({
               ok: false,
               error_code: "MP_ORDER_ERROR",
-              message: `Erro ao gerar cobrança no Mercado Pago: ${errorMsg}`,
+              message: `Erro ao gerar cobrança no Mercado Pago: ${detailedError}`,
+              mp_status: mpResponse.status,
+              mp_diagnostics: sanitizedDiagnostics,
             }, 400);
           }
         } catch (mpErr: any) {
-          console.error("[reseller-api] Exceção na chamada de API Mercado Pago Orders:", mpErr);
+          const errDetail = mpErr?.message || String(mpErr);
+          console.error("[reseller-api] Exceção na chamada de API Mercado Pago Orders:", errDetail);
           return json({
             ok: false,
             error_code: "MP_CONNECTION_ERROR",
-            message: "Erro de comunicação com o Mercado Pago. Verifique sua conexão e tente novamente.",
+            message: `Erro de comunicação com o Mercado Pago: ${errDetail}`,
           }, 502);
         }
       } else {
