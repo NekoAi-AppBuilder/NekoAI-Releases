@@ -432,6 +432,20 @@ async function calculateSha256Hex(text: string): Promise<string> {
   return hashArr.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Deriva a máscara pública canônica no formato oficial NEKO-****-****-****-XXXX.
+ * Alinhado estritamente com extractKeyMask do billing-core e public-test-license.
+ */
+export function extractKeyMask(licenseKey: string): string {
+  const clean = String(licenseKey || "").trim().toUpperCase();
+  const lastFour = clean.slice(-4);
+  return `NEKO-****-****-****-${lastFour}`;
+}
+
+export function makeKeyMask(key: string): string {
+  return extractKeyMask(key);
+}
+
 function cleanAccessToken(raw: string | null | undefined): string {
   if (!raw) return "";
   let token = raw.trim();
