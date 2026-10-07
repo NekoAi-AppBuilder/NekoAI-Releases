@@ -384,15 +384,22 @@ function validateCpf(rawCpf: string): boolean {
 
 const LICENSE_CHARSET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
-function getUtc3DayStartIso(): string {
-  const now = new Date();
-  const utc3Ms = now.getTime() - 3 * 60 * 60 * 1000;
+function getUtc3DayBoundsIso(referenceDate = new Date()): { startIso: string; nextDayStartIso: string } {
+  const utc3Ms = referenceDate.getTime() - 3 * 60 * 60 * 1000;
   const utc3Date = new Date(utc3Ms);
   const y = utc3Date.getUTCFullYear();
   const m = utc3Date.getUTCMonth();
   const d = utc3Date.getUTCDate();
   const dayStart = new Date(Date.UTC(y, m, d, 3, 0, 0, 0));
-  return dayStart.toISOString();
+  const nextDayStart = new Date(Date.UTC(y, m, d + 1, 3, 0, 0, 0));
+  return {
+    startIso: dayStart.toISOString(),
+    nextDayStartIso: nextDayStart.toISOString(),
+  };
+}
+
+function getUtc3DayStartIso(): string {
+  return getUtc3DayBoundsIso().startIso;
 }
 
 function generateTestKey(): string {
@@ -579,13 +586,14 @@ Deno.serve(async (req: Request) => {
       }
 
       // 3. Contagem de testes gerados hoje (UTC-3)
-      const dayStartIso = getUtc3DayStartIso();
+      const { startIso, nextDayStartIso } = getUtc3DayBoundsIso();
       const { count: todayTestsCount } = await supabaseAdmin
         .from("licenses")
         .select("id", { count: "exact", head: true })
         .eq("reseller_id", reseller.id)
         .eq("license_type", "TEST")
-        .gte("created_at", dayStartIso);
+        .gte("created_at", startIso)
+        .lt("created_at", nextDayStartIso);
 
       return json({
         ok: true,
@@ -604,29 +612,47 @@ Deno.serve(async (req: Request) => {
     // AÇÃO GET: LISTAGEM DE LICENÇAS DE TESTE DO REVENDEDOR (list_test_licenses)
     // --------------------------------------------------------------------------
     if (action === "list_test_licenses") {
-      const dayStartIso = getUtc3DayStartIso();
+      const { startIso, nextDayStartIso } = getUtc3DayBoundsIso();
       const [licensesRes, countRes] = await Promise.all([
         supabaseAdmin
           .from("licenses")
           .select("id, customer_name, customer_email, created_at, expires_at, status")
           .eq("reseller_id", reseller.id)
           .eq("license_type", "TEST")
+          .gte("created_at", startIso)
+          .lt("created_at", nextDayStartIso)
           .order("created_at", { ascending: false }),
         supabaseAdmin
           .from("licenses")
           .select("id", { count: "exact", head: true })
           .eq("reseller_id", reseller.id)
           .eq("license_type", "TEST")
-          .gte("created_at", dayStartIso),
+          .gte("created_at", startIso)
+          .lt("created_at", nextDayStartIso),
       ]);
 
       if (licensesRes.error) {
         return json({ ok: false, message: licensesRes.error.message }, 500);
       }
 
+      const nowMs = Date.now();
+      const formattedLicenses = (licensesRes.data || []).map((lic: any) => {
+        let effectiveStatus = lic.status;
+        if (lic.status !== "revoked" && lic.expires_at) {
+          const expMs = new Date(lic.expires_at).getTime();
+          if (!Number.isNaN(expMs) && expMs <= nowMs) {
+            effectiveStatus = "expired";
+          }
+        }
+        return {
+          ...lic,
+          status: effectiveStatus,
+        };
+      });
+
       return json({
         ok: true,
-        licenses: licensesRes.data || [],
+        licenses: formattedLicenses,
         today_tests_count: countRes.count || 0,
         daily_limit: 10,
       });
@@ -1343,13 +1369,14 @@ Deno.serve(async (req: Request) => {
       }
 
       // 3. Validação de Quota Diária no Backend (10 licenças/dia UTC-3)
-      const dayStartIso = getUtc3DayStartIso();
+      const { startIso, nextDayStartIso } = getUtc3DayBoundsIso();
       const { count: todayTestsCount, error: countErr } = await supabaseAdmin
         .from("licenses")
         .select("id", { count: "exact", head: true })
         .eq("reseller_id", reseller.id)
         .eq("license_type", "TEST")
-        .gte("created_at", dayStartIso);
+        .gte("created_at", startIso)
+        .lt("created_at", nextDayStartIso);
 
       if (countErr) {
         return json({ ok: false, message: countErr.message }, 500);
@@ -1995,6 +2022,20 @@ Deno.serve(async (req: Request) => {
 
       if (licErr || !lic) {
         return json({ ok: false, message: "Licença não encontrada ou não pertencente à sua conta de revendedor." }, 404);
+      }
+
+      // Validação estrita: licença de teste expirada não pode ser reenviada
+      if (lic.license_type === "TEST") {
+        const nowMs = Date.now();
+        const expMs = lic.expires_at ? new Date(lic.expires_at).getTime() : 0;
+        if (!expMs || expMs <= nowMs) {
+          return json({
+            ok: false,
+            code: "TEST_LICENSE_EXPIRED",
+            error_code: "TEST_LICENSE_EXPIRED",
+            message: "Esta licença de teste está expirada e não pode ser reenviada.",
+          }, 400);
+        }
       }
 
       const targetEmail = (customer_email || lic.customer_email)?.trim().toLowerCase();

@@ -522,6 +522,20 @@ Deno.serve(async (req: Request) => {
           return json({ ok: false, message: "Licença não encontrada ou não pertencente à sua conta de revendedor." }, 404);
         }
 
+        // Validação estrita: licença de teste expirada não pode ser reenviada
+        if (lic.license_type === "TEST") {
+          const nowMs = Date.now();
+          const expMs = lic.expires_at ? new Date(lic.expires_at).getTime() : 0;
+          if (!expMs || expMs <= nowMs) {
+            return json({
+              ok: false,
+              code: "TEST_LICENSE_EXPIRED",
+              error_code: "TEST_LICENSE_EXPIRED",
+              message: "Esta licença de teste está expirada e não pode ser reenviada.",
+            }, 400);
+          }
+        }
+
         const targetEmail = (customer_email || lic.customer_email)?.trim().toLowerCase();
         const targetName = lic.customer_name || "Cliente";
         const targetPlan = lic.plan || "ANNUAL";

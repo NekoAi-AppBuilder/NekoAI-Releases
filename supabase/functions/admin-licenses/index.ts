@@ -114,7 +114,7 @@ Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
 
   // ============================================================================
-  // GET: LISTAGEM OU HISTÓRICO DE EVENTOS
+  // GET: LISTAGEM, HISTÓRICO DE EVENTOS OU BUSCA DE REVENDEDORES
   // ============================================================================
   if (req.method === "GET") {
     const action = url.searchParams.get("action");
@@ -134,26 +134,253 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true, events: events || [] });
     }
 
-    const search = url.searchParams.get("search")?.trim().toUpperCase();
+    if (action === "search_resellers") {
+      const q = url.searchParams.get("query")?.trim() || "";
+      let qBuilder = supabaseAdmin
+        .from("resellers")
+        .select("id, name, email")
+        .order("name", { ascending: true })
+        .limit(20);
+
+      if (q) {
+        qBuilder = qBuilder.or(`name.ilike.%${q}%,email.ilike.%${q}%`);
+      }
+
+      const { data: searchResults, error: sErr } = await qBuilder;
+      if (sErr) return json({ ok: false, message: sErr.message }, 500);
+
+      // NekoAI Admin NÃO é revendedor; excluir estritamente qualquer menção administrativa
+      const filtered = (searchResults || []).filter((r: any) => {
+        const name = (r.name || "").trim().toLowerCase();
+        const email = (r.email || "").trim().toLowerCase();
+        const id = (r.id || "").trim().toLowerCase();
+        return (
+          name !== "nekoai admin" &&
+          name !== "admin" &&
+          email !== "admin@nekoai.com" &&
+          id !== "admin"
+        );
+      });
+
+      return json({ ok: true, resellers: filtered });
+    }
+
+    if (action === "activities") {
+      const limitStr = url.searchParams.get("limit");
+      const cursor = url.searchParams.get("cursor"); // Timestamp ISO para paginação baseada em cursor
+
+      const limit = limitStr ? Math.max(1, Math.min(50, parseInt(limitStr, 10) || 10)) : 10;
+
+      // 1. Licenças criadas ou revogadas
+      let licQuery = supabaseAdmin
+        .from("licenses")
+        .select("id, key_mask, plan, status, customer_name, customer_email, license_type, created_at, updated_at")
+        .order("created_at", { ascending: false })
+        .limit(limit + 5);
+
+      if (cursor) {
+        licQuery = licQuery.lt("created_at", cursor);
+      }
+
+      // 2. Vendas de revendedor confirmadas
+      let salesQuery = supabaseAdmin
+        .from("reseller_sales")
+        .select("id, reseller_id, plan, resale_price_snapshot, status, customer_name, customer_email, paid_at, created_at")
+        .in("status", ["paid", "license_delivered"])
+        .order("created_at", { ascending: false })
+        .limit(limit + 5);
+
+      if (cursor) {
+        salesQuery = salesQuery.lt("created_at", cursor);
+      }
+
+      // 3. Novos revendedores cadastrados
+      let resellersQuery = supabaseAdmin
+        .from("resellers")
+        .select("id, name, email, created_at")
+        .order("created_at", { ascending: false })
+        .limit(limit + 5);
+
+      if (cursor) {
+        resellersQuery = resellersQuery.lt("created_at", cursor);
+      }
+
+      const [licRes, salesRes, resRes] = await Promise.all([
+        licQuery,
+        salesQuery,
+        resellersQuery,
+      ]);
+
+      const activities: any[] = [];
+
+      // A. Licenças
+      if (licRes.data) {
+        for (const lic of licRes.data) {
+          const planLabel = lic.plan === "MONTHLY" ? "Mensal" : lic.plan === "QUARTERLY" ? "Trimestral" : "Anual";
+          const clientDisplay = lic.customer_name || lic.customer_email || lic.key_mask;
+          activities.push({
+            id: `lic-create-${lic.id}`,
+            type: "license_created",
+            title: `Licença criada para ${clientDisplay}`,
+            subtitle: `Plano ${planLabel} · ${lic.key_mask}`,
+            timestamp: lic.created_at,
+          });
+
+          if (lic.status === "revoked") {
+            const revDate = lic.updated_at || lic.created_at;
+            if (!cursor || revDate < cursor) {
+              activities.push({
+                id: `lic-rev-${lic.id}`,
+                type: "license_revoked",
+                title: `Licença revogada: ${lic.key_mask}`,
+                subtitle: `${lic.customer_name || "Cliente sem nome cadastrado"}`,
+                timestamp: revDate,
+              });
+            }
+          }
+        }
+      }
+
+      // B. Vendas de revendedor
+      if (salesRes.data) {
+        for (const sale of salesRes.data) {
+          const planLabel = sale.plan === "MONTHLY" ? "Mensal" : sale.plan === "QUARTERLY" ? "Trimestral" : "Anual";
+          const formattedVal = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(sale.resale_price_snapshot || 0);
+          activities.push({
+            id: `sale-reseller-${sale.id}`,
+            type: "reseller_sale",
+            title: "Venda de revendedor confirmada",
+            subtitle: `${sale.customer_name || "Cliente"} · ${planLabel} · ${formattedVal}`,
+            timestamp: sale.created_at || sale.paid_at,
+          });
+        }
+      }
+
+      // C. Revendedores
+      if (resRes.data) {
+        for (const r of resRes.data) {
+          activities.push({
+            id: `reseller-new-${r.id}`,
+            type: "new_reseller",
+            title: "Novo revendedor cadastrado",
+            subtitle: `${r.name} · ${r.email}`,
+            timestamp: r.created_at,
+          });
+        }
+      }
+
+      // Deduplicação por id antes de paginar
+      const seenIds = new Set<string>();
+      const uniqueActivities = activities.filter((act) => {
+        if (seenIds.has(act.id)) return false;
+        seenIds.add(act.id);
+        return true;
+      });
+
+      // Ordenar decrescente por timestamp
+      uniqueActivities.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+      // Paginação real
+      const paginated = uniqueActivities.slice(0, limit);
+      const hasMore = uniqueActivities.length > limit;
+      const nextCursor = hasMore && paginated.length > 0 ? paginated[paginated.length - 1].timestamp : null;
+
+      // Proteção contra cursor estagnado/repetido
+      const finalHasMore = hasMore && nextCursor !== null && nextCursor !== cursor;
+
+      return json({
+        ok: true,
+        activities: paginated,
+        next_cursor: finalHasMore ? nextCursor : null,
+        has_more: finalHasMore,
+      });
+    }
+
+    const search = url.searchParams.get("search")?.trim();
     const status = url.searchParams.get("status")?.trim().toLowerCase();
     const plan = url.searchParams.get("plan")?.trim().toUpperCase();
+    const type = url.searchParams.get("type")?.trim().toLowerCase();
+    const origin = url.searchParams.get("origin")?.trim().toLowerCase();
+    const resellerId = url.searchParams.get("reseller_id")?.trim();
+    const pageStr = url.searchParams.get("page");
+    const limitStr = url.searchParams.get("limit");
 
-    // 1. Busca licenças com campos de cliente
+    const page = pageStr ? Math.max(1, parseInt(pageStr, 10) || 1) : 1;
+    const limit = limitStr ? Math.max(1, Math.min(1000, parseInt(limitStr, 10) || 20)) : 20;
+
+    // 1. Consulta de licenças filtrada com paginação server-side
     let query = supabaseAdmin
       .from("licenses")
-      .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, encrypted_key, license_type")
+      .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, encrypted_key, license_type, reseller_id", { count: "exact" })
       .order("created_at", { ascending: false });
 
     if (search) {
       query = query.or(`key_mask.ilike.%${search}%,customer_name.ilike.%${search}%,customer_email.ilike.%${search}%,customer_whatsapp.ilike.%${search}%`);
     }
-    if (status && status !== "all") query = query.eq("status", status);
+    if (status && status !== "all") {
+      if (status === "expired") {
+        query = query.or(`status.eq.expired,and(status.neq.revoked,expires_at.lte.${new Date().toISOString()})`);
+      } else if (status === "active") {
+        query = query.eq("status", "active").or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`);
+      } else {
+        query = query.eq("status", status);
+      }
+    }
     if (plan && plan !== "all") query = query.eq("plan", plan);
+    
+    // Filtro por Tipo
+    if (type && type !== "all") {
+      if (type === "test") {
+        query = query.eq("license_type", "TEST");
+      } else if (type === "reseller") {
+        query = query.not("reseller_id", "is", null);
+      } else if (type === "direct") {
+        query = query.or("license_type.is.null,license_type.neq.TEST").is("reseller_id", null);
+      }
+    }
 
-    const { data: licenseList, error: licError } = await query;
+    // Filtro por Origem
+    if (origin && origin !== "all") {
+      if (origin === "direct" || origin === "neko_admin" || origin === "admin") {
+        query = query.or("license_type.is.null,license_type.neq.TEST").is("reseller_id", null);
+      } else if (origin === "all_resellers") {
+        query = query.or("license_type.is.null,license_type.neq.TEST").not("reseller_id", "is", null);
+      }
+    }
+
+    // Filtro por Revendedor Específico
+    if (resellerId && resellerId !== "all") {
+      query = query.eq("reseller_id", resellerId);
+    }
+
+    // Paginação server-side
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+    query = query.range(from, to);
+
+    const { data: licenseList, count: totalFilteredItems, error: licError } = await query;
     if (licError) return json({ ok: false, message: licError.message }, 500);
 
-    // 2. Busca ativações diretamente da tabela license_activations (Multi-Device)
+    // 2. Mapeamento sob demanda dos revendedores referenciados na página atual (escalável para 500+ revendedores)
+    const referencedResellerIds = [...new Set((licenseList || []).map((l: any) => l.reseller_id).filter(Boolean))];
+    const resellerMap = new Map<string, { id: string; name: string; email: string }>();
+    if (referencedResellerIds.length > 0) {
+      try {
+        const { data: resData } = await supabaseAdmin
+          .from("resellers")
+          .select("id, name, email")
+          .in("id", referencedResellerIds);
+        if (resData) {
+          for (const r of resData) {
+            resellerMap.set(r.id, r);
+          }
+        }
+      } catch (errRes) {
+        console.warn("[admin-licenses] Erro ao carregar detalhes dos revendedores:", errRes);
+      }
+    }
+
+    // 3. Busca ativações dos registros da página atual
     const licenseIds = (licenseList || []).map((l: any) => l.id);
     const activationsMap = new Map<string, Array<{ device_id: string; device_name: string; last_validated_at: string }>>();
 
@@ -179,20 +406,33 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // 3. Contadores globais
+    // 4. Estatísticas globais reais
+    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
     const { count: totalCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true });
-    const { count: activeCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true }).eq("status", "active");
+    const { count: activeCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true }).eq("status", "active").or(`expires_at.is.null,expires_at.gt.${nowIso}`);
     const { count: revokedCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true }).eq("status", "revoked");
-    const { count: expiredCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true }).eq("status", "expired");
+    const { count: expiredCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true }).or(`status.eq.expired,and(status.neq.revoked,expires_at.lte.${nowIso})`);
+    const { count: testCount } = await supabaseAdmin.from("licenses").select("*", { count: "exact", head: true }).eq("license_type", "TEST");
     const { count: activeDevicesCount } = await supabaseAdmin.from("license_activations").select("*", { count: "exact", head: true });
 
     const formatted = (licenseList || []).map((lic: any) => {
       const activeDevices = activationsMap.get(lic.id) || [];
+      const resellerInfo = lic.reseller_id ? resellerMap.get(lic.reseller_id) : null;
+
+      let effectiveStatus = lic.status;
+      if (lic.status !== "revoked" && lic.expires_at) {
+        const expMs = new Date(lic.expires_at).getTime();
+        if (!Number.isNaN(expMs) && expMs <= nowMs) {
+          effectiveStatus = "expired";
+        }
+      }
+
       return {
         id: lic.id,
         key_mask: lic.key_mask,
         plan: lic.plan,
-        status: lic.status,
+        status: effectiveStatus,
         max_devices: lic.max_devices || 1,
         expires_at: lic.expires_at,
         entitlements: lic.entitlements,
@@ -201,6 +441,9 @@ Deno.serve(async (req: Request) => {
         customer_whatsapp: lic.customer_whatsapp || null,
         has_stored_key: !!(lic.encrypted_key && lic.encrypted_key.length > 0),
         license_type: lic.license_type || "NORMAL",
+        reseller_id: lic.reseller_id || null,
+        reseller_name: resellerInfo?.name || null,
+        reseller_email: resellerInfo?.email || null,
         created_at: lic.created_at,
         updated_at: lic.updated_at,
         active_devices: activeDevices,
@@ -210,14 +453,24 @@ Deno.serve(async (req: Request) => {
       };
     });
 
+    const totalItems = totalFilteredItems || 0;
+    const totalPages = Math.max(1, Math.ceil(totalItems / limit));
+
     return json({
       ok: true,
       licenses: formatted,
+      pagination: {
+        page,
+        limit,
+        total_items: totalItems,
+        total_pages: totalPages,
+      },
       stats: {
         total_licenses: totalCount || 0,
         active_licenses: activeCount || 0,
         revoked_licenses: revokedCount || 0,
         expired_licenses: expiredCount || 0,
+        test_licenses: testCount || 0,
         active_devices: activeDevicesCount || 0,
       },
     });
