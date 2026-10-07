@@ -219,7 +219,7 @@ Deno.serve(async (req: Request) => {
 
       // 1. Atualização das Configurações Gerais
       if (action === "update_general") {
-        const payload = body.general || {};
+        const payload = body.general || body.payload || body || {};
         const updatedGeneral = {
           platform_name: String(payload.platform_name || DEFAULT_GENERAL_SETTINGS.platform_name).trim(),
           app_download_url: String(payload.app_download_url || DEFAULT_GENERAL_SETTINGS.app_download_url).trim(),
@@ -230,17 +230,24 @@ Deno.serve(async (req: Request) => {
 
         const { data: dbData, error: dbErr } = await supabaseAdmin
           .from("admin_settings")
-          .upsert({
-            key: "general",
-            value: updatedGeneral,
-            description: "Configurações operacionais e remetentes de e-mail transacional",
-            updated_at: new Date().toISOString(),
-            updated_by: "admin",
-          }).select("value").single();
+          .upsert(
+            {
+              key: "general",
+              value: updatedGeneral,
+              description: "Configurações operacionais e remetentes de e-mail transacional",
+              updated_at: new Date().toISOString(),
+              updated_by: "admin",
+            },
+            { onConflict: "key" }
+          )
+          .select("value")
+          .maybeSingle();
+
         if (dbErr) {
-          console.warn("[admin-settings] Falha no banco de dados:", dbErr.message);
-          return json({ ok: false, message: `Erro ao salvar configuraÃ§Ãµes operacionais: ${dbErr.message}` }, 500);
+          console.error("[admin-settings] Falha no banco de dados ao salvar configurações gerais:", dbErr.message);
+          return json({ ok: false, message: `Erro ao salvar configurações operacionais: ${dbErr.message}` }, 500);
         }
+
         return json({
           ok: true,
           message: "Configurações gerais atualizadas com sucesso.",
@@ -288,13 +295,13 @@ Deno.serve(async (req: Request) => {
           .upsert({
             key: "pricing",
             value: updatedPricing,
-            description: "Tabela oficial de custos base NekoAI e preÃ§os sugeridos de revenda",
+            description: "Tabela oficial de custos base NekoAI e preços sugeridos de revenda",
             updated_at: new Date().toISOString(),
             updated_by: "admin",
           }).select("value").single();
         if (dbErr) {
           console.warn("[admin-settings] Falha no banco de dados:", dbErr.message);
-          return json({ ok: false, message: `Erro ao salvar preÃ§os: ${dbErr.message}` }, 500);
+          return json({ ok: false, message: `Erro ao salvar preços: ${dbErr.message}` }, 500);
         }
         return json({
           ok: true,

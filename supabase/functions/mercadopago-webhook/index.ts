@@ -29,6 +29,27 @@ function timingSafeEqualHex(a: string, b: string): boolean {
   return result === 0;
 }
 
+export function cleanAccessToken(raw: string | null | undefined): string {
+  if (!raw) return "";
+  let token = raw.trim();
+  while (
+    (token.startsWith('"') && token.endsWith('"')) ||
+    (token.startsWith("'") && token.endsWith("'"))
+  ) {
+    token = token.slice(1, -1).trim();
+  }
+  if (token.toLowerCase().startsWith("bearer ")) {
+    token = token.slice(7).trim();
+  }
+  while (
+    (token.startsWith('"') && token.endsWith('"')) ||
+    (token.startsWith("'") && token.endsWith("'"))
+  ) {
+    token = token.slice(1, -1).trim();
+  }
+  return token;
+}
+
 /**
  * Validação de Assinatura Criptográfica HMAC-SHA256 do Mercado Pago Webhook V2
  * Manifesto Oficial: id:<data.id>;request-id:<x-request-id>;ts:<ts>;
@@ -108,7 +129,7 @@ Deno.serve(async (req: Request) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  const mpAccessToken = Deno.env.get("MERCADOPAGO_ACCESS_TOKEN");
+  const mpAccessToken = cleanAccessToken(Deno.env.get("MERCADOPAGO_ACCESS_TOKEN"));
   const webhookSecret = Deno.env.get("MERCADOPAGO_WEBHOOK_SECRET");
 
   if (!supabaseUrl || !supabaseServiceKey) {
@@ -141,8 +162,12 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  // 3. Extração do ID do Pedido (Order ID) do Payload / Query String
-  const orderId = bodyDataId || url.searchParams.get("data.id") || url.searchParams.get("id");
+  // 3. Extração do ID do Pedido (Order ID) do Payload / Query String / Resource
+  let orderId = bodyDataId || url.searchParams.get("data.id") || url.searchParams.get("id");
+  if (!orderId && typeof body?.resource === "string") {
+    const resourceMatch = body.resource.match(/\/(\d+|[a-zA-Z0-9_-]+)$/);
+    if (resourceMatch) orderId = resourceMatch[1];
+  }
 
   if (!orderId) {
     console.warn("[mercadopago-webhook] Webhook recebido sem ID de order/recurso.");
@@ -163,6 +188,31 @@ Deno.serve(async (req: Request) => {
       });
       if (mpRes.ok) {
         orderDetails = await mpRes.json();
+      } else if (mpRes.status === 404) {
+        // Fallback: se o ID direto gerou 404, tenta buscar por external_reference se presente no body
+        const bodyExtRef = body?.external_reference || body?.data?.external_reference;
+        if (bodyExtRef) {
+          try {
+            const now = new Date();
+            const beginDate = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+            const endDate = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+            const searchRes = await fetch(
+              `https://api.mercadopago.com/v1/orders/search?begin_date=${encodeURIComponent(beginDate)}&end_date=${encodeURIComponent(endDate)}&external_reference=${encodeURIComponent(bodyExtRef)}`,
+              {
+                headers: { "Authorization": `Bearer ${mpAccessToken.trim()}` },
+              }
+            );
+            if (searchRes.ok) {
+              const searchData = await searchRes.json();
+              orderDetails = searchData?.data?.[0] || searchData?.results?.[0];
+            }
+          } catch (searchErr) {
+            console.warn("[mercadopago-webhook] Fallback search de order por external_reference falhou:", searchErr);
+          }
+        }
+        if (!orderDetails) {
+          console.error(`[mercadopago-webhook] Falha ao buscar order ${orderId} na API MP: ${mpRes.status}`);
+        }
       } else {
         console.error(`[mercadopago-webhook] Falha ao buscar order ${orderId} na API MP: ${mpRes.status}`);
       }
@@ -199,10 +249,22 @@ Deno.serve(async (req: Request) => {
     return json({ ok: false, error_code: "ORDER_NOT_FOUND", message: "Não foi possível validar os detalhes da order no Mercado Pago." }, 404);
   }
 
+  // 5. Extração robusta de pagamentos/transações (compatível com array ou objeto)
+  const payments = Array.isArray(orderDetails.transactions?.payments)
+    ? orderDetails.transactions.payments
+    : Array.isArray(orderDetails.transactions)
+    ? orderDetails.transactions.flatMap((t: any) => (Array.isArray(t?.payments) ? t.payments : t ? [t] : []))
+    : Array.isArray(orderDetails.payments)
+    ? orderDetails.payments
+    : [];
+
   const externalReference =
     orderDetails.external_reference ||
     orderDetails.metadata?.external_reference ||
-    orderDetails.transactions?.payments?.[0]?.external_reference;
+    orderDetails.transactions?.payments?.[0]?.external_reference ||
+    payments[0]?.external_reference ||
+    body?.external_reference ||
+    body?.data?.external_reference;
 
   if (!externalReference) {
     console.warn(`[mercadopago-webhook] Order ${orderId} não possui external_reference de venda.`);
@@ -241,30 +303,49 @@ Deno.serve(async (req: Request) => {
   const orderStatus = String(orderDetails.status || "");
   const orderStatusDetail = String(orderDetails.status_detail || "");
 
-  const paymentTx = orderDetails.transactions?.payments?.[0];
+  const paymentTx = payments[0];
   const txStatus = String(paymentTx?.status || "");
   const txStatusDetail = String(paymentTx?.status_detail || "");
 
   const isOrderAccredited =
-    orderStatus === "processed" && orderStatusDetail === "accredited";
+    (orderStatus === "processed" && orderStatusDetail === "accredited") ||
+    ((orderStatus === "closed" || orderStatus === "approved") && (orderStatusDetail === "accredited" || orderStatusDetail === "approved"));
 
   const isTxAccredited =
     (txStatus === "processed" || txStatus === "approved") &&
-    txStatusDetail === "accredited";
+    (txStatusDetail === "accredited" || txStatusDetail === "approved");
 
   const hasAnyPaymentAccredited = Boolean(
-    orderDetails.transactions?.payments?.some(
+    payments.some(
       (p: any) =>
         (p?.status === "processed" || p?.status === "approved") &&
-        p?.status_detail === "accredited"
+        (p?.status_detail === "accredited" || p?.status_detail === "approved")
     )
   );
 
   const isApproved = isOrderAccredited || isTxAccredited || hasAnyPaymentAccredited;
 
   const paidAmount = Number(
-    paymentTx?.amount ?? orderDetails.total_amount ?? paymentTx?.transaction_amount ?? 0
+    paymentTx?.amount ??
+    paymentTx?.transaction_amount ??
+    paymentTx?.total_amount ??
+    orderDetails.total_amount ??
+    orderDetails.amount ??
+    0
   );
+
+  // Log de diagnóstico seguro (sem tokens, sem secrets, sem dados sensíveis)
+  console.log("[mercadopago-webhook] Diagnóstico de Order recebido:", {
+    orderId,
+    action: body?.action || body?.type || url.searchParams.get("topic") || "unknown",
+    orderStatus,
+    orderStatusDetail,
+    txStatus,
+    txStatusDetail,
+    saleId: sale.id,
+    isApproved,
+    paidAmount,
+  });
 
   // 8. Trata Status Não Aprovados (Pending / Action Required / Rejected / Cancelled / Expired)
   if (!isApproved) {

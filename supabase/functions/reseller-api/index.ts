@@ -424,8 +424,25 @@ async function calculateSha256Hex(text: string): Promise<string> {
   return hashArr.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function makeKeyMask(key: string): string {
-  return `NEKO-****-****-****-${key.trim().toUpperCase().slice(-4)}`;
+function cleanAccessToken(raw: string | null | undefined): string {
+  if (!raw) return "";
+  let token = raw.trim();
+  while (
+    (token.startsWith('"') && token.endsWith('"')) ||
+    (token.startsWith("'") && token.endsWith("'"))
+  ) {
+    token = token.slice(1, -1).trim();
+  }
+  if (token.toLowerCase().startsWith("bearer ")) {
+    token = token.slice(7).trim();
+  }
+  while (
+    (token.startsWith('"') && token.endsWith('"')) ||
+    (token.startsWith("'") && token.endsWith("'"))
+  ) {
+    token = token.slice(1, -1).trim();
+  }
+  return token;
 }
 
 Deno.serve(async (req: Request) => {
@@ -437,7 +454,7 @@ Deno.serve(async (req: Request) => {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
     const adminSecret = Deno.env.get("NEKO_ADMIN_SECRET_KEY") || Deno.env.get("ADMIN_SECRET_KEY");
-    const mpAccessToken = Deno.env.get("MERCADOPAGO_ACCESS_TOKEN");
+    const mpAccessToken = cleanAccessToken(Deno.env.get("MERCADOPAGO_ACCESS_TOKEN"));
 
     if (!supabaseUrl || !supabaseServiceKey) {
       console.error("[reseller-api] Erro: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausentes.");
@@ -1643,103 +1660,159 @@ Deno.serve(async (req: Request) => {
       let pixQrCodeBase64: string | null = null;
       let ticketUrl: string | null = null;
 
-      if (mpAccessToken) {
-        try {
-          const nameParts = (reseller.name || "").trim().split(/\s+/);
-          const firstName = nameParts[0] || "Revendedor";
-          const lastName = nameParts.slice(1).join(" ") || undefined;
-          const cleanCpfDigits = activeCpf ? activeCpf.replace(/\D/g, "") : null;
-          const formattedAmount = officialNekoCost.toFixed(2);
+      if (!mpAccessToken) {
+        console.error("[reseller-api] MERCADOPAGO_ACCESS_TOKEN ausente ou vazio nas variáveis de ambiente.");
+        await supabaseAdmin
+          .from("reseller_sales")
+          .update({
+            status: "cancelled",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", newSale.id);
 
-          const orderPayload = {
-            type: "online",
-            total_amount: formattedAmount, // O PIX é estritamente no valor do custo NekoAI (neko_cost_snapshot)
-            external_reference: newSale.id,
-            processing_mode: "automatic",
-            transactions: {
-              payments: [
-                {
-                  amount: formattedAmount,
-                  payment_method: {
-                    id: "pix",
-                    type: "bank_transfer",
-                  },
+        return json({
+          ok: false,
+          error_code: "MP_CONFIG_ERROR",
+          message: "Não foi possível conectar ao Mercado Pago. A configuração da conta de pagamento precisa ser verificada.",
+        }, 500);
+      }
+
+      try {
+        const nameParts = (reseller.name || "").trim().split(/\s+/);
+        const firstName = nameParts[0] || "Revendedor";
+        const lastName = nameParts.slice(1).join(" ") || undefined;
+        const cleanCpfDigits = activeCpf ? activeCpf.replace(/\D/g, "") : null;
+        const formattedAmount = officialNekoCost.toFixed(2);
+
+        const orderPayload = {
+          type: "online",
+          total_amount: formattedAmount, // O PIX é estritamente no valor do custo NekoAI (neko_cost_snapshot)
+          external_reference: newSale.id,
+          processing_mode: "automatic",
+          transactions: {
+            payments: [
+              {
+                amount: formattedAmount,
+                payment_method: {
+                  id: "pix",
+                  type: "bank_transfer",
                 },
-              ],
-            },
-            payer: {
-              email: reseller.email,
-              first_name: firstName,
-              ...(lastName ? { last_name: lastName } : {}),
-              ...(cleanCpfDigits && cleanCpfDigits.length === 11 ? { identification: { type: "CPF", number: cleanCpfDigits } } : {}),
-            },
-          };
+              },
+            ],
+          },
+          payer: {
+            email: reseller.email,
+            first_name: firstName,
+            ...(lastName ? { last_name: lastName } : {}),
+            ...(cleanCpfDigits && cleanCpfDigits.length === 11 ? { identification: { type: "CPF", number: cleanCpfDigits } } : {}),
+          },
+        };
 
-          const mpResponse = await fetch("https://api.mercadopago.com/v1/orders", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${mpAccessToken.trim()}`,
-              "X-Idempotency-Key": newSale.id,
-            },
-            body: JSON.stringify(orderPayload),
-          });
+        const mpResponse = await fetch("https://api.mercadopago.com/v1/orders", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${mpAccessToken}`,
+            "X-Idempotency-Key": newSale.id,
+          },
+          body: JSON.stringify(orderPayload),
+        });
 
-          const rawText = await mpResponse.text();
-          let mpData: any = null;
-          try {
-            mpData = rawText ? JSON.parse(rawText) : null;
-          } catch {
-            mpData = rawText;
-          }
+        const rawText = await mpResponse.text();
+        let mpData: any = null;
+        try {
+          mpData = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          mpData = rawText;
+        }
 
-          if (mpResponse.ok && mpData) {
-            const extracted = extractOrderPixData(typeof mpData === "object" ? mpData : null);
-            const orderId = String(mpData.id || extracted.orderId || "");
-            mpPaymentId = orderId || extracted.paymentId || "";
-            pixQrCode = extracted.pixQrCode;
-            pixQrCodeBase64 = extracted.pixQrCodeBase64;
-            ticketUrl = extracted.ticketUrl;
+        if (mpResponse.ok && mpData) {
+          const extracted = extractOrderPixData(typeof mpData === "object" ? mpData : null);
+          const orderId = String(mpData.id || extracted.orderId || "");
+          mpPaymentId = orderId || extracted.paymentId || "";
+          pixQrCode = extracted.pixQrCode;
+          pixQrCodeBase64 = extracted.pixQrCodeBase64;
+          ticketUrl = extracted.ticketUrl;
 
-            if (!pixQrCode) {
-              console.error("[reseller-api] Resposta da Orders API não continha código PIX válido para a Order:", mpData.id);
-              return json({
-                ok: false,
-                error_code: "PIX_DATA_UNAVAILABLE",
-                message: "O pedido foi criado no Mercado Pago, mas o código PIX não pôde ser gerado. Tente novamente.",
-              }, 502);
-            }
-          } else {
-            const detailedError = extractMercadoPagoErrorDetails(mpData, mpResponse.status);
-            const sanitizedDiagnostics = sanitizeForDiagnostics(mpData);
-            console.error("[reseller-api] Falha na criação de Order no Mercado Pago:", {
-              status: mpResponse.status,
-              details: detailedError,
-              diagnostics: sanitizedDiagnostics,
-            });
+          if (!pixQrCode) {
+            console.error("[reseller-api] Resposta da Orders API não continha código PIX válido para a Order:", mpData.id);
+            await supabaseAdmin
+              .from("reseller_sales")
+              .update({
+                status: "cancelled",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", newSale.id);
+
             return json({
               ok: false,
-              error_code: "MP_ORDER_ERROR",
-              message: `Erro ao gerar cobrança no Mercado Pago: ${detailedError}`,
+              error_code: "PIX_DATA_UNAVAILABLE",
+              message: "O pedido foi criado no Mercado Pago, mas o código PIX não pôde ser gerado. Tente novamente.",
+            }, 502);
+          }
+        } else {
+          const detailedError = extractMercadoPagoErrorDetails(mpData, mpResponse.status);
+          const sanitizedDiagnostics = sanitizeForDiagnostics(mpData);
+          console.error("[reseller-api] Falha na criação de Order no Mercado Pago:", {
+            status: mpResponse.status,
+            details: detailedError,
+            diagnostics: sanitizedDiagnostics,
+          });
+
+          // Atualiza status da venda para cancelled para evitar venda pendente fantasma
+          await supabaseAdmin
+            .from("reseller_sales")
+            .update({
+              status: "cancelled",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", newSale.id);
+
+          const isCredentialError =
+            mpResponse.status === 401 ||
+            mpResponse.status === 403 ||
+            detailedError.toLowerCase().includes("invalid access token") ||
+            detailedError.toLowerCase().includes("invalid token") ||
+            detailedError.toLowerCase().includes("unauthorized");
+
+          const userMessage = isCredentialError
+            ? "Não foi possível conectar ao Mercado Pago. A configuração da conta de pagamento precisa ser verificada."
+            : `Erro ao gerar cobrança no Mercado Pago: ${detailedError}`;
+
+          if (isCredentialError) {
+            return json({
+              ok: false,
+              error_code: "MP_AUTH_ERROR",
+              message: userMessage,
               mp_status: mpResponse.status,
               mp_diagnostics: sanitizedDiagnostics,
             }, 400);
           }
-        } catch (mpErr: any) {
-          const errDetail = mpErr?.message || String(mpErr);
-          console.error("[reseller-api] Exceção na chamada de API Mercado Pago Orders:", errDetail);
+
           return json({
             ok: false,
-            error_code: "MP_CONNECTION_ERROR",
-            message: `Erro de comunicação com o Mercado Pago: ${errDetail}`,
-          }, 502);
+            error_code: "MP_ORDER_ERROR",
+            message: userMessage,
+            mp_status: mpResponse.status,
+            mp_diagnostics: sanitizedDiagnostics,
+          }, 400);
         }
-      } else {
-        console.warn("[reseller-api] MERCADOPAGO_ACCESS_TOKEN não configurado nas variáveis de ambiente. Simulação local ativada.");
-        // Em ambiente dev sem token MP, gera simulação de PIX para testes unitários / integração
-        mpPaymentId = `sim_order_${Date.now()}`;
-        pixQrCode = `00020126580014br.gov.bcb.pix0136simulado-nekoai-${newSale.id}5204000053039865405${officialNekoCost}5802BR5906NEKOAI6009SAO_PAULO62070503***6304ABCD`;
-        pixQrCodeBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+      } catch (mpErr: any) {
+        const errDetail = mpErr?.message || String(mpErr);
+        console.error("[reseller-api] Exceção na chamada de API Mercado Pago Orders:", errDetail);
+        await supabaseAdmin
+          .from("reseller_sales")
+          .update({
+            status: "cancelled",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", newSale.id);
+
+        return json({
+          ok: false,
+          error_code: "MP_CONNECTION_ERROR",
+          message: `Erro de comunicação com o Mercado Pago: ${errDetail}`,
+        }, 502);
       }
 
       // 7. Atualiza os dados de PIX e Mercado Pago no registro de venda
