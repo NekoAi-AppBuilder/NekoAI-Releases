@@ -306,6 +306,14 @@ function extractIp(req: Request): string {
          "unknown";
 }
 
+function extractIpOrNull(req: Request): string | null {
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+             req.headers.get("cf-connecting-ip") ||
+             req.headers.get("x-real-ip");
+  if (!ip || ip === "unknown") return null;
+  return ip;
+}
+
 export function extractSessionIdFromJwt(token: string): string | null {
   try {
     const parts = token.split(".");
@@ -443,6 +451,139 @@ function cleanAccessToken(raw: string | null | undefined): string {
     token = token.slice(1, -1).trim();
   }
   return token;
+}
+
+async function handlePrepareRenewal(
+  licenseId: string | undefined,
+  reseller: any,
+  supabaseAdmin: any
+) {
+  if (!licenseId) {
+    return json({ ok: false, error_code: "INVALID_LICENSE_ID", message: "license_id é obrigatório." }, 400);
+  }
+
+  // 1. Busca a licença com campos essenciais
+  const { data: license, error: licErr } = await supabaseAdmin
+    .from("licenses")
+    .select("id, key_mask, plan, status, max_devices, expires_at, customer_name, customer_email, customer_whatsapp, license_type, reseller_id, renewal_count, renewed_at")
+    .eq("id", licenseId)
+    .maybeSingle();
+
+  if (licErr || !license) {
+    return json({ ok: false, error_code: "LICENSE_NOT_FOUND", message: "Licença não encontrada." }, 404);
+  }
+
+  // 2. Validação de isolamento: pertence ao revendedor autenticado
+  if (!license.reseller_id || license.reseller_id !== reseller.id) {
+    return json({
+      ok: false,
+      error_code: "FORBIDDEN_RESELLER_MISMATCH",
+      message: "A licença não pertence ao seu catálogo de revendedor.",
+    }, 403);
+  }
+
+  // 3. Validação de licença TEST
+  if (license.license_type === "TEST") {
+    return json({
+      ok: false,
+      error_code: "CANNOT_RENEW_TEST_LICENSE",
+      message: "Licenças de teste gratuitas não podem ser renovadas comercialmente.",
+    }, 400);
+  }
+
+  // 4. Validação de status revogado
+  if (license.status === "revoked") {
+    return json({
+      ok: false,
+      error_code: "CANNOT_RENEW_REVOKED_LICENSE",
+      message: "Licenças revogadas não podem ser renovadas.",
+    }, 400);
+  }
+
+  // 5. Obtenção de preços oficiais e configurações de revenda
+  const officialPricing = await getOfficialPricing(supabaseAdmin);
+  const { data: priceSettings } = await supabaseAdmin
+    .from("reseller_price_settings")
+    .select("plan, resale_price")
+    .eq("reseller_id", reseller.id);
+
+  const priceMap: Record<string, number> = {};
+  if (priceSettings) {
+    for (const ps of priceSettings) {
+      priceMap[ps.plan] = Number(ps.resale_price);
+    }
+  }
+
+  const planDurations: Record<string, number> = {
+    MONTHLY: 30,
+    QUARTERLY: 90,
+    ANNUAL: 365,
+  };
+
+  const planLabels: Record<string, string> = {
+    MONTHLY: "Mensal (30 dias)",
+    QUARTERLY: "Trimestral (90 dias)",
+    ANNUAL: "Anual (365 dias)",
+  };
+
+  const plans = (["MONTHLY", "QUARTERLY", "ANNUAL"] as const).map((p) => {
+    const nekoCost = officialPricing[p]?.neko_cost ?? OFFICIAL_NEKO_COSTS[p];
+    const resalePrice = priceMap[p] ?? officialPricing[p]?.suggested_resale_price ?? nekoCost;
+    const profit = Number((resalePrice - nekoCost).toFixed(2));
+    return {
+      plan: p,
+      label: planLabels[p],
+      duration_days: planDurations[p],
+      neko_cost: nekoCost,
+      resale_price: resalePrice,
+      profit: profit,
+    };
+  });
+
+  // 6. Verifica cobrança pendente ativa de renovação para esta licença
+  const { data: pendingRenewal } = await supabaseAdmin
+    .from("reseller_sales")
+    .select("*")
+    .eq("reseller_id", reseller.id)
+    .eq("license_id", license.id)
+    .eq("sale_type", "RENEWAL")
+    .eq("status", "pending")
+    .gt("expires_at", new Date().toISOString())
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const activePendingRenewal = pendingRenewal ? {
+    sale_id: pendingRenewal.id,
+    plan: pendingRenewal.plan,
+    neko_cost: Number(pendingRenewal.neko_cost_snapshot || 0),
+    resale_price: Number(pendingRenewal.resale_price_snapshot || 0),
+    profit: Number(pendingRenewal.profit_snapshot || 0),
+    pix_qr_code: pendingRenewal.pix_qr_code || null,
+    pix_qr_code_base64: pendingRenewal.pix_qr_code_base64 || null,
+    ticket_url: pendingRenewal.ticket_url || null,
+    expires_at: pendingRenewal.expires_at,
+  } : null;
+
+  const isExpired = license.status === "expired" || (license.expires_at ? new Date(license.expires_at).getTime() <= Date.now() : false);
+
+  return json({
+    ok: true,
+    license_id: license.id,
+    client_id: license.id,
+    client_name: license.customer_name || "Cliente",
+    client_email: license.customer_email || "—",
+    client_whatsapp: license.customer_whatsapp || null,
+    key_mask: license.key_mask,
+    current_plan: license.plan,
+    expires_at: license.expires_at,
+    status: license.status,
+    renewal_count: license.renewal_count || 0,
+    renewed_at: license.renewed_at || null,
+    is_expired: isExpired,
+    plans,
+    active_pending_renewal: activePendingRenewal,
+  });
 }
 
 Deno.serve(async (req: Request) => {
@@ -821,19 +962,43 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      // Se a venda for do tipo RENEWAL e estiver paga, aciona auto-fulfillment atômico via fn_renew_reseller_license
+      if (sale.sale_type === "RENEWAL" && sale.status === "paid" && sale.license_id) {
+        try {
+          const { data: rpcRes, error: rpcErr } = await supabaseAdmin.rpc("fn_renew_reseller_license", {
+            p_sale_id: sale.id,
+            p_reseller_id: reseller.id,
+            p_ip_address: extractIpOrNull(req),
+            p_user_agent: req.headers.get("user-agent") || null,
+          });
+          if (!rpcErr && rpcRes?.ok) {
+            sale.status = "license_delivered";
+            console.log(`[reseller-api] Auto-fulfillment de renovação concluído durante get_sale para venda ${sale.id}.`);
+          }
+        } catch (autoRenewErr) {
+          console.warn("[reseller-api] Auto-fulfillment de renovação em get_sale falhou silenciosamente:", autoRenewErr);
+        }
+      }
+
       // Busca dados complementares da licença vinculada se houver
       let licenseKeyMask: string | null = null;
       let licenseStatus: string | null = null;
+      let licenseExpiresAt: string | null = null;
+      let licenseRenewalCount: number | null = null;
+      let licenseRenewedAt: string | null = null;
       if (sale.license_id) {
         const { data: licData } = await supabaseAdmin
           .from("licenses")
-          .select("id, key_mask, status")
+          .select("id, key_mask, status, expires_at, renewal_count, renewed_at")
           .eq("id", sale.license_id)
           .eq("reseller_id", reseller.id)
           .maybeSingle();
         if (licData) {
           licenseKeyMask = licData.key_mask;
           licenseStatus = licData.status;
+          licenseExpiresAt = licData.expires_at;
+          licenseRenewalCount = licData.renewal_count;
+          licenseRenewedAt = licData.renewed_at;
         }
       }
 
@@ -874,6 +1039,7 @@ Deno.serve(async (req: Request) => {
         ok: true,
         sale: {
           id: sale.id,
+          sale_type: sale.sale_type || "NEW_LICENSE",
           reseller_id: sale.reseller_id,
           reseller_name: reseller.name,
           plan: sale.plan,
@@ -892,6 +1058,9 @@ Deno.serve(async (req: Request) => {
           license_id: sale.license_id || null,
           license_key_mask: licenseKeyMask,
           license_status: licenseStatus,
+          license_expires_at: licenseExpiresAt,
+          renewal_count: licenseRenewalCount ?? 0,
+          renewed_at: licenseRenewedAt,
           pix_qr_code: sale.pix_qr_code || null,
           pix_qr_code_base64: sale.pix_qr_code_base64 || null,
           ticket_url: sale.ticket_url || null,
@@ -904,6 +1073,14 @@ Deno.serve(async (req: Request) => {
     }
 
     // --------------------------------------------------------------------------
+    // AÇÃO GET: PREPARAR RENOVAÇÃO DE LICENÇA (prepare_renewal)
+    // --------------------------------------------------------------------------
+    if (action === "prepare_renewal") {
+      const licenseId = url.searchParams.get("license_id")?.trim();
+      return await handlePrepareRenewal(licenseId, reseller, supabaseAdmin);
+    }
+
+    // --------------------------------------------------------------------------
     // AÇÃO GET: LISTAGEM DE VENDAS DO REVENDEDOR COM FILTROS, MÉTRICAS E PAGINAÇÃO
     // --------------------------------------------------------------------------
     if (action === "list_sales") {
@@ -913,6 +1090,9 @@ Deno.serve(async (req: Request) => {
 
       const rawStatus = url.searchParams.get("status")?.trim().toLowerCase();
       const statusFilter = (!rawStatus || rawStatus === "all") ? null : rawStatus;
+
+      const rawSaleType = url.searchParams.get("sale_type")?.trim().toUpperCase();
+      const saleTypeFilter = (!rawSaleType || rawSaleType === "ALL") ? null : rawSaleType;
 
       const dateFrom = url.searchParams.get("date_from")?.trim() || "";
       const dateTo = url.searchParams.get("date_to")?.trim() || "";
@@ -961,6 +1141,7 @@ Deno.serve(async (req: Request) => {
 
         return {
           id: s.id,
+          sale_type: s.sale_type || "NEW_LICENSE",
           reseller_id: s.reseller_id,
           reseller_name: reseller.name,
           plan: s.plan,
@@ -1027,6 +1208,10 @@ Deno.serve(async (req: Request) => {
 
       if (statusFilter) {
         filtered = filtered.filter((s: any) => s.status?.toLowerCase() === statusFilter);
+      }
+
+      if (saleTypeFilter) {
+        filtered = filtered.filter((s: any) => (s.sale_type || "NEW_LICENSE").toUpperCase() === saleTypeFilter);
       }
 
       if (dateFrom) {
@@ -1109,7 +1294,7 @@ Deno.serve(async (req: Request) => {
       // 1. Busca todas as licenças do revendedor autenticado (estritamente comerciais, sem TEST)
       const { data: allResellerLicenses, error: allErr } = await supabaseAdmin
         .from("licenses")
-        .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, license_type")
+        .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, license_type, renewed_at, renewal_count")
         .eq("reseller_id", reseller.id)
         .neq("license_type", "TEST")
         .order("created_at", { ascending: false });
@@ -1136,6 +1321,17 @@ Deno.serve(async (req: Request) => {
       }).length;
       const testLicenses = 0; // Regra 18: TEST nunca entra em Revendedor -> Licenças
 
+      // Licenças comerciais que vencem hoje em UTC-3 (exclui TEST e revoked)
+      const { startIso: todayStartIso, nextDayStartIso: todayNextDayIso } = getUtc3DayBoundsIso();
+      const startTodayMs = new Date(todayStartIso).getTime();
+      const endTodayMs = new Date(todayNextDayIso).getTime();
+      const renewalLicenses = allList.filter((l: any) => {
+        if (l.license_type === "TEST" || l.status === "revoked") return false;
+        if (!l.expires_at) return false;
+        const expMs = new Date(l.expires_at).getTime();
+        return expMs >= startTodayMs && expMs < endTodayMs;
+      }).length;
+
       // 2. Aplicação de Filtros
       let filtered = allList;
 
@@ -1158,6 +1354,13 @@ Deno.serve(async (req: Request) => {
           filtered = filtered.filter((l: any) => {
             return l.status === "expired" || (l.expires_at && new Date(l.expires_at).getTime() <= nowMs);
           });
+        } else if (statusParam === "renewals" || statusParam === "renewal") {
+          filtered = filtered.filter((l: any) => {
+            if (l.license_type === "TEST" || l.status === "revoked") return false;
+            if (!l.expires_at) return false;
+            const expMs = new Date(l.expires_at).getTime();
+            return expMs >= startTodayMs && expMs < endTodayMs;
+          });
         } else if (statusParam === "test") {
           filtered = filtered.filter((l: any) => l.license_type === "TEST");
         } else {
@@ -1170,6 +1373,19 @@ Deno.serve(async (req: Request) => {
           const p = (l.plan || "").toUpperCase();
           if (planParam === "TEST") return l.license_type === "TEST" || p === "TEST";
           return p === planParam;
+        });
+      }
+
+      const renewalsFilter = url.searchParams.get("renewals")?.trim().toLowerCase();
+      if (renewalsFilter === "today") {
+        const { startIso, nextDayStartIso } = getUtc3DayBoundsIso();
+        const startMs = new Date(startIso).getTime();
+        const endMs = new Date(nextDayStartIso).getTime();
+        filtered = filtered.filter((l: any) => {
+          if (l.license_type === "TEST" || l.status === "revoked") return false;
+          if (!l.expires_at) return false;
+          const expMs = new Date(l.expires_at).getTime();
+          return expMs >= startMs && expMs < endMs;
         });
       }
 
@@ -1217,6 +1433,8 @@ Deno.serve(async (req: Request) => {
         license_type: lic.license_type || "NORMAL",
         created_at: lic.created_at,
         updated_at: lic.updated_at,
+        renewed_at: lic.renewed_at || null,
+        renewal_count: lic.renewal_count || 0,
         active_devices: activationsMap.get(lic.id) || [],
       }));
 
@@ -1228,6 +1446,8 @@ Deno.serve(async (req: Request) => {
           active_licenses: activeLicenses,
           expired_licenses: expiredLicenses,
           test_licenses: testLicenses,
+          renewal_licenses: renewalLicenses,
+          renewals_today: renewalLicenses,
         },
         pagination: {
           page,
@@ -1249,7 +1469,7 @@ Deno.serve(async (req: Request) => {
 
       const { data: lic, error: licErr } = await supabaseAdmin
         .from("licenses")
-        .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, license_type, reseller_id")
+        .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, license_type, reseller_id, renewed_at, renewal_count")
         .eq("id", licenseId)
         .eq("reseller_id", reseller.id)
         .maybeSingle();
@@ -1291,6 +1511,8 @@ Deno.serve(async (req: Request) => {
           license_type: lic.license_type || "NORMAL",
           created_at: lic.created_at,
           updated_at: lic.updated_at,
+          renewed_at: lic.renewed_at || null,
+          renewal_count: lic.renewal_count || 0,
           active_devices: activations || [],
           sale: sale ? {
             id: sale.id,
@@ -1502,6 +1724,415 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    // --------------------------------------------------------------------------
+    // AÇÃO POST: PREPARAR RENOVAÇÃO DE LICENÇA (prepare_renewal)
+    // --------------------------------------------------------------------------
+    if (action === "prepare_renewal") {
+      const licenseId = (body.license_id || url.searchParams.get("license_id"))?.trim();
+      return await handlePrepareRenewal(licenseId, reseller, supabaseAdmin);
+    }
+
+    // --------------------------------------------------------------------------
+    // AÇÃO POST: CRIAR CHECKOUT PIX PARA RENOVAÇÃO DE LICENÇA (create_renewal_checkout)
+    // --------------------------------------------------------------------------
+    if (action === "create_renewal_checkout") {
+      const { license_id, plan } = body;
+
+      if (!license_id) {
+        return json({ ok: false, error_code: "INVALID_LICENSE_ID", message: "license_id é obrigatório para renovação." }, 400);
+      }
+
+      if (!plan || !["MONTHLY", "QUARTERLY", "ANNUAL"].includes(plan)) {
+        return json({ ok: false, error_code: "INVALID_PLAN", message: "Plano inválido. Selecione MONTHLY, QUARTERLY ou ANNUAL." }, 400);
+      }
+
+      // 1. Busca a licença e valida posse e elegibilidade
+      const { data: license, error: licErr } = await supabaseAdmin
+        .from("licenses")
+        .select("id, key_mask, plan, status, max_devices, expires_at, customer_name, customer_email, customer_whatsapp, license_type, reseller_id")
+        .eq("id", license_id)
+        .maybeSingle();
+
+      if (licErr || !license) {
+        return json({ ok: false, error_code: "LICENSE_NOT_FOUND", message: "Licença não encontrada." }, 404);
+      }
+
+      if (!license.reseller_id || license.reseller_id !== reseller.id) {
+        return json({ ok: false, error_code: "FORBIDDEN_RESELLER_MISMATCH", message: "A licença não pertence ao seu catálogo de revendedor." }, 403);
+      }
+
+      if (license.license_type === "TEST") {
+        return json({ ok: false, error_code: "CANNOT_RENEW_TEST_LICENSE", message: "Licenças de teste gratuitas não podem ser renovadas comercialmente." }, 400);
+      }
+
+      if (license.status === "revoked") {
+        return json({ ok: false, error_code: "CANNOT_RENEW_REVOKED_LICENSE", message: "Licenças revogadas não podem ser renovadas." }, 400);
+      }
+
+      // 2. Identificação do Pagador (Revendedor) para Faturamento no PIX do Mercado Pago
+      // NOTA ARQUITETURAL CRÍTICA:
+      // Na renovação comercial, o pagador do PIX pelo custo NekoAI é o REVENDEDOR.
+      // O cliente já pertence à licença existente e seus dados cadastrais permanecem intactos.
+      // A renovação NUNCA solicita CPF de cliente, NUNCA cria cliente na tabela clients,
+      // NUNCA atualiza CPF de cliente e NUNCA altera cadastros de clientes ou metadados de terceiros.
+      const activeCpf = (user?.user_metadata?.cpf as string) || (reseller?.cpf as string) || null;
+
+      // 3. Obtenção do Custo Oficial NekoAI e Preço de Revenda Configurado
+      const officialPricing = await getOfficialPricing(supabaseAdmin);
+      const officialNekoCost = officialPricing[plan as keyof typeof officialPricing]?.neko_cost ?? OFFICIAL_NEKO_COSTS[plan];
+
+      const { data: priceSetting } = await supabaseAdmin
+        .from("reseller_price_settings")
+        .select("resale_price")
+        .eq("reseller_id", reseller.id)
+        .eq("plan", plan)
+        .single();
+
+      const configuredResalePrice = priceSetting?.resale_price || officialNekoCost;
+      if (configuredResalePrice < officialNekoCost) {
+        return json({ ok: false, error_code: "INVALID_PRICE", message: "Preço de revenda configurado é menor que o custo NekoAI." }, 400);
+      }
+      const calculatedProfit = Number((configuredResalePrice - officialNekoCost).toFixed(2));
+
+      // 4. Verificação de Idempotência e Reutilização de Renovação Ativa Pendente
+      const { data: existingActiveRenewal } = await supabaseAdmin
+        .from("reseller_sales")
+        .select("*")
+        .eq("license_id", license.id)
+        .eq("sale_type", "RENEWAL")
+        .in("status", ["pending", "paid"])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existingActiveRenewal) {
+        if (existingActiveRenewal.status === "paid") {
+          return json({
+            ok: false,
+            error_code: "RENEWAL_ALREADY_PAID",
+            message: "Esta licença já possui uma renovação com pagamento confirmado aguardando processamento.",
+          }, 400);
+        }
+
+        const isStillValid = new Date(existingActiveRenewal.expires_at).getTime() > Date.now();
+
+        if (isStillValid && existingActiveRenewal.plan === plan) {
+          if (existingActiveRenewal.pix_qr_code) {
+            console.log(`[reseller-api] Reutilizando cobrança PIX de renovação pendente ativa (sale_id: ${existingActiveRenewal.id})`);
+            return json({
+              ok: true,
+              reused: true,
+              sale_id: existingActiveRenewal.id,
+              sale_type: "RENEWAL",
+              license_id: license.id,
+              plan: existingActiveRenewal.plan,
+              neko_cost: existingActiveRenewal.neko_cost_snapshot,
+              resale_price: existingActiveRenewal.resale_price_snapshot,
+              profit: existingActiveRenewal.profit_snapshot,
+              neko_cost_snapshot: existingActiveRenewal.neko_cost_snapshot,
+              resale_price_snapshot: existingActiveRenewal.resale_price_snapshot,
+              profit_snapshot: existingActiveRenewal.profit_snapshot,
+              pix_qr_code: existingActiveRenewal.pix_qr_code,
+              pix_qr_code_base64: existingActiveRenewal.pix_qr_code_base64,
+              ticket_url: existingActiveRenewal.ticket_url,
+              expires_at: existingActiveRenewal.expires_at,
+              message: "Cobrança PIX de renovação pendente localizada. Exibindo QR Code existente.",
+            });
+          }
+
+          if (existingActiveRenewal.mp_payment_id && mpAccessToken) {
+            try {
+              const getOrderRes = await fetch(`https://api.mercadopago.com/v1/orders/${existingActiveRenewal.mp_payment_id}`, {
+                headers: { Authorization: `Bearer ${mpAccessToken.trim()}` },
+              });
+              if (getOrderRes.ok) {
+                const orderData = await getOrderRes.json();
+                const recovered = extractOrderPixData(orderData);
+                if (recovered.pixQrCode) {
+                  await supabaseAdmin
+                    .from("reseller_sales")
+                    .update({
+                      pix_qr_code: recovered.pixQrCode,
+                      pix_qr_code_base64: recovered.pixQrCodeBase64,
+                      ticket_url: recovered.ticketUrl,
+                      updated_at: new Date().toISOString(),
+                    })
+                    .eq("id", existingActiveRenewal.id);
+
+                  return json({
+                    ok: true,
+                    reused: true,
+                    sale_id: existingActiveRenewal.id,
+                    sale_type: "RENEWAL",
+                    license_id: license.id,
+                    plan: existingActiveRenewal.plan,
+                    neko_cost: existingActiveRenewal.neko_cost_snapshot,
+                    resale_price: existingActiveRenewal.resale_price_snapshot,
+                    profit: existingActiveRenewal.profit_snapshot,
+                    neko_cost_snapshot: existingActiveRenewal.neko_cost_snapshot,
+                    resale_price_snapshot: existingActiveRenewal.resale_price_snapshot,
+                    profit_snapshot: existingActiveRenewal.profit_snapshot,
+                    pix_qr_code: recovered.pixQrCode,
+                    pix_qr_code_base64: recovered.pixQrCodeBase64,
+                    ticket_url: recovered.ticketUrl,
+                    expires_at: existingActiveRenewal.expires_at,
+                    message: "Cobrança PIX de renovação pendente recuperada com sucesso.",
+                  });
+                }
+              }
+            } catch (recErr) {
+              console.warn("[reseller-api] Erro ao recuperar PIX de renovação existente:", recErr);
+            }
+          }
+        }
+
+        // Se expirou ou o plano foi trocado, cancela a cobrança anterior para liberar o índice único parcial
+        const cleanupStatus = isStillValid ? "cancelled" : "expired";
+        await supabaseAdmin
+          .from("reseller_sales")
+          .update({ status: cleanupStatus, updated_at: new Date().toISOString() })
+          .eq("id", existingActiveRenewal.id);
+      }
+
+      // 5. Criação da Venda RENEWAL com Snapshots Financeiros Congelados
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      const externalReference = crypto.randomUUID();
+
+      const { data: newSale, error: insertErr } = await supabaseAdmin
+        .from("reseller_sales")
+        .insert({
+          reseller_id: reseller.id,
+          license_id: license.id,
+          sale_type: "RENEWAL",
+          plan,
+          neko_cost_snapshot: officialNekoCost,
+          resale_price_snapshot: configuredResalePrice,
+          profit_snapshot: calculatedProfit,
+          status: "pending",
+          mp_external_reference: externalReference,
+          customer_name: license.customer_name || null,
+          customer_email: license.customer_email || null,
+          customer_whatsapp: license.customer_whatsapp || null,
+          expires_at: expiresAt,
+        })
+        .select()
+        .single();
+
+      if (insertErr || !newSale) {
+        // Tratamento elegante do índice único parcial uq_reseller_sales_active_renewal (Concorrência ACID)
+        if (insertErr?.code === "23505" || insertErr?.message?.includes("uq_reseller_sales_active_renewal")) {
+          console.warn("[reseller-api] Concorrência detectada: uq_reseller_sales_active_renewal violado. Recuperando venda concorrente.");
+          const { data: concurrentSale } = await supabaseAdmin
+            .from("reseller_sales")
+            .select("*")
+            .eq("license_id", license.id)
+            .eq("sale_type", "RENEWAL")
+            .in("status", ["pending", "paid"])
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (concurrentSale) {
+            if (concurrentSale.status === "paid") {
+              return json({ ok: false, error_code: "RENEWAL_ALREADY_PAID", message: "Esta licença já possui uma renovação paga." }, 400);
+            }
+            return json({
+              ok: true,
+              reused: true,
+              concurrent: true,
+              sale_id: concurrentSale.id,
+              sale_type: "RENEWAL",
+              license_id: license.id,
+              plan: concurrentSale.plan,
+              neko_cost: concurrentSale.neko_cost_snapshot,
+              resale_price: concurrentSale.resale_price_snapshot,
+              profit: concurrentSale.profit_snapshot,
+              neko_cost_snapshot: concurrentSale.neko_cost_snapshot,
+              resale_price_snapshot: concurrentSale.resale_price_snapshot,
+              profit_snapshot: concurrentSale.profit_snapshot,
+              pix_qr_code: concurrentSale.pix_qr_code,
+              pix_qr_code_base64: concurrentSale.pix_qr_code_base64,
+              ticket_url: concurrentSale.ticket_url,
+              expires_at: concurrentSale.expires_at,
+              message: "Cobrança PIX de renovação concorrente localizada. Exibindo QR Code existente.",
+            });
+          }
+        }
+
+        console.error("[reseller-api] Erro ao criar venda de renovação em reseller_sales:", insertErr);
+        return json({ ok: false, error_code: "DB_ERROR", message: "Não foi possível registrar a intenção de renovação." }, 500);
+      }
+
+      // 6. Integração Mercado Pago Orders API (Reutilizando a implementação oficial)
+      let mpPaymentId: string | null = null;
+      let pixQrCode: string | null = null;
+      let pixQrCodeBase64: string | null = null;
+      let ticketUrl: string | null = null;
+
+      if (!mpAccessToken) {
+        console.error("[reseller-api] MERCADOPAGO_ACCESS_TOKEN ausente nas variáveis de ambiente.");
+        await supabaseAdmin
+          .from("reseller_sales")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .eq("id", newSale.id);
+
+        return json({
+          ok: false,
+          error_code: "MP_CONFIG_ERROR",
+          message: "Não foi possível conectar ao Mercado Pago. A configuração da conta de pagamento precisa ser verificada.",
+        }, 500);
+      }
+
+      try {
+        const nameParts = (reseller.name || "").trim().split(/\s+/);
+        const firstName = nameParts[0] || "Revendedor";
+        const lastName = nameParts.slice(1).join(" ") || undefined;
+        const cleanCpfDigits = activeCpf ? activeCpf.replace(/\D/g, "") : null;
+        const formattedAmount = officialNekoCost.toFixed(2);
+
+        const orderPayload = {
+          type: "online",
+          total_amount: formattedAmount,
+          external_reference: newSale.id,
+          processing_mode: "automatic",
+          transactions: {
+            payments: [
+              {
+                amount: formattedAmount,
+                payment_method: {
+                  id: "pix",
+                  type: "bank_transfer",
+                },
+              },
+            ],
+          },
+          payer: {
+            email: reseller.email,
+            first_name: firstName,
+            ...(lastName ? { last_name: lastName } : {}),
+            ...(cleanCpfDigits && cleanCpfDigits.length === 11 ? { identification: { type: "CPF", number: cleanCpfDigits } } : {}),
+          },
+        };
+
+        const mpResponse = await fetch("https://api.mercadopago.com/v1/orders", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${mpAccessToken}`,
+            "X-Idempotency-Key": newSale.id,
+          },
+          body: JSON.stringify(orderPayload),
+        });
+
+        const rawText = await mpResponse.text();
+        let mpData: any = null;
+        try {
+          mpData = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          mpData = rawText;
+        }
+
+        if (mpResponse.ok && mpData) {
+          const extracted = extractOrderPixData(typeof mpData === "object" ? mpData : null);
+          const orderId = String(mpData.id || extracted.orderId || "");
+          mpPaymentId = orderId || extracted.paymentId || "";
+          pixQrCode = extracted.pixQrCode;
+          pixQrCodeBase64 = extracted.pixQrCodeBase64;
+          ticketUrl = extracted.ticketUrl;
+
+          if (!pixQrCode) {
+            console.error("[reseller-api] Orders API não retornou código PIX válido para renovação na Order:", mpData.id);
+            await supabaseAdmin
+              .from("reseller_sales")
+              .update({ status: "cancelled", updated_at: new Date().toISOString() })
+              .eq("id", newSale.id);
+
+            return json({
+              ok: false,
+              error_code: "PIX_DATA_UNAVAILABLE",
+              message: "O pedido de renovação foi criado no Mercado Pago, mas o código PIX não pôde ser gerado. Tente novamente.",
+            }, 502);
+          }
+        } else {
+          const detailedError = extractMercadoPagoErrorDetails(mpData, mpResponse.status);
+          const sanitizedDiagnostics = sanitizeForDiagnostics(mpData);
+          console.error("[reseller-api] Falha na criação de Order de renovação no Mercado Pago:", {
+            status: mpResponse.status,
+            details: detailedError,
+            diagnostics: sanitizedDiagnostics,
+          });
+
+          await supabaseAdmin
+            .from("reseller_sales")
+            .update({ status: "cancelled", updated_at: new Date().toISOString() })
+            .eq("id", newSale.id);
+
+          const isCredentialError =
+            mpResponse.status === 401 ||
+            mpResponse.status === 403 ||
+            detailedError.toLowerCase().includes("invalid access token") ||
+            detailedError.toLowerCase().includes("invalid token") ||
+            detailedError.toLowerCase().includes("unauthorized");
+
+          const userMessage = isCredentialError
+            ? "Não foi possível conectar ao Mercado Pago. A configuração da conta de pagamento precisa ser verificada."
+            : `Erro ao gerar cobrança no Mercado Pago: ${detailedError}`;
+
+          return json({
+            ok: false,
+            error_code: isCredentialError ? "MP_AUTH_ERROR" : "MP_ORDER_ERROR",
+            message: userMessage,
+            mp_status: mpResponse.status,
+            mp_diagnostics: sanitizedDiagnostics,
+          }, 400);
+        }
+      } catch (mpErr: any) {
+        const errDetail = mpErr?.message || String(mpErr);
+        console.error("[reseller-api] Exceção na API MP Orders para renovação:", errDetail);
+        await supabaseAdmin
+          .from("reseller_sales")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .eq("id", newSale.id);
+
+        return json({
+          ok: false,
+          error_code: "MP_CONNECTION_ERROR",
+          message: `Erro de comunicação com o Mercado Pago: ${errDetail}`,
+        }, 502);
+      }
+
+      // 7. Atualiza os dados de PIX na venda de renovação
+      await supabaseAdmin
+        .from("reseller_sales")
+        .update({
+          mp_payment_id: mpPaymentId,
+          pix_qr_code: pixQrCode,
+          pix_qr_code_base64: pixQrCodeBase64,
+          ticket_url: ticketUrl,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", newSale.id);
+
+      return json({
+        ok: true,
+        sale_id: newSale.id,
+        sale_type: "RENEWAL",
+        license_id: license.id,
+        plan: newSale.plan,
+        neko_cost: officialNekoCost,
+        resale_price: configuredResalePrice,
+        profit: calculatedProfit,
+        neko_cost_snapshot: officialNekoCost,
+        resale_price_snapshot: configuredResalePrice,
+        profit_snapshot: calculatedProfit,
+        pix_qr_code: pixQrCode,
+        pix_qr_code_base64: pixQrCodeBase64,
+        ticket_url: ticketUrl,
+        expires_at: newSale.expires_at,
+        message: "Cobrança PIX para renovação gerada com sucesso.",
+      });
+    }
+
     if (action === "create_checkout") {
       const { plan, customer_name, customer_email, customer_whatsapp, customer_cpf } = body;
 
@@ -1635,6 +2266,7 @@ Deno.serve(async (req: Request) => {
         .from("reseller_sales")
         .insert({
           reseller_id: reseller.id,
+          sale_type: "NEW_LICENSE",
           plan,
           neko_cost_snapshot: officialNekoCost,
           resale_price_snapshot: configuredResalePrice,
@@ -1847,7 +2479,7 @@ Deno.serve(async (req: Request) => {
     // --------------------------------------------------------------------------
     // AÇÃO POST: EMITIR E ENTREGAR LICENÇA COMERCIAL APÓS PAGAMENTO PIX
     // --------------------------------------------------------------------------
-    if (action === "fulfill_sale") {
+    if (action === "fulfill_sale" || action === "fulfill_renewal_sale") {
       const { sale_id, customer_name, customer_email, customer_whatsapp } = body;
 
       if (!sale_id) {
@@ -1866,13 +2498,31 @@ Deno.serve(async (req: Request) => {
         return json({ ok: false, message: "Venda não encontrada ou não pertencente à sua conta de revendedor." }, 404);
       }
 
-      // 2. Idempotência: se a licença já foi emitida, retorna os dados existentes sem duplicar
+      // 2. Idempotência: se a licença já foi emitida/renovada, retorna os dados existentes sem duplicar
       if (sale.status === "license_delivered" && sale.license_id) {
         const { data: existingLic } = await supabaseAdmin
           .from("licenses")
-          .select("id, key_mask, plan, status, expires_at")
+          .select("id, key_mask, plan, status, expires_at, renewal_count, renewed_at")
           .eq("id", sale.license_id)
           .maybeSingle();
+
+        if (sale.sale_type === "RENEWAL") {
+          return json({
+            ok: true,
+            already_fulfilled: true,
+            idempotent: true,
+            message: "Licença já foi renovada com sucesso para esta venda.",
+            sale_id: sale.id,
+            license_id: sale.license_id,
+            key_mask: existingLic?.key_mask || null,
+            plan: sale.plan,
+            expires_at: existingLic?.expires_at || null,
+            new_expires_at: existingLic?.expires_at || null,
+            renewal_count: existingLic?.renewal_count || 1,
+            renewed_at: existingLic?.renewed_at || null,
+            customer_email: sale.customer_email,
+          });
+        }
 
         return json({
           ok: true,
@@ -1886,14 +2536,74 @@ Deno.serve(async (req: Request) => {
         });
       }
 
-      // 3. Validação de status de pagamento: apenas vendas pagas podem emitir licença
+      // 3. Validação de status de pagamento: apenas vendas pagas podem emitir ou renovar licença
       if (sale.status !== "paid" && sale.status !== "awaiting_customer") {
         return json({
           ok: false,
           error_code: "PAYMENT_NOT_CONFIRMED",
-          message: "A licença só pode ser emitida após a confirmação do pagamento do custo NekoAI.",
+          message: sale.sale_type === "RENEWAL"
+            ? "A licença só pode ser renovada após a confirmação do pagamento do custo NekoAI."
+            : "A licença só pode ser emitida após a confirmação do pagamento do custo NekoAI.",
         }, 400);
       }
+
+      // ------------------------------------------------------------------------
+      // RAMIFICAÇÃO RENEWAL: Processamento atômico via fn_renew_reseller_license
+      // ------------------------------------------------------------------------
+      if (sale.sale_type === "RENEWAL") {
+        if (!sale.license_id) {
+          return json({
+            ok: false,
+            error_code: "SALE_MISSING_LICENSE_ID",
+            message: "A venda de renovação não possui licença vinculada.",
+          }, 400);
+        }
+
+        const { data: rpcResult, error: rpcErr } = await supabaseAdmin.rpc("fn_renew_reseller_license", {
+          p_sale_id: sale.id,
+          p_reseller_id: reseller.id,
+          p_ip_address: extractIpOrNull(req),
+          p_user_agent: req.headers.get("user-agent") || null,
+        });
+
+        if (rpcErr || !rpcResult) {
+          console.error("[reseller-api] Erro ao executar RPC fn_renew_reseller_license:", rpcErr);
+          return json({
+            ok: false,
+            error_code: "RENEWAL_RPC_ERROR",
+            message: rpcErr?.message || "Erro ao processar renovação da licença.",
+          }, 500);
+        }
+
+        if (!rpcResult.ok) {
+          return json({
+            ok: false,
+            error_code: rpcResult.error_code || "RENEWAL_FAILED",
+            message: rpcResult.message || "Falha ao processar renovação da licença.",
+          }, 400);
+        }
+
+        return json({
+          ok: true,
+          message: "Licença renovada com sucesso.",
+          sale_id: sale.id,
+          license_id: rpcResult.license_id,
+          key_mask: rpcResult.key_mask,
+          plan: rpcResult.new_plan || sale.plan,
+          previous_plan: rpcResult.previous_plan,
+          expires_at: rpcResult.new_expires_at,
+          new_expires_at: rpcResult.new_expires_at,
+          days_added: rpcResult.days_added,
+          renewal_count: rpcResult.renewal_count,
+          is_expired_at_renewal: rpcResult.is_expired_at_renewal,
+          customer_email: sale.customer_email,
+          idempotent: Boolean(rpcResult.idempotent),
+        });
+      }
+
+      // ------------------------------------------------------------------------
+      // FLUXO NEW_LICENSE (Preservado 100% Intacto)
+      // ------------------------------------------------------------------------
 
       // 4. Validação dos dados do cliente final
       const finalCustomerName = (customer_name || sale.customer_name || "").trim();

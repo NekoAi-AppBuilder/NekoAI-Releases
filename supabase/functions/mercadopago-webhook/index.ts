@@ -50,6 +50,14 @@ export function cleanAccessToken(raw: string | null | undefined): string {
   return token;
 }
 
+function extractIp(req: Request): string | null {
+  const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() ||
+             req.headers.get("cf-connecting-ip") ||
+             req.headers.get("x-real-ip");
+  if (!ip || ip === "unknown") return null;
+  return ip;
+}
+
 /**
  * Validação de Assinatura Criptográfica HMAC-SHA256 do Mercado Pago Webhook V2
  * Manifesto Oficial: id:<data.id>;request-id:<x-request-id>;ts:<ts>;
@@ -285,6 +293,31 @@ Deno.serve(async (req: Request) => {
 
   // 6. IDEMPOTÊNCIA: Se a venda já estiver marcada como paga ou superior, não faz nada
   if (["paid", "awaiting_customer", "license_delivered"].includes(sale.status)) {
+    // Se for RENEWAL e a venda estiver com status 'paid', garante a entrega atômica da renovação
+    if (sale.sale_type === "RENEWAL" && sale.status === "paid" && sale.license_id) {
+      console.log(`[mercadopago-webhook] Venda de RENOVAÇÃO ${sale.id} já está como 'paid'. Executando RPC de renovação para garantir entrega...`);
+      try {
+        const { data: rpcRes, error: rpcErr } = await supabaseAdmin.rpc("fn_renew_reseller_license", {
+          p_sale_id: sale.id,
+          p_reseller_id: sale.reseller_id,
+          p_ip_address: extractIp(req),
+          p_user_agent: req.headers.get("user-agent") || "mercadopago-webhook",
+        });
+        if (!rpcErr && rpcRes?.ok) {
+          console.log(`[mercadopago-webhook] Auto-fulfillment de renovação garantido na idempotência para venda ${sale.id}.`);
+          return json({
+            ok: true,
+            action_performed: "renewal_fulfilled",
+            sale_id: sale.id,
+            status: "license_delivered",
+            message: "Renovação confirmada e licença entregue com sucesso via idempotência.",
+          }, 200);
+        }
+      } catch (autoRenewErr) {
+        console.warn(`[mercadopago-webhook] Falha ao executar fn_renew_reseller_license na idempotência da venda ${sale.id}:`, autoRenewErr);
+      }
+    }
+
     console.log(`[mercadopago-webhook] Idempotência ativada: Venda ${sale.id} já está no estado '${sale.status}'. Nenhuma alteração feita.`);
     return json({
       ok: true,
@@ -395,7 +428,7 @@ Deno.serve(async (req: Request) => {
     }, 400);
   }
 
-  // 10. TRANSIÇÃO DE ESTADO PARA 'paid' (Idempotente e Segura - NENHUMA LICENÇA GERADA NESTA FASE)
+  // 10. TRANSIÇÃO DE ESTADO PARA 'paid' (Idempotente e Segura)
   const { error: updateErr } = await supabaseAdmin
     .from("reseller_sales")
     .update({
@@ -411,13 +444,43 @@ Deno.serve(async (req: Request) => {
     return json({ ok: false, error_code: "DB_ERROR", message: "Erro ao atualizar status de pagamento no banco." }, 500);
   }
 
-  console.log(`[mercadopago-webhook] SUCESSO: Venda ${sale.id} confirmada como PAGA via Webhook do Mercado Pago Orders (Order ID: ${orderId}).`);
+  // 11. AUTO-FULFILLMENT AUTÔNOMO EXCLUSIVO PARA RENOVAÇÃO (RENEWAL)
+  // Licenças de renovação não dependem de dados do cliente digitados no frontend,
+  // pois a licença e o cliente já existem. O webhook garante a renovação atômica imediata.
+  let finalStatus = "paid";
+  let finalAction = "marked_as_paid";
+  let finalMessage = "Pagamento confirmado com sucesso via Webhook Orders.";
+
+  if (sale.sale_type === "RENEWAL" && sale.license_id) {
+    console.log(`[mercadopago-webhook] Detectada venda de RENOVAÇÃO (${sale.id}). Executando fn_renew_reseller_license de forma autônoma...`);
+    try {
+      const { data: rpcRes, error: rpcErr } = await supabaseAdmin.rpc("fn_renew_reseller_license", {
+        p_sale_id: sale.id,
+        p_reseller_id: sale.reseller_id,
+        p_ip_address: extractIp(req),
+        p_user_agent: req.headers.get("user-agent") || "mercadopago-webhook",
+      });
+
+      if (rpcErr || !rpcRes?.ok) {
+        console.error(`[mercadopago-webhook] Erro na RPC fn_renew_reseller_license para venda ${sale.id}:`, rpcErr || rpcRes);
+      } else {
+        finalStatus = "license_delivered";
+        finalAction = "renewal_fulfilled";
+        finalMessage = "Pagamento confirmado e licença renovada com sucesso via Webhook Orders.";
+        console.log(`[mercadopago-webhook] SUCESSO: Auto-fulfillment da renovação concluído para venda ${sale.id} (license_id: ${sale.license_id}).`);
+      }
+    } catch (autoRenewErr) {
+      console.error(`[mercadopago-webhook] Exceção ao executar auto-fulfillment da renovação para venda ${sale.id}:`, autoRenewErr);
+    }
+  }
+
+  console.log(`[mercadopago-webhook] SUCESSO: Venda ${sale.id} confirmada via Webhook do Mercado Pago Orders (Order ID: ${orderId}, Status: ${finalStatus}).`);
 
   return json({
     ok: true,
-    action_performed: "marked_as_paid",
+    action_performed: finalAction,
     sale_id: sale.id,
-    status: "paid",
-    message: "Pagamento confirmado com sucesso via Webhook Orders.",
+    status: finalStatus,
+    message: finalMessage,
   }, 200);
 });
