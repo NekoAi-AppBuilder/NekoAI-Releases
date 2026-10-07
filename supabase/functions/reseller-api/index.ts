@@ -2094,92 +2094,98 @@ Deno.serve(async (req: Request) => {
       }
       const calculatedProfit = Number((configuredResalePrice - officialNekoCost).toFixed(2));
 
-      // 4. Verificação de Idempotência / Cobrança Pendente Ativa
-      const { data: existingPendingSale } = await supabaseAdmin
-        .from("reseller_sales")
-        .select("*")
-        .eq("reseller_id", reseller.id)
-        .eq("plan", plan)
-        .eq("status", "pending")
-        .gt("expires_at", new Date().toISOString())
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      // 4. Cancelamento/Invalidação de Cobrança Pendente Anterior da MESMA Intenção de Compra
+      // Toda nova tentativa explícita do usuário cria uma nova venda e nova Order no Mercado Pago.
+      // REGRA CRÍTICA: Uma nova tentativa cancela SOMENTE pendências da MESMA intenção (mesmo cliente/venda),
+      // NUNCA cancela compras pendentes independentes de outros clientes.
+      // Vendas anteriores com status 'pending' que coincidam com a mesma intenção são canceladas sem apagar histórico.
+      // Vendas 'paid' e 'license_delivered' NUNCA são canceladas.
+      const targetSaleId =
+        (typeof body.previous_sale_id === "string" && body.previous_sale_id.trim()) ||
+        (typeof body.sale_id === "string" && body.sale_id.trim()) ||
+        null;
+      const targetEmail =
+        typeof customer_email === "string" && customer_email.trim()
+          ? customer_email.trim().toLowerCase()
+          : null;
+      const targetName =
+        typeof customer_name === "string" && customer_name.trim()
+          ? customer_name.trim().toLowerCase()
+          : null;
+      const targetPhone =
+        typeof customer_whatsapp === "string" && customer_whatsapp.trim()
+          ? customer_whatsapp.trim()
+          : null;
 
-      if (existingPendingSale) {
-        // Verifica se os snapshots de preço da venda pendente ainda conferem com os preços atuais
-        const isCostStale = Number(existingPendingSale.neko_cost_snapshot) !== officialNekoCost;
-        const isPriceStale = Number(existingPendingSale.resale_price_snapshot) !== configuredResalePrice;
+      if (targetSaleId) {
+        // Validação estrita de ownership e elegibilidade do targetSaleId
+        // REGRA DE SEGURANÇA: reseller_id deve corresponder rigorosamente ao revendedor autenticado pelo JWT
+        const { data: targetSale } = await supabaseAdmin
+          .from("reseller_sales")
+          .select("id, reseller_id, status, sale_type, plan")
+          .eq("id", targetSaleId)
+          .maybeSingle();
 
-        if (isCostStale || isPriceStale) {
-          console.log(`[reseller-api] Cobrança pendente antiga possui preços defasados (cost: ${existingPendingSale.neko_cost_snapshot} vs ${officialNekoCost}). Cancelando cobrança defasada.`);
+        if (
+          targetSale &&
+          targetSale.reseller_id === reseller.id &&
+          targetSale.status === "pending" &&
+          targetSale.sale_type === "NEW_LICENSE" &&
+          targetSale.plan === plan
+        ) {
           await supabaseAdmin
             .from("reseller_sales")
             .update({ status: "cancelled", updated_at: new Date().toISOString() })
-            .eq("id", existingPendingSale.id);
-        } else if (existingPendingSale.pix_qr_code) {
-          console.log(`[reseller-api] Reutilizando cobrança PIX pendente ativa (sale_id: ${existingPendingSale.id})`);
-          return json({
-            ok: true,
-            reused: true,
-            sale_id: existingPendingSale.id,
-            plan: existingPendingSale.plan,
-            neko_cost: existingPendingSale.neko_cost_snapshot,
-            resale_price: existingPendingSale.resale_price_snapshot,
-            profit: existingPendingSale.profit_snapshot,
-            neko_cost_snapshot: existingPendingSale.neko_cost_snapshot,
-            resale_price_snapshot: existingPendingSale.resale_price_snapshot,
-            profit_snapshot: existingPendingSale.profit_snapshot,
-            pix_qr_code: existingPendingSale.pix_qr_code,
-            pix_qr_code_base64: existingPendingSale.pix_qr_code_base64,
-            expires_at: existingPendingSale.expires_at,
-            message: "Cobrança PIX pendente localizada. Exibindo QR Code existente.",
-          });
+            .eq("id", targetSale.id)
+            .eq("reseller_id", reseller.id)
+            .eq("status", "pending");
         }
+      } else {
+        // Se targetSaleId não foi fornecido, busca pendências por intenção do mesmo revendedor
+        const { data: existingPendingSales } = await supabaseAdmin
+          .from("reseller_sales")
+          .select("id, customer_email, customer_name, customer_whatsapp")
+          .eq("reseller_id", reseller.id)
+          .eq("plan", plan)
+          .eq("sale_type", "NEW_LICENSE")
+          .eq("status", "pending");
 
-        // Se a venda pendente possui mp_payment_id mas faltou o código PIX anteriormente, recupera na Orders API
-        if (existingPendingSale.mp_payment_id && mpAccessToken) {
-          try {
-            const getOrderRes = await fetch(`https://api.mercadopago.com/v1/orders/${existingPendingSale.mp_payment_id}`, {
-              headers: { Authorization: `Bearer ${mpAccessToken.trim()}` },
-            });
-            if (getOrderRes.ok) {
-              const orderData = await getOrderRes.json();
-              const recovered = extractOrderPixData(orderData);
-              if (recovered.pixQrCode) {
-                await supabaseAdmin
-                  .from("reseller_sales")
-                  .update({
-                    pix_qr_code: recovered.pixQrCode,
-                    pix_qr_code_base64: recovered.pixQrCodeBase64,
-                    updated_at: new Date().toISOString(),
-                  })
-                  .eq("id", existingPendingSale.id);
+        if (existingPendingSales && existingPendingSales.length > 0) {
+          const salesToCancel: string[] = [];
 
-                return json({
-                  ok: true,
-                  reused: true,
-                  sale_id: existingPendingSale.id,
-                  plan: existingPendingSale.plan,
-                  neko_cost: existingPendingSale.neko_cost_snapshot,
-                  resale_price: existingPendingSale.resale_price_snapshot,
-                  profit: existingPendingSale.profit_snapshot,
-                  neko_cost_snapshot: existingPendingSale.neko_cost_snapshot,
-                  resale_price_snapshot: existingPendingSale.resale_price_snapshot,
-                  profit_snapshot: existingPendingSale.profit_snapshot,
-                  pix_qr_code: recovered.pixQrCode,
-                  pix_qr_code_base64: recovered.pixQrCodeBase64,
-                  ticket_url: recovered.ticketUrl,
-                  expires_at: existingPendingSale.expires_at,
-                  message: "Cobrança PIX pendente recuperada com sucesso.",
-                });
-              }
+          for (const sale of existingPendingSales) {
+            const saleEmail = sale.customer_email ? sale.customer_email.trim().toLowerCase() : null;
+            const saleName = sale.customer_name ? sale.customer_name.trim().toLowerCase() : null;
+            const salePhone = sale.customer_whatsapp ? sale.customer_whatsapp.trim() : null;
+
+            let isSameIntent = false;
+
+            if (targetEmail) {
+              isSameIntent = (saleEmail === targetEmail);
+            } else if (targetName) {
+              isSameIntent = (saleName === targetName);
+            } else if (targetPhone) {
+              isSameIntent = (salePhone === targetPhone);
+            } else {
+              isSameIntent = (!saleEmail && !saleName && !salePhone);
             }
-          } catch (recErr) {
-            console.warn("[reseller-api] Erro ao recuperar PIX de order pendente existente:", recErr);
+
+            if (isSameIntent) {
+              salesToCancel.push(sale.id);
+            }
+          }
+
+          if (salesToCancel.length > 0) {
+            await supabaseAdmin
+              .from("reseller_sales")
+              .update({ status: "cancelled", updated_at: new Date().toISOString() })
+              .in("id", salesToCancel)
+              .eq("reseller_id", reseller.id)
+              .eq("status", "pending");
           }
         }
       }
+
 
       // 5. Criação da Venda com Snapshots Financeiros Congelados
       const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString(); // 30 minutos de validade PIX
