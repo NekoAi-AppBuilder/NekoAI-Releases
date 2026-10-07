@@ -528,7 +528,8 @@ async function handlePrepareRenewal(
 
   const plans = (["MONTHLY", "QUARTERLY", "ANNUAL"] as const).map((p) => {
     const nekoCost = officialPricing[p]?.neko_cost ?? OFFICIAL_NEKO_COSTS[p];
-    const resalePrice = priceMap[p] ?? officialPricing[p]?.suggested_resale_price ?? nekoCost;
+    const rawResale = priceMap[p] ?? officialPricing[p]?.suggested_resale_price ?? nekoCost;
+    const resalePrice = Math.max(rawResale, nekoCost);
     const profit = Number((resalePrice - nekoCost).toFixed(2));
     return {
       plan: p,
@@ -539,31 +540,6 @@ async function handlePrepareRenewal(
       profit: profit,
     };
   });
-
-  // 6. Verifica cobrança pendente ativa de renovação para esta licença
-  const { data: pendingRenewal } = await supabaseAdmin
-    .from("reseller_sales")
-    .select("*")
-    .eq("reseller_id", reseller.id)
-    .eq("license_id", license.id)
-    .eq("sale_type", "RENEWAL")
-    .eq("status", "pending")
-    .gt("expires_at", new Date().toISOString())
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const activePendingRenewal = pendingRenewal ? {
-    sale_id: pendingRenewal.id,
-    plan: pendingRenewal.plan,
-    neko_cost: Number(pendingRenewal.neko_cost_snapshot || 0),
-    resale_price: Number(pendingRenewal.resale_price_snapshot || 0),
-    profit: Number(pendingRenewal.profit_snapshot || 0),
-    pix_qr_code: pendingRenewal.pix_qr_code || null,
-    pix_qr_code_base64: pendingRenewal.pix_qr_code_base64 || null,
-    ticket_url: pendingRenewal.ticket_url || null,
-    expires_at: pendingRenewal.expires_at,
-  } : null;
 
   const isExpired = license.status === "expired" || (license.expires_at ? new Date(license.expires_at).getTime() <= Date.now() : false);
 
@@ -582,7 +558,7 @@ async function handlePrepareRenewal(
     renewed_at: license.renewed_at || null,
     is_expired: isExpired,
     plans,
-    active_pending_renewal: activePendingRenewal,
+    active_pending_renewal: null,
   });
 }
 
@@ -1268,7 +1244,8 @@ Deno.serve(async (req: Request) => {
       const officialPricing = await getOfficialPricing(supabaseAdmin);
       const result = (["MONTHLY", "QUARTERLY", "ANNUAL"] as const).map((plan) => {
         const nekoCost = officialPricing[plan].neko_cost;
-        const resalePrice = existingMap[plan] ?? officialPricing[plan].suggested_resale_price;
+        const rawResale = existingMap[plan] ?? officialPricing[plan].suggested_resale_price;
+        const resalePrice = Math.max(rawResale, nekoCost);
         return {
           plan,
           neko_cost: nekoCost,
@@ -1803,114 +1780,40 @@ Deno.serve(async (req: Request) => {
       }
       const calculatedProfit = Number((configuredResalePrice - officialNekoCost).toFixed(2));
 
-      // 4. Verificação de Idempotência e Reutilização de Renovação Ativa Pendente
-      const { data: existingActiveRenewal } = await supabaseAdmin
+      // 4. Verificação de Renovação Paga e Cancelamento de Pendência Anterior
+      const { data: existingPaidRenewal } = await supabaseAdmin
         .from("reseller_sales")
-        .select("*")
+        .select("id, status")
         .eq("license_id", license.id)
         .eq("sale_type", "RENEWAL")
-        .in("status", ["pending", "paid"])
+        .in("status", ["paid", "license_delivered"])
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle();
 
-      if (existingActiveRenewal) {
-        if (existingActiveRenewal.status === "paid") {
-          return json({
-            ok: false,
-            error_code: "RENEWAL_ALREADY_PAID",
-            message: "Esta licença já possui uma renovação com pagamento confirmado aguardando processamento.",
-          }, 400);
-        }
-
-        const isStillValid = new Date(existingActiveRenewal.expires_at).getTime() > Date.now();
-
-        if (isStillValid && existingActiveRenewal.plan === plan) {
-          if (existingActiveRenewal.pix_qr_code) {
-            console.log(`[reseller-api] Reutilizando cobrança PIX de renovação pendente ativa (sale_id: ${existingActiveRenewal.id})`);
-            return json({
-              ok: true,
-              reused: true,
-              sale_id: existingActiveRenewal.id,
-              sale_type: "RENEWAL",
-              license_id: license.id,
-              plan: existingActiveRenewal.plan,
-              neko_cost: existingActiveRenewal.neko_cost_snapshot,
-              resale_price: existingActiveRenewal.resale_price_snapshot,
-              profit: existingActiveRenewal.profit_snapshot,
-              neko_cost_snapshot: existingActiveRenewal.neko_cost_snapshot,
-              resale_price_snapshot: existingActiveRenewal.resale_price_snapshot,
-              profit_snapshot: existingActiveRenewal.profit_snapshot,
-              pix_qr_code: existingActiveRenewal.pix_qr_code,
-              pix_qr_code_base64: existingActiveRenewal.pix_qr_code_base64,
-              ticket_url: existingActiveRenewal.ticket_url,
-              expires_at: existingActiveRenewal.expires_at,
-              message: "Cobrança PIX de renovação pendente localizada. Exibindo QR Code existente.",
-            });
-          }
-
-          if (existingActiveRenewal.mp_payment_id && mpAccessToken) {
-            try {
-              const getOrderRes = await fetch(`https://api.mercadopago.com/v1/orders/${existingActiveRenewal.mp_payment_id}`, {
-                headers: { Authorization: `Bearer ${mpAccessToken.trim()}` },
-              });
-              if (getOrderRes.ok) {
-                const orderData = await getOrderRes.json();
-                const recovered = extractOrderPixData(orderData);
-                if (recovered.pixQrCode) {
-                  const { error: recUpdateErr } = await supabaseAdmin
-                    .from("reseller_sales")
-                    .update({
-                      pix_qr_code: recovered.pixQrCode,
-                      pix_qr_code_base64: recovered.pixQrCodeBase64,
-                      updated_at: new Date().toISOString(),
-                    })
-                    .eq("id", existingActiveRenewal.id);
-
-                  if (recUpdateErr) {
-                    console.error("[reseller-api] Erro ao atualizar PIX recuperado:", recUpdateErr);
-                  }
-
-                  return json({
-                    ok: true,
-                    reused: true,
-                    sale_id: existingActiveRenewal.id,
-                    sale_type: "RENEWAL",
-                    license_id: license.id,
-                    plan: existingActiveRenewal.plan,
-                    neko_cost: existingActiveRenewal.neko_cost_snapshot,
-                    resale_price: existingActiveRenewal.resale_price_snapshot,
-                    profit: existingActiveRenewal.profit_snapshot,
-                    neko_cost_snapshot: existingActiveRenewal.neko_cost_snapshot,
-                    resale_price_snapshot: existingActiveRenewal.resale_price_snapshot,
-                    profit_snapshot: existingActiveRenewal.profit_snapshot,
-                    pix_qr_code: recovered.pixQrCode,
-                    pix_qr_code_base64: recovered.pixQrCodeBase64,
-                    ticket_url: recovered.ticketUrl,
-                    expires_at: existingActiveRenewal.expires_at,
-                    message: "Cobrança PIX de renovação pendente recuperada com sucesso.",
-                  });
-                }
-              }
-            } catch (recErr) {
-              console.warn("[reseller-api] Erro ao recuperar PIX de renovação existente:", recErr);
-            }
-          }
-        }
-
-        // Se expirou ou o plano foi trocado, cancela a cobrança anterior para liberar o índice único parcial
-        const cleanupStatus = isStillValid ? "cancelled" : "expired";
-        await supabaseAdmin
-          .from("reseller_sales")
-          .update({ status: cleanupStatus, updated_at: new Date().toISOString() })
-          .eq("id", existingActiveRenewal.id);
+      if (existingPaidRenewal && existingPaidRenewal.status === "paid") {
+        return json({
+          ok: false,
+          error_code: "RENEWAL_ALREADY_PAID",
+          message: "Esta licença já possui uma renovação com pagamento confirmado aguardando processamento.",
+        }, 400);
       }
 
-      // 5. Criação da Venda RENEWAL com Snapshots Financeiros Congelados
+      // Cancela/invalida quaisquer renovações anteriores ainda com status 'pending' para esta licença.
+      // Isso libera o índice único uq_reseller_sales_active_renewal e assegura que uma NOVA intenção seja criada.
+      // Vendas 'paid' ou 'license_delivered' NUNCA são canceladas.
+      await supabaseAdmin
+        .from("reseller_sales")
+        .update({ status: "cancelled", updated_at: new Date().toISOString() })
+        .eq("license_id", license.id)
+        .eq("sale_type", "RENEWAL")
+        .eq("status", "pending");
+
+      // 5. Criação da Nova Venda RENEWAL com Snapshots Financeiros Atualizados
       const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
       const externalReference = crypto.randomUUID();
 
-      const { data: newSale, error: insertErr } = await supabaseAdmin
+      let { data: newSale, error: insertErr } = await supabaseAdmin
         .from("reseller_sales")
         .insert({
           reseller_id: reseller.id,
@@ -1931,48 +1834,43 @@ Deno.serve(async (req: Request) => {
         .single();
 
       if (insertErr || !newSale) {
-        // Tratamento elegante do índice único parcial uq_reseller_sales_active_renewal (Concorrência ACID)
         if (insertErr?.code === "23505" || insertErr?.message?.includes("uq_reseller_sales_active_renewal")) {
-          console.warn("[reseller-api] Concorrência detectada: uq_reseller_sales_active_renewal violado. Recuperando venda concorrente.");
-          const { data: concurrentSale } = await supabaseAdmin
+          console.warn("[reseller-api] Concorrência detectada: uq_reseller_sales_active_renewal violado. Cancelando pendência concorrente e re-tentando.");
+          await supabaseAdmin
             .from("reseller_sales")
-            .select("*")
+            .update({ status: "cancelled", updated_at: new Date().toISOString() })
             .eq("license_id", license.id)
             .eq("sale_type", "RENEWAL")
-            .in("status", ["pending", "paid"])
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+            .eq("status", "pending");
 
-          if (concurrentSale) {
-            if (concurrentSale.status === "paid") {
-              return json({ ok: false, error_code: "RENEWAL_ALREADY_PAID", message: "Esta licença já possui uma renovação paga." }, 400);
-            }
-            return json({
-              ok: true,
-              reused: true,
-              concurrent: true,
-              sale_id: concurrentSale.id,
-              sale_type: "RENEWAL",
+          const retryInsert = await supabaseAdmin
+            .from("reseller_sales")
+            .insert({
+              reseller_id: reseller.id,
               license_id: license.id,
-              plan: concurrentSale.plan,
-              neko_cost: concurrentSale.neko_cost_snapshot,
-              resale_price: concurrentSale.resale_price_snapshot,
-              profit: concurrentSale.profit_snapshot,
-              neko_cost_snapshot: concurrentSale.neko_cost_snapshot,
-              resale_price_snapshot: concurrentSale.resale_price_snapshot,
-              profit_snapshot: concurrentSale.profit_snapshot,
-              pix_qr_code: concurrentSale.pix_qr_code,
-              pix_qr_code_base64: concurrentSale.pix_qr_code_base64,
-              ticket_url: concurrentSale.ticket_url,
-              expires_at: concurrentSale.expires_at,
-              message: "Cobrança PIX de renovação concorrente localizada. Exibindo QR Code existente.",
-            });
-          }
+              sale_type: "RENEWAL",
+              plan,
+              neko_cost_snapshot: officialNekoCost,
+              resale_price_snapshot: configuredResalePrice,
+              profit_snapshot: calculatedProfit,
+              status: "pending",
+              mp_external_reference: externalReference,
+              customer_name: license.customer_name || null,
+              customer_email: license.customer_email || null,
+              customer_whatsapp: license.customer_whatsapp || null,
+              expires_at: expiresAt,
+            })
+            .select()
+            .single();
+
+          newSale = retryInsert.data;
+          insertErr = retryInsert.error;
         }
 
-        console.error("[reseller-api] Erro ao criar venda de renovação em reseller_sales:", insertErr);
-        return json({ ok: false, error_code: "DB_ERROR", message: "Não foi possível registrar a intenção de renovação." }, 500);
+        if (insertErr || !newSale) {
+          console.error("[reseller-api] Erro ao criar venda de renovação em reseller_sales:", insertErr);
+          return json({ ok: false, error_code: "DB_ERROR", message: "Não foi possível registrar a intenção de renovação." }, 500);
+        }
       }
 
       // 6. Integração Mercado Pago Orders API (Reutilizando a implementação oficial)
@@ -2209,7 +2107,17 @@ Deno.serve(async (req: Request) => {
         .maybeSingle();
 
       if (existingPendingSale) {
-        if (existingPendingSale.pix_qr_code) {
+        // Verifica se os snapshots de preço da venda pendente ainda conferem com os preços atuais
+        const isCostStale = Number(existingPendingSale.neko_cost_snapshot) !== officialNekoCost;
+        const isPriceStale = Number(existingPendingSale.resale_price_snapshot) !== configuredResalePrice;
+
+        if (isCostStale || isPriceStale) {
+          console.log(`[reseller-api] Cobrança pendente antiga possui preços defasados (cost: ${existingPendingSale.neko_cost_snapshot} vs ${officialNekoCost}). Cancelando cobrança defasada.`);
+          await supabaseAdmin
+            .from("reseller_sales")
+            .update({ status: "cancelled", updated_at: new Date().toISOString() })
+            .eq("id", existingPendingSale.id);
+        } else if (existingPendingSale.pix_qr_code) {
           console.log(`[reseller-api] Reutilizando cobrança PIX pendente ativa (sale_id: ${existingPendingSale.id})`);
           return json({
             ok: true,
