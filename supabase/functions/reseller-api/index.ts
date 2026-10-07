@@ -1015,15 +1015,17 @@ Deno.serve(async (req: Request) => {
               sale.pix_qr_code = recovered.pixQrCode;
               sale.pix_qr_code_base64 = recovered.pixQrCodeBase64;
               sale.ticket_url = recovered.ticketUrl;
-              await supabaseAdmin
+              const { error: updatePixErr } = await supabaseAdmin
                 .from("reseller_sales")
                 .update({
                   pix_qr_code: recovered.pixQrCode,
                   pix_qr_code_base64: recovered.pixQrCodeBase64,
-                  ticket_url: recovered.ticketUrl,
                   updated_at: new Date().toISOString(),
                 })
                 .eq("id", sale.id);
+              if (updatePixErr) {
+                console.warn("[reseller-api] Falha ao persistir PIX recuperado em reseller_sales:", updatePixErr);
+              }
             }
           }
         } catch (e) {
@@ -1291,25 +1293,52 @@ Deno.serve(async (req: Request) => {
       const page = pageStr ? Math.max(1, parseInt(pageStr, 10) || 1) : 1;
       const limit = limitStr ? Math.max(1, Math.min(100, parseInt(limitStr, 10) || 20)) : 20;
 
-      // 1. Busca todas as licenças do revendedor autenticado (estritamente comerciais, sem TEST)
+      // 1. Busca todas as licenças do revendedor autenticado
       const { data: allResellerLicenses, error: allErr } = await supabaseAdmin
         .from("licenses")
         .select("id, key_mask, plan, status, max_devices, expires_at, entitlements, customer_name, customer_email, customer_whatsapp, created_at, updated_at, license_type, renewed_at, renewal_count")
         .eq("reseller_id", reseller.id)
-        .neq("license_type", "TEST")
         .order("created_at", { ascending: false });
 
       if (allErr) {
         return json({ ok: false, message: allErr.message }, 500);
       }
 
-      // Garante exclusão estrita de licenças TEST em memória também
-      const allList = (allResellerLicenses || []).filter((l: any) => l.license_type !== "TEST");
+      const allList = allResellerLicenses || [];
       const nowMs = Date.now();
 
-      // Métricas reais isoladas do revendedor (apenas comerciais)
+      // Limites do dia atual em UTC-3 para determinação de vencimento hoje
+      const { startIso: todayStartIso, nextDayStartIso: todayNextDayIso } = getUtc3DayBoundsIso();
+      const startTodayMs = new Date(todayStartIso).getTime();
+      const endTodayMs = new Date(todayNextDayIso).getTime();
+
+      // Regra de autoridade para elegibilidade de Renovação:
+      // INCLUI:
+      // 1. Licença comercial expirada (expires_at < startTodayMs ou status === 'expired')
+      // 2. Licença comercial vencendo hoje em UTC-3 (expires_at >= startTodayMs && expires_at < endTodayMs)
+      // EXCLUI:
+      // 1. Todas as licenças TEST
+      // 2. Licenças com status revoked
+      // 3. Licenças comerciais ativas com vencimento futuro (expires_at >= endTodayMs)
+      const isRenewalEligible = (l: any) => {
+        if (l.license_type === "TEST" || l.status === "revoked") return false;
+        if (l.status === "expired") return true;
+        if (!l.expires_at) return false;
+        const expMs = new Date(l.expires_at).getTime();
+        const isExpiringToday = expMs >= startTodayMs && expMs < endTodayMs;
+        const isExpiredBeforeToday = expMs < startTodayMs;
+        return isExpiredBeforeToday || isExpiringToday;
+      };
+
+      // Métricas consolidadas do painel:
+      // - Total: todas as licenças do revendedor
+      // - Ativas: comerciais ativas não expiradas
+      // - Expiradas: comerciais expiradas + TEST expiradas
+      // - Testes: total de licenças do tipo TEST
+      // - Renovação: comerciais elegíveis para renovação (expiradas + vencendo hoje)
       const totalLicenses = allList.length;
       const activeLicenses = allList.filter((l: any) => {
+        if (l.license_type === "TEST") return false;
         if (l.status !== "active") return false;
         if (l.expires_at && new Date(l.expires_at).getTime() <= nowMs) return false;
         return true;
@@ -1319,18 +1348,8 @@ Deno.serve(async (req: Request) => {
         if (l.expires_at && new Date(l.expires_at).getTime() <= nowMs) return true;
         return false;
       }).length;
-      const testLicenses = 0; // Regra 18: TEST nunca entra em Revendedor -> Licenças
-
-      // Licenças comerciais que vencem hoje em UTC-3 (exclui TEST e revoked)
-      const { startIso: todayStartIso, nextDayStartIso: todayNextDayIso } = getUtc3DayBoundsIso();
-      const startTodayMs = new Date(todayStartIso).getTime();
-      const endTodayMs = new Date(todayNextDayIso).getTime();
-      const renewalLicenses = allList.filter((l: any) => {
-        if (l.license_type === "TEST" || l.status === "revoked") return false;
-        if (!l.expires_at) return false;
-        const expMs = new Date(l.expires_at).getTime();
-        return expMs >= startTodayMs && expMs < endTodayMs;
-      }).length;
+      const testLicenses = allList.filter((l: any) => l.license_type === "TEST").length;
+      const renewalLicenses = allList.filter(isRenewalEligible).length;
 
       // 2. Aplicação de Filtros
       let filtered = allList;
@@ -1351,16 +1370,13 @@ Deno.serve(async (req: Request) => {
             return l.status === "active" && (!l.expires_at || new Date(l.expires_at).getTime() > nowMs);
           });
         } else if (statusParam === "expired") {
+          // Filtro "Expiradas": retorna comerciais expiradas E licenças TEST expiradas
           filtered = filtered.filter((l: any) => {
             return l.status === "expired" || (l.expires_at && new Date(l.expires_at).getTime() <= nowMs);
           });
         } else if (statusParam === "renewals" || statusParam === "renewal") {
-          filtered = filtered.filter((l: any) => {
-            if (l.license_type === "TEST" || l.status === "revoked") return false;
-            if (!l.expires_at) return false;
-            const expMs = new Date(l.expires_at).getTime();
-            return expMs >= startTodayMs && expMs < endTodayMs;
-          });
+          // Filtro "Renovações": estritamente comerciais elegíveis para renovação
+          filtered = filtered.filter(isRenewalEligible);
         } else if (statusParam === "test") {
           filtered = filtered.filter((l: any) => l.license_type === "TEST");
         } else {
@@ -1377,16 +1393,8 @@ Deno.serve(async (req: Request) => {
       }
 
       const renewalsFilter = url.searchParams.get("renewals")?.trim().toLowerCase();
-      if (renewalsFilter === "today") {
-        const { startIso, nextDayStartIso } = getUtc3DayBoundsIso();
-        const startMs = new Date(startIso).getTime();
-        const endMs = new Date(nextDayStartIso).getTime();
-        filtered = filtered.filter((l: any) => {
-          if (l.license_type === "TEST" || l.status === "revoked") return false;
-          if (!l.expires_at) return false;
-          const expMs = new Date(l.expires_at).getTime();
-          return expMs >= startMs && expMs < endMs;
-        });
+      if (renewalsFilter === "eligible" || renewalsFilter === "today") {
+        filtered = filtered.filter(isRenewalEligible);
       }
 
       // Paginação
@@ -1448,6 +1456,7 @@ Deno.serve(async (req: Request) => {
           test_licenses: testLicenses,
           renewal_licenses: renewalLicenses,
           renewals_today: renewalLicenses,
+          renewals_eligible: renewalLicenses,
         },
         pagination: {
           page,
@@ -1849,15 +1858,18 @@ Deno.serve(async (req: Request) => {
                 const orderData = await getOrderRes.json();
                 const recovered = extractOrderPixData(orderData);
                 if (recovered.pixQrCode) {
-                  await supabaseAdmin
+                  const { error: recUpdateErr } = await supabaseAdmin
                     .from("reseller_sales")
                     .update({
                       pix_qr_code: recovered.pixQrCode,
                       pix_qr_code_base64: recovered.pixQrCodeBase64,
-                      ticket_url: recovered.ticketUrl,
                       updated_at: new Date().toISOString(),
                     })
                     .eq("id", existingActiveRenewal.id);
+
+                  if (recUpdateErr) {
+                    console.error("[reseller-api] Erro ao atualizar PIX recuperado:", recUpdateErr);
+                  }
 
                   return json({
                     ok: true,
@@ -2102,16 +2114,19 @@ Deno.serve(async (req: Request) => {
       }
 
       // 7. Atualiza os dados de PIX na venda de renovação
-      await supabaseAdmin
+      const { error: updatePixErr } = await supabaseAdmin
         .from("reseller_sales")
         .update({
           mp_payment_id: mpPaymentId,
           pix_qr_code: pixQrCode,
           pix_qr_code_base64: pixQrCodeBase64,
-          ticket_url: ticketUrl,
           updated_at: new Date().toISOString(),
         })
         .eq("id", newSale.id);
+
+      if (updatePixErr) {
+        console.error("[reseller-api] Erro ao persistir dados do PIX na venda de renovação:", updatePixErr);
+      }
 
       return json({
         ok: true,
