@@ -18,6 +18,7 @@ export class LicenseManager {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private onStateChangeCallback: ((state: LicenseStateInfo, previousState: LicenseStateInfo) => void) | null = null;
   private isInitialized = false;
+  private stateGeneration: number = 0;
 
   public setOnStateChange(callback: (state: LicenseStateInfo, previousState: LicenseStateInfo) => void): void {
     this.onStateChangeCallback = callback;
@@ -48,6 +49,12 @@ export class LicenseManager {
 
     // Inicia o heartbeat periódico de validação online (60 segundos)
     this.startHeartbeat();
+
+    // Dispara validação online imediata sem bloquear a inicialização da UI.
+    // Se a licença expirou no backend, será detectada em segundos (não em 10s do heartbeat).
+    void this.validate().catch(err => {
+      console.warn("[Neko/License] Falha na validação online inicial (boot):", err);
+    });
 
     return this.currentState;
   }
@@ -159,12 +166,20 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
     this.pendingValidationPromise = (async () => {
       try {
         const deviceId = await getStableDeviceId();
+        const genAtStart = this.stateGeneration;
         const vaultData = await licenseVault.loadVault();
         const result = await licenseClient.validate(deviceId, vaultData?.grant);
 
+        // Proteção contra race condition: se o estado mudou durante a validação
+        // (ex: activate() ou outra validate() concluiu), não sobrescrever o estado mais recente
+        if (this.stateGeneration !== genAtStart) {
+          console.warn("[Neko/License] Estado alterado durante validação online. Descartando resultado obsoleto.");
+          return result;
+        }
+
         if (result.ok && result.grant) {
           const verification = verifySignedGrant(result.grant, deviceId);
-if (verification.valid && (verification.state === "VALID" || verification.state === "GRACE")) {
+          if (verification.valid && (verification.state === "VALID" || verification.state === "GRACE")) {
             await licenseVault.saveGrant(result.grant, result.key_mask);
             this.updateStateFromVerification(verification.state, verification.payload, result.key_mask);
           } else {
@@ -183,6 +198,29 @@ if (verification.valid && (verification.state === "VALID" || verification.state 
             entitlements: [],
             deviceId,
             reason: "REMOTE_TRANSFER",
+          });
+        } else if (result.error_code === "EXPIRED") {
+          // CORREÇÃO CRÍTICA: O backend declarou a licença como expirada.
+          // O Electron DEVE bloquear imediatamente — o grace period NÃO se aplica
+          // quando o servidor responde explicitamente EXPIRED.
+          console.warn("[Neko/License] Licença expirada no servidor. Limpando cofre local e bloqueando acesso.");
+          await licenseVault.clearGrant();
+          this.updateStateDirectly({
+            state: "EXPIRED",
+            isLicensed: false,
+            entitlements: [],
+            deviceId,
+            reason: "REMOTE_EXPIRED",
+          });
+        } else if (result.error_code === "INACTIVE") {
+          console.warn("[Neko/License] Licença inativa no servidor. Limpando cofre local e bloqueando acesso.");
+          await licenseVault.clearGrant();
+          this.updateStateDirectly({
+            state: "EXPIRED",
+            isLicensed: false,
+            entitlements: [],
+            deviceId,
+            reason: "REMOTE_INACTIVE",
           });
         }
 
@@ -221,6 +259,7 @@ if (verification.valid && (verification.state === "VALID" || verification.state 
   private updateStateDirectly(newState: LicenseStateInfo): void {
     const prev = { ...this.currentState };
     this.currentState = newState;
+    this.stateGeneration++;
     if (prev.state !== newState.state || prev.isLicensed !== newState.isLicensed) {
       try {
         this.onStateChangeCallback?.(this.currentState, prev);

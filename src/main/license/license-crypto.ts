@@ -159,6 +159,14 @@ export function verifySignedGrant(grant: string, expectedDeviceId: string): Lice
     return { valid: false, state: "INVALID", reason: "invalid_date_format", payload };
   }
 
+  // 6a. Proteção contra retrocesso de relógio (Clock Rollback)
+  // Se o relógio local está mais de 60s no passado em relação ao issued_at do grant,
+  // o grant é rejeitado — impede bypass de expiração via manipulação de relógio.
+  const issuedAtMs = new Date(payload.issued_at).getTime();
+  if (!isNaN(issuedAtMs) && nowMs < issuedAtMs - 60000) {
+    return { valid: false, state: "INVALID", reason: "clock_rollback_detected", payload };
+  }
+
   // Regra Inegociável: grace_until NUNCA pode ser posterior a expires_at
   if (graceUntilMs > expiresAtMs) {
     return { valid: false, state: "INVALID", reason: "grace_exceeds_expiration", payload };

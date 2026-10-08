@@ -753,7 +753,21 @@ Deno.serve(async (req: Request) => {
       if (typeof customer_email !== "undefined") updatePayload.customer_email = customer_email ? String(customer_email).trim().slice(0, 255) : null;
       if (typeof customer_whatsapp !== "undefined") updatePayload.customer_whatsapp = customer_whatsapp ? String(customer_whatsapp).trim().slice(0, 32) : null;
       if (plan && ["MONTHLY", "QUARTERLY", "ANNUAL"].includes(plan)) updatePayload.plan = plan;
-      if (expires_at) updatePayload.expires_at = expires_at;
+      if (expires_at) {
+        updatePayload.expires_at = expires_at;
+        // Sincronizar status persistido com a nova data de expiração.
+        // Revoked e cancelled nunca são alterados automaticamente.
+        if (currentLic.status !== "revoked" && currentLic.status !== "cancelled") {
+          const newExpiresMs = new Date(expires_at).getTime();
+          if (!Number.isNaN(newExpiresMs) && newExpiresMs <= Date.now()) {
+            // Data no passado → marcar como expirada no banco
+            updatePayload.status = "expired";
+          } else if (!Number.isNaN(newExpiresMs) && newExpiresMs > Date.now() && currentLic.status === "expired") {
+            // Data futura e licença estava expirada → reativar
+            updatePayload.status = "active";
+          }
+        }
+      }
 
       if (typeof max_devices !== "undefined") {
         const numDevices = Number(max_devices);
