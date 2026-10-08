@@ -87,7 +87,7 @@ describe("LicenseManager.validate() — INACTIVE handling", () => {
 
   test("T07: INACTIVE → clearGrant() + state EXPIRED + isLicensed false + reason REMOTE_INACTIVE", () => {
     const idx = MANAGER_SRC.indexOf('error_code === "INACTIVE"');
-    const block = MANAGER_SRC.slice(idx, idx + 400);
+    const block = MANAGER_SRC.slice(idx, idx + 800);
     expect(block).toContain("clearGrant()");
     expect(block).toContain('state: "EXPIRED"');
     expect(block).toContain("isLicensed: false");
@@ -197,8 +197,8 @@ describe("Race Condition Protection — stateGeneration", () => {
 
   test("T20: validate() descarta resultado obsoleto sem alterar estado quando geração diverge", () => {
     const validateBlock = MANAGER_SRC.slice(
-      MANAGER_SRC.indexOf("this.stateGeneration !== genAtStart"),
-      MANAGER_SRC.indexOf("this.stateGeneration !== genAtStart") + 200
+      MANAGER_SRC.indexOf("this.stateGeneration !== genAtStart", MANAGER_SRC.indexOf("public async validate")),
+      MANAGER_SRC.indexOf("this.stateGeneration !== genAtStart", MANAGER_SRC.indexOf("public async validate")) + 200
     );
     expect(validateBlock).toContain("return result");
   });
@@ -539,7 +539,7 @@ describe("Grace period NÃO se aplica quando servidor declara EXPIRED", () => {
     const idx = MANAGER_SRC.indexOf('error_code === "EXPIRED"');
     // Pega o bloco entre EXPIRED e INACTIVE
     const inactiveIdx = MANAGER_SRC.indexOf('error_code === "INACTIVE"', idx);
-    const block = MANAGER_SRC.slice(idx, inactiveIdx > idx ? inactiveIdx : idx + 400);
+    const block = MANAGER_SRC.slice(idx, inactiveIdx > idx ? inactiveIdx : idx + 800);
     expect(block).not.toContain('"GRACE"');
   });
 

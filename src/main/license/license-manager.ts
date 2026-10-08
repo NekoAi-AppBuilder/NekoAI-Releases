@@ -27,12 +27,15 @@ export class LicenseManager {
   public async initialize(): Promise<LicenseStateInfo> {
     if (this.isInitialized) return this.currentState;
 
+    const genAtStart = this.stateGeneration;
     this.currentDeviceId = await getStableDeviceId();
     this.currentState.deviceId = this.currentDeviceId;
 
     // Carrega o grant armazenado localmente
     const vaultData = await licenseVault.loadVault();
-    if (vaultData?.grant) {
+    if (this.stateGeneration !== genAtStart) {
+      console.warn("[Neko/License] Estado alterado durante initialize (loadVault). Descartando vault local.");
+    } else if (vaultData?.grant) {
       const verification = verifySignedGrant(vaultData.grant, this.currentDeviceId);
       this.updateStateFromVerification(verification.state, verification.payload, vaultData.keyMask);
     } else {
@@ -118,13 +121,18 @@ export class LicenseManager {
     }
 
     const deviceId = await getStableDeviceId();
-    const result = await licenseClient.activate(cleanKey, deviceId);
+    const genAtStart = this.stateGeneration;
+      const result = await licenseClient.activate(cleanKey, deviceId);
 
     if (result.ok && result.grant) {
       // Verifica o grant recebido antes de salvar
       const verification = verifySignedGrant(result.grant, deviceId);
       if (verification.valid && (verification.state === "VALID" || verification.state === "GRACE")) {
 await licenseVault.saveGrant(result.grant, result.key_mask);
+            if (this.stateGeneration !== genAtStart) {
+              console.warn("[Neko/License] Estado alterado durante ativação online (após saveGrant). Descartando resultado obsoleto.");
+              return result;
+            }
             this.updateStateFromVerification(verification.state, verification.payload, result.key_mask);
           } else {
             this.updateStateFromVerification(verification.state, verification.payload, result.key_mask);
@@ -141,12 +149,17 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
     }
 
     const deviceId = await getStableDeviceId();
+    const genAtStart = this.stateGeneration;
     const result = await licenseClient.resetDevice(cleanKey, deviceId);
 
     if (result.ok && result.grant) {
       const verification = verifySignedGrant(result.grant, deviceId);
       if (verification.valid && (verification.state === "VALID" || verification.state === "GRACE")) {
         await licenseVault.saveGrant(result.grant, result.key_mask);
+        if (this.stateGeneration !== genAtStart) {
+          console.warn("[Neko/License] Estado alterado durante validação/reset online (após saveGrant). Descartando resultado obsoleto.");
+          return result;
+        }
         this.updateStateFromVerification(verification.state, verification.payload, result.key_mask);
       } else {
         return { ok: false, error_code: "INVALID_GRANT", message: "O certificado emitido pelo servidor falhou na verificação de integridade local." };
@@ -181,6 +194,10 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
           const verification = verifySignedGrant(result.grant, deviceId);
           if (verification.valid && (verification.state === "VALID" || verification.state === "GRACE")) {
             await licenseVault.saveGrant(result.grant, result.key_mask);
+            if (this.stateGeneration !== genAtStart) {
+              console.warn("[Neko/License] Estado alterado durante validação/reset online (após saveGrant). Descartando resultado obsoleto.");
+              return result;
+            }
             this.updateStateFromVerification(verification.state, verification.payload, result.key_mask);
           } else {
             this.updateStateFromVerification(verification.state, verification.payload, result.key_mask);
@@ -192,6 +209,10 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
         ) {
           console.warn(`[Neko/License] Licença revogada ou transferida no servidor (${result.error_code}). Limpando cofre local imediatamente.`);
           await licenseVault.clearGrant();
+          if (typeof genAtStart !== "undefined" && this.stateGeneration !== genAtStart) {
+            console.warn("[Neko/License] Estado alterado durante validação/operação online (após clearGrant). Descartando resultado obsoleto.");
+            return result;
+          }
           this.updateStateDirectly({
             state: "MISSING",
             isLicensed: false,
@@ -205,6 +226,10 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
           // quando o servidor responde explicitamente EXPIRED.
           console.warn("[Neko/License] Licença expirada no servidor. Limpando cofre local e bloqueando acesso.");
           await licenseVault.clearGrant();
+          if (typeof genAtStart !== "undefined" && this.stateGeneration !== genAtStart) {
+            console.warn("[Neko/License] Estado alterado durante validação/operação online (após clearGrant). Descartando resultado obsoleto.");
+            return result;
+          }
           this.updateStateDirectly({
             state: "EXPIRED",
             isLicensed: false,
@@ -215,6 +240,10 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
         } else if (result.error_code === "INACTIVE") {
           console.warn("[Neko/License] Licença inativa no servidor. Limpando cofre local e bloqueando acesso.");
           await licenseVault.clearGrant();
+          if (typeof genAtStart !== "undefined" && this.stateGeneration !== genAtStart) {
+            console.warn("[Neko/License] Estado alterado durante validação/operação online (após clearGrant). Descartando resultado obsoleto.");
+            return result;
+          }
           this.updateStateDirectly({
             state: "EXPIRED",
             isLicensed: false,
@@ -240,10 +269,15 @@ await licenseVault.saveGrant(result.grant, result.key_mask);
     }
 
     const deviceId = await getStableDeviceId();
+    const genAtStart = this.stateGeneration;
     const result = await licenseClient.deactivate(targetLicenseId, deviceId);
 
     if (result.ok) {
       await licenseVault.clearGrant();
+      if (typeof genAtStart !== "undefined" && this.stateGeneration !== genAtStart) {
+        console.warn("[Neko/License] Estado alterado durante validação/operação online (após clearGrant). Descartando resultado obsoleto.");
+        return result;
+      }
       this.updateStateDirectly({
         state: "MISSING",
         isLicensed: false,
