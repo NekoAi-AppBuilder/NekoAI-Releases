@@ -1368,6 +1368,45 @@ function App() {
   const projectDisplayName = projectName;
   const [messages, setMessages] = React.useState<Message[]>([]);
   const [input, setInput] = React.useState("");
+  const [isEnhancingPrompt, setIsEnhancingPrompt] = React.useState(false);
+  const [previousPromptForUndo, setPreviousPromptForUndo] = React.useState<string | null>(null);
+
+  const handleEnhancePrompt = async () => {
+    if (!input.trim() || isEnhancingPrompt) return;
+    setPreviousPromptForUndo(null);
+    setIsEnhancingPrompt(true);
+    try {
+      const grant = licenseState.grant || "";
+      const url = "https://igadprvhgmfnyvyqavhy.supabase.co/functions/v1/enhance-prompt";
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-neko-license-grant": grant,
+        },
+        body: JSON.stringify({ prompt: input }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || "Falha ao melhorar prompt.");
+      }
+      setPreviousPromptForUndo(input);
+      setInput(data.improvedPrompt);
+    } catch (err: any) {
+      console.error("[Composer] Erro ao melhorar prompt:", err);
+      // Fallback gracioso, não afeta o fluxo normal e não consome créditos.
+      window.alert(err.message || "O serviço auxiliar está temporariamente ocupado. Tente novamente mais tarde.");
+    } finally {
+      setIsEnhancingPrompt(false);
+    }
+  };
+
+  const handleUndoEnhance = () => {
+    if (previousPromptForUndo !== null) {
+      setInput(previousPromptForUndo);
+      setPreviousPromptForUndo(null);
+    }
+  };
   const [busy, setBusy] = React.useState(false);
   const [activity, setActivity] = React.useState<Activity[]>([]);
   const [workingStatus, setWorkingStatus] = React.useState<string>("");
@@ -8572,6 +8611,7 @@ function App() {
                     const value = e.target.value;
                     const cursor = e.target.selectionStart ?? value.length;
                     setInput(value);
+                    if (previousPromptForUndo !== null) setPreviousPromptForUndo(null);
 
                     const trigger = detectAutocompleteTrigger(value, cursor);
                     if (trigger) {
@@ -8686,6 +8726,15 @@ function App() {
                   :<div className={`attachment-preview-card ${a.kind}`} key={`${a.path}:${i}`}><div className="attachment-preview-media">{a.kind==="image"&&a.previewUrl?<img src={a.previewUrl} alt={a.name}/>:<div className="attachment-doc-preview">{(a.extension||(a.name.split(".").pop()||"FILE")).slice(0,6).toUpperCase()}</div>}</div><div className="attachment-preview-info"><b title={a.name}>{a.name}</b><small>{formatBytes(a.size)}</small></div><button className="attachment-remove" onClick={()=>setAttachments(prev=>prev.filter((_,idx)=>idx!==i))} aria-label={`Remover ${a.name}`}><X size={12}/></button></div>
                 ))}{uploadErrors.map(e=><div className="attachment-preview-card failed" key={e.id}><div className="attachment-preview-media"><div className="attachment-doc-preview error">{e.extension.slice(0,6).toUpperCase()}</div></div><div className="attachment-preview-info"><b>Falha no Upload</b><small title={e.message}>{e.name}</small></div><button className="attachment-remove" onClick={()=>setUploadErrors(prev=>prev.filter(x=>x.id!==e.id))} aria-label="Remover erro"><X size={12}/></button></div>)}</div>}
                 <div className="composer-bar"><button className="plus" aria-label="Adicionar contexto" onClick={() => void handlePickAttachments()} disabled={busy}><Plus size={17}/></button>
+                  {previousPromptForUndo !== null ? (
+                    <button className="enhance-prompt-btn undo" aria-label="Desfazer Melhoria" onClick={handleUndoEnhance} disabled={busy || isEnhancingPrompt} title="Desfazer melhoria e voltar ao original" style={{ background: "rgba(255, 255, 255, 0.05)", padding: "0 10px", borderRadius: "12px", border: "1px solid rgba(255, 255, 255, 0.1)", color: "#a899b4", display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", fontWeight: 600 }}>
+                      <Undo2 size={14}/> Desfazer
+                    </button>
+                  ) : (
+                    <button className={`enhance-prompt-btn ${isEnhancingPrompt ? "loading" : ""}`} aria-label="Melhorar Prompt" onClick={() => void handleEnhancePrompt()} disabled={busy || isEnhancingPrompt || !input.trim()} title="Melhorar instrução gratuitamente" style={{ background: "rgba(168, 85, 247, 0.1)", padding: "0 10px", borderRadius: "12px", border: "1px solid rgba(168, 85, 247, 0.2)", color: "#c084fc", display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", fontWeight: 600 }}>
+                      {isEnhancingPrompt ? <Loader2 size={14} className="spin"/> : <Sparkles size={14}/>} Melhorar
+                    </button>
+                  )}
                   <div className="model-anchor" ref={modelAnchorRef}>
                     <button className="model-inline" onClick={() => {
                       setModelOpen(v => {

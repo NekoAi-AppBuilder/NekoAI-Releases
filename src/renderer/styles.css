@@ -7487,3 +7487,5 @@ button.github-pull-btn:hover:not(:disabled) {
 }
 
 
+
+.composer textarea { min-height: 120px; }
