@@ -7,7 +7,7 @@ import {
   ExternalLink, Eye, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
   Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitCommit, GitPullRequest, GitMerge, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
-  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info, Mic, MicOff, BarChart2
+  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info, Mic, MicOff, BarChart2, MicAudioLines
 } from "lucide-react";
 import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
@@ -8959,7 +8959,7 @@ function App() {
                     disabled={busy}
                     title="Adicionar contexto ou arquivos"
                   >
-                    <Paperclip size={15}/>
+                    <Paperclip size={16}/>
                   </button>
 
                   {previousPromptForUndo !== null ? (
@@ -8971,7 +8971,7 @@ function App() {
                       disabled={busy || isEnhancingPrompt} 
                       title="Desfazer melhoria e voltar ao original"
                     >
-                      <Undo2 size={14}/>
+                      <Undo2 size={13}/>
                       <span>Desfazer</span>
                     </button>
                   ) : (
@@ -8983,7 +8983,7 @@ function App() {
                       disabled={busy || isEnhancingPrompt || !input.trim()} 
                       title="Melhorar instrução com IA gratuitamente"
                     >
-                      {isEnhancingPrompt ? <Loader2 size={14} className="spin"/> : <Sparkles size={14}/>}
+                      {isEnhancingPrompt && <Loader2 size={13} className="spin"/>}
                       <span>Melhorar Prompt</span>
                     </button>
                   )}
@@ -8997,11 +8997,11 @@ function App() {
                     title={isRecordingAudio ? "Clique para concluir e transcrever" : isTranscribingAudio ? "Transcrevendo áudio..." : "Gravar prompt por voz"}
                   >
                     {isTranscribingAudio ? (
-                      <Loader2 size={15} className="spin"/>
+                      <Loader2 size={16} className="spin"/>
                     ) : isRecordingAudio ? (
-                      <MicOff size={15}/>
+                      <MicOff size={16}/>
                     ) : (
-                      <Mic size={15}/>
+                      <MicAudioLines size={16}/>
                     )}
                     {isRecordingAudio && <span className="recording-pulse-dot" />}
                   </button>
@@ -9092,7 +9092,6 @@ function App() {
                     </div>
 
                     <button className="effort" onClick={() => setEffort(effort === "Low" ? "Medium" : effort === "Medium" ? "High" : "Low")} disabled={busy}>
-                      <BarChart2 size={13}/>
                       <span>{effort}</span>
                       <ChevronDown size={13}/>
                     </button>

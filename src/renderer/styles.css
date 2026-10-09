@@ -6802,7 +6802,7 @@ button.github-pull-btn:hover:not(:disabled) {
   background: #110d18 !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
   border-radius: 14px !important;
-  padding: 12px 12px 10px !important;
+  padding: 14px 16px 12px 16px !important;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25) !important;
   display: flex !important;
   flex-direction: column !important;
@@ -6811,17 +6811,17 @@ button.github-pull-btn:hover:not(:disabled) {
 .composer textarea {
   display: block !important;
   width: 100% !important;
-  min-height: 85px !important;
+  min-height: 75px !important;
   max-height: 220px !important;
   resize: none !important;
   border: 0 !important;
   background: transparent !important;
   color: #eee9f7 !important;
   outline: 0 !important;
-  padding: 2px 2px 6px !important;
+  padding: 0 !important;
   font-family: Inter, Segoe UI, system-ui, sans-serif !important;
-  font-size: 12px !important;
-  line-height: 1.55 !important;
+  font-size: 13px !important;
+  line-height: 1.5 !important;
   box-sizing: border-box !important;
 }
 
@@ -6829,14 +6829,14 @@ button.github-pull-btn:hover:not(:disabled) {
   color: #6e647c !important;
 }
 
-/* Middle Utility Actions Row: [ 📎 ] [ ✨ Melhorar Prompt ] [ 🎙️ ] */
+/* Middle Utility Actions Row: [ 📎 ]  Melhorar Prompt  [ 🎙️ ] */
 .composer-actions-row {
   display: flex !important;
   align-items: center !important;
-  gap: 8px !important;
-  margin-top: 6px !important;
-  margin-bottom: 10px !important;
-  padding: 0 2px !important;
+  gap: 16px !important;
+  margin-top: 10px !important;
+  margin-bottom: 12px !important;
+  padding: 0 !important;
 }
 
 .composer-action-btn {
@@ -6848,17 +6848,16 @@ button.github-pull-btn:hover:not(:disabled) {
   border: 0 !important;
   color: #9485a3 !important;
   cursor: pointer !important;
-  border-radius: 6px !important;
-  padding: 4px 6px !important;
-  font-size: 11px !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  font-size: 12px !important;
   font-weight: 500 !important;
   transition: all 0.15s ease !important;
   user-select: none !important;
 }
 
 .composer-action-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.05) !important;
-  color: #ffffff !important;
+  background: transparent !important;
 }
 
 .composer-action-btn:disabled {
@@ -6867,52 +6866,52 @@ button.github-pull-btn:hover:not(:disabled) {
 }
 
 .composer-action-btn.clip-btn {
-  color: #9485a3 !important;
-  padding: 4px !important;
+  color: #a855f7 !important;
+  padding: 0 !important;
 }
 
 .composer-action-btn.clip-btn:hover:not(:disabled) {
-  color: #ffffff !important;
+  color: #c084fc !important;
 }
 
 .composer-action-btn.enhance-btn {
-  color: #c084fc !important;
-  font-weight: 600 !important;
-  background: rgba(168, 85, 247, 0.08) !important;
-  border-radius: 8px !important;
-  padding: 4px 8px !important;
+  color: #857b98 !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
 }
 
 .composer-action-btn.enhance-btn:hover:not(:disabled) {
-  color: #d8b4fe !important;
-  background: rgba(168, 85, 247, 0.18) !important;
+  color: #c084fc !important;
+  background: transparent !important;
 }
 
 .composer-action-btn.enhance-btn.undo {
   color: #a899b4 !important;
-  background: rgba(255, 255, 255, 0.06) !important;
+  background: transparent !important;
+  padding: 0 !important;
 }
 
 .composer-action-btn.enhance-btn.undo:hover:not(:disabled) {
   color: #ffffff !important;
-  background: rgba(255, 255, 255, 0.1) !important;
 }
 
 .composer-action-btn.voice-btn {
-  color: #c084fc !important;
-  padding: 4px 6px !important;
+  color: #a855f7 !important;
+  padding: 0 !important;
+  background: transparent !important;
   position: relative !important;
 }
 
 .composer-action-btn.voice-btn:hover:not(:disabled) {
-  color: #d8b4fe !important;
-  background: rgba(168, 85, 247, 0.14) !important;
+  color: #c084fc !important;
 }
 
 .composer-action-btn.voice-btn.recording {
   color: #f43f5e !important;
-  background: rgba(244, 63, 94, 0.16) !important;
-  border: 1px solid rgba(244, 63, 94, 0.35) !important;
   animation: pulseRecordButton 1.5s infinite !important;
 }
 
@@ -6942,7 +6941,7 @@ button.github-pull-btn:hover:not(:disabled) {
   display: flex !important;
   align-items: center !important;
   justify-content: space-between !important;
-  gap: 6px !important;
+  gap: 8px !important;
   height: auto !important;
   min-height: 32px !important;
   max-height: none !important;
@@ -6954,7 +6953,7 @@ button.github-pull-btn:hover:not(:disabled) {
 .composer-bar-left {
   display: flex !important;
   align-items: center !important;
-  gap: 6px !important;
+  gap: 16px !important;
   flex: 1 1 auto !important;
   min-width: 0 !important;
 }
@@ -6962,7 +6961,7 @@ button.github-pull-btn:hover:not(:disabled) {
 .composer-bar-right {
   display: flex !important;
   align-items: center !important;
-  gap: 6px !important;
+  gap: 8px !important;
   flex: 0 0 auto !important;
 }
 
@@ -6971,63 +6970,93 @@ button.github-pull-btn:hover:not(:disabled) {
   z-index: var(--z-popover) !important;
   min-width: 0 !important;
   flex: 0 1 auto !important;
-  max-width: 140px !important;
+  max-width: none !important;
 }
 
 .model-inline {
   display: flex !important;
   align-items: center !important;
   gap: 5px !important;
-  font-size: 11px !important;
-  width: 100% !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  width: auto !important;
   max-width: 100% !important;
   min-width: 0 !important;
-  padding: 5px 8px !important;
-  height: 29px !important;
-  border-radius: 8px !important;
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
-  background: rgba(255, 255, 255, 0.04) !important;
-  color: #cfc7da !important;
+  padding: 2px 0 !important;
+  height: auto !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: #8d829c !important;
   cursor: pointer !important;
   box-sizing: border-box !important;
-  transition: all 0.15s ease !important;
+  transition: color 0.15s ease !important;
 }
 
 .model-inline:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08) !important;
-  border-color: rgba(255, 255, 255, 0.15) !important;
+  background: transparent !important;
+  border: 0 !important;
   color: #ffffff !important;
+}
+
+.model-inline .spark {
+  color: #a855f7 !important;
+  display: flex !important;
+  align-items: center !important;
 }
 
 .model-inline span:nth-child(2) {
   overflow: hidden !important;
   text-overflow: ellipsis !important;
   white-space: nowrap !important;
+  max-width: 140px !important;
   min-width: 0 !important;
-  flex: 1 1 auto !important;
+  color: #8d829c !important;
+  font-size: 12px !important;
+}
+
+.model-inline:hover:not(:disabled) span:nth-child(2) {
+  color: #ffffff !important;
+}
+
+.model-inline svg {
+  color: #8d829c !important;
+}
+
+.model-inline:hover:not(:disabled) svg {
+  color: #ffffff !important;
 }
 
 .effort {
   display: flex !important;
   align-items: center !important;
-  gap: 5px !important;
-  font-size: 11px !important;
+  gap: 3px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
   flex: 0 0 auto !important;
   white-space: nowrap !important;
-  padding: 5px 8px !important;
-  height: 29px !important;
-  border-radius: 8px !important;
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
-  background: rgba(255, 255, 255, 0.04) !important;
-  color: #cfc7da !important;
+  padding: 2px 0 !important;
+  height: auto !important;
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: #8d829c !important;
   cursor: pointer !important;
   box-sizing: border-box !important;
-  transition: all 0.15s ease !important;
+  transition: color 0.15s ease !important;
 }
 
 .effort:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08) !important;
-  border-color: rgba(255, 255, 255, 0.15) !important;
+  background: transparent !important;
+  border: 0 !important;
+  color: #ffffff !important;
+}
+
+.effort svg {
+  color: #8d829c !important;
+}
+
+.effort:hover:not(:disabled) svg {
   color: #ffffff !important;
 }
 
@@ -7041,22 +7070,27 @@ button.github-pull-btn:hover:not(:disabled) {
   display: flex !important;
   align-items: center !important;
   gap: 5px !important;
-  font-size: 11px !important;
-  padding: 5px 9px !important;
-  height: 29px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  padding: 0 11px !important;
+  height: 30px !important;
   border-radius: 8px !important;
-  border: 1px solid rgba(255, 255, 255, 0.08) !important;
-  background: rgba(255, 255, 255, 0.04) !important;
-  color: #cfc7da !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  background: #171221 !important;
+  color: #eee9f7 !important;
   cursor: pointer !important;
   box-sizing: border-box !important;
   transition: all 0.15s ease !important;
 }
 
 .chat-mode-trigger:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.08) !important;
-  border-color: rgba(255, 255, 255, 0.15) !important;
+  background: #221a30 !important;
+  border-color: rgba(255, 255, 255, 0.2) !important;
   color: #ffffff !important;
+}
+
+.chat-mode-trigger .chat-mode-caret {
+  color: #8d829c !important;
 }
 
 .send-btn {
@@ -7064,12 +7098,12 @@ button.github-pull-btn:hover:not(:disabled) {
   align-items: center !important;
   justify-content: center !important;
   gap: 6px !important;
-  padding: 0 14px !important;
-  height: 29px !important;
-  min-height: 29px !important;
-  max-height: 29px !important;
+  padding: 0 16px !important;
+  height: 30px !important;
+  min-height: 30px !important;
+  max-height: 30px !important;
   width: auto !important;
-  min-width: 76px !important;
+  min-width: 80px !important;
   border: 0 !important;
   border-radius: 8px !important;
   background: #7c3aed !important;
@@ -7077,14 +7111,14 @@ button.github-pull-btn:hover:not(:disabled) {
   font-size: 12px !important;
   font-weight: 600 !important;
   cursor: pointer !important;
-  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.35) !important;
+  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.4) !important;
   transition: all 0.15s ease !important;
   user-select: none !important;
 }
 
 .send-btn:hover:not(:disabled) {
   background: #6d28d9 !important;
-  box-shadow: 0 4px 12px rgba(124, 58, 237, 0.5) !important;
+  box-shadow: 0 4px 14px rgba(124, 58, 237, 0.55) !important;
 }
 
 .send-btn:disabled {
