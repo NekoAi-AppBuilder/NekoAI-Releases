@@ -3239,6 +3239,7 @@ function App() {
 
   // Fecha o popover de seleção de modelo ao clicar fora ou pressionar Escape.
   const modelAnchorRef = React.useRef<HTMLDivElement | null>(null);
+  const modelPopoverRef = React.useRef<HTMLDivElement | null>(null);
   React.useEffect(() => {
     if (!modelOpen) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setModelOpen(false); };
@@ -3249,6 +3250,41 @@ function App() {
     window.addEventListener("keydown", onKey);
     window.addEventListener("mousedown", onClick);
     return () => { window.removeEventListener("keydown", onKey); window.removeEventListener("mousedown", onClick); };
+  }, [modelOpen]);
+
+  // Posicionamento horizontal protegido dentro dos limites da janela (viewport bounds)
+  React.useLayoutEffect(() => {
+    if (!modelOpen || !modelPopoverRef.current || !modelAnchorRef.current) return;
+    const popover = modelPopoverRef.current;
+    const anchor = modelAnchorRef.current;
+
+    const adjustPosition = () => {
+      const anchorRect = anchor.getBoundingClientRect();
+      const popoverRect = popover.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+
+      // Base offset: -6px relativo ao anchor (deslocado para a direita em relação aos -37px anteriores)
+      let offsetLeft = -6;
+
+      // 1. Limite esquerdo: impede que o dropdown ultrapasse a borda esquerda da janela
+      const screenLeft = anchorRect.left + offsetLeft;
+      const minMargin = 8;
+      if (screenLeft < minMargin) {
+        offsetLeft += (minMargin - screenLeft);
+      }
+
+      // 2. Limite direito: impede que o dropdown ultrapasse a borda direita da janela
+      const screenRight = anchorRect.left + offsetLeft + popoverRect.width;
+      if (screenRight > viewportWidth - minMargin) {
+        offsetLeft -= (screenRight - (viewportWidth - minMargin));
+      }
+
+      popover.style.left = `${Math.round(offsetLeft)}px`;
+    };
+
+    adjustPosition();
+    window.addEventListener("resize", adjustPosition);
+    return () => window.removeEventListener("resize", adjustPosition);
   }, [modelOpen]);
 
   // Overlays (modais e dropdowns): quando um overlay está aberto, a visibilidade da view
@@ -9023,7 +9059,7 @@ function App() {
                         <span>{selected?.name || "Selecionar modelo"}</span>
                         <ChevronDown size={13}/>
                       </button>
-                      {modelOpen && <div className="model-popover" role="dialog" aria-label="Selecionar modelo">
+                      {modelOpen && <div className="model-popover" ref={modelPopoverRef} role="dialog" aria-label="Selecionar modelo">
                         <div className="model-search"><Search size={15}/><input autoFocus value={modelSearch} onChange={e => setModelSearch(e.target.value)} placeholder="Buscar modelos" aria-label="Buscar modelos" /></div>
                         <div className="model-list" onWheel={e => e.stopPropagation()}>
                           {modelGroups.length ? modelGroups.map(group => {
