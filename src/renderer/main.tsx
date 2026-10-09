@@ -7,7 +7,7 @@ import {
   ExternalLink, Eye, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
   Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitCommit, GitPullRequest, GitMerge, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
-  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info
+  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info, Mic, MicOff, BarChart2
 } from "lucide-react";
 import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
@@ -1411,6 +1411,201 @@ function App() {
     if (previousPromptForUndo !== null) {
       setInput(previousPromptForUndo);
       setPreviousPromptForUndo(null);
+    }
+  };
+
+  const [isRecordingAudio, setIsRecordingAudio] = React.useState(false);
+  const [isTranscribingAudio, setIsTranscribingAudio] = React.useState(false);
+  const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
+  const audioChunksRef = React.useRef<Blob[]>([]);
+  const audioStreamRef = React.useRef<MediaStream | null>(null);
+
+  const cleanupAudioStream = React.useCallback(() => {
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(track => {
+        try { track.stop(); } catch {}
+      });
+      audioStreamRef.current = null;
+    }
+    mediaRecorderRef.current = null;
+    audioChunksRef.current = [];
+  }, []);
+
+  React.useEffect(() => {
+    return () => {
+      cleanupAudioStream();
+    };
+  }, [cleanupAudioStream]);
+
+  const handleStopAndTranscribe = async () => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") {
+      cleanupAudioStream();
+      setIsRecordingAudio(false);
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      recorder.onstop = async () => {
+        const chunks = [...audioChunksRef.current];
+        const mimeType = recorder.mimeType || "audio/webm";
+        cleanupAudioStream();
+        setIsRecordingAudio(false);
+
+        if (!chunks || chunks.length === 0) {
+          notificationManager.showGlobalNotification({
+            message: "Nenhum áudio foi capturado.",
+            type: "warning"
+          });
+          resolve();
+          return;
+        }
+
+        const audioBlob = new Blob(chunks, { type: mimeType });
+        if (audioBlob.size < 100) {
+          notificationManager.showGlobalNotification({
+            message: "Gravação muito curta. Fale sua instrução e tente novamente.",
+            type: "warning"
+          });
+          resolve();
+          return;
+        }
+
+        setIsTranscribingAudio(true);
+        try {
+          const reader = new FileReader();
+          reader.readAsDataURL(audioBlob);
+          reader.onloadend = async () => {
+            try {
+              const base64Data = (reader.result as string)?.split(",")?.[1] || "";
+              if (!base64Data) {
+                throw new Error("Falha ao codificar o áudio capturado.");
+              }
+
+              const res = await window.neko.transcribeAudio({
+                audioBase64: base64Data,
+                mimeType
+              });
+
+              if (!res.success) {
+                throw new Error(res.message || res.error || "Falha na transcrição de voz.");
+              }
+
+              const transcribedText = (res.text || "").trim();
+              if (!transcribedText) {
+                notificationManager.showGlobalNotification({
+                  message: "Nenhuma fala foi detectada no áudio gravado.",
+                  type: "info"
+                });
+              } else {
+                setInput(prev => {
+                  const trimmed = prev.trim();
+                  return trimmed ? `${trimmed} ${transcribedText}` : transcribedText;
+                });
+                notificationManager.showGlobalNotification({
+                  message: "Voz transcrita com sucesso!",
+                  type: "success"
+                });
+              }
+            } catch (err: any) {
+              console.error("[Composer/Voice] Erro ao transcrever:", err);
+              notificationManager.showGlobalNotification({
+                message: err.message || "Erro ao transcrever áudio. Tente novamente.",
+                type: "warning"
+              });
+            } finally {
+              setIsTranscribingAudio(false);
+              resolve();
+            }
+          };
+          reader.onerror = () => {
+            setIsTranscribingAudio(false);
+            notificationManager.showGlobalNotification({
+              message: "Erro ao ler dados do áudio gravado.",
+              type: "warning"
+            });
+            resolve();
+          };
+        } catch (err: any) {
+          setIsTranscribingAudio(false);
+          notificationManager.showGlobalNotification({
+            message: err.message || "Erro inesperado ao processar áudio.",
+            type: "warning"
+          });
+          resolve();
+        }
+      };
+
+      try {
+        recorder.stop();
+      } catch (err) {
+        cleanupAudioStream();
+        setIsRecordingAudio(false);
+        resolve();
+      }
+    });
+  };
+
+  const handleToggleVoiceRecording = async () => {
+    if (busy || isTranscribingAudio) return;
+
+    if (isRecordingAudio) {
+      await handleStopAndTranscribe();
+      return;
+    }
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("Seu ambiente não suporta captura de microfone.");
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+      audioChunksRef.current = [];
+
+      let mimeType = "audio/webm;codecs=opus";
+      if (typeof MediaRecorder.isTypeSupported === "function") {
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+        }
+      }
+
+      const options = mimeType ? { mimeType } : undefined;
+      const recorder = new MediaRecorder(stream, options);
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          audioChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onerror = (e) => {
+        console.error("[Composer/Voice] Erro no gravador de áudio:", e);
+        cleanupAudioStream();
+        setIsRecordingAudio(false);
+        notificationManager.showGlobalNotification({
+          message: "Falha na gravação de áudio.",
+          type: "warning"
+        });
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(250);
+      setIsRecordingAudio(true);
+    } catch (err: any) {
+      cleanupAudioStream();
+      setIsRecordingAudio(false);
+      console.error("[Composer/Voice] Erro ao acessar microfone:", err);
+      let msg = "Não foi possível acessar o microfone.";
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        msg = "Permissão do microfone negada no sistema operacional.";
+      } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        msg = "Nenhum microfone encontrado no seu computador.";
+      }
+      notificationManager.showGlobalNotification({
+        message: msg,
+        type: "warning"
+      });
     }
   };
   const [busy, setBusy] = React.useState(false);
@@ -8755,124 +8950,200 @@ function App() {
                   </div>
                   :<div className={`attachment-preview-card ${a.kind}`} key={`${a.path}:${i}`}><div className="attachment-preview-media">{a.kind==="image"&&a.previewUrl?<img src={a.previewUrl} alt={a.name}/>:<div className="attachment-doc-preview">{(a.extension||(a.name.split(".").pop()||"FILE")).slice(0,6).toUpperCase()}</div>}</div><div className="attachment-preview-info"><b title={a.name}>{a.name}</b><small>{formatBytes(a.size)}</small></div><button className="attachment-remove" onClick={()=>setAttachments(prev=>prev.filter((_,idx)=>idx!==i))} aria-label={`Remover ${a.name}`}><X size={12}/></button></div>
                 ))}{uploadErrors.map(e=><div className="attachment-preview-card failed" key={e.id}><div className="attachment-preview-media"><div className="attachment-doc-preview error">{e.extension.slice(0,6).toUpperCase()}</div></div><div className="attachment-preview-info"><b>Falha no Upload</b><small title={e.message}>{e.name}</small></div><button className="attachment-remove" onClick={()=>setUploadErrors(prev=>prev.filter(x=>x.id!==e.id))} aria-label="Remover erro"><X size={12}/></button></div>)}</div>}
-                <div className="composer-bar"><button className="plus" aria-label="Adicionar contexto" onClick={() => void handlePickAttachments()} disabled={busy}><Plus size={17}/></button>
+                <div className="composer-actions-row">
+                  <button 
+                    type="button"
+                    className="composer-action-btn clip-btn" 
+                    aria-label="Adicionar contexto ou arquivos" 
+                    onClick={() => void handlePickAttachments()} 
+                    disabled={busy}
+                    title="Adicionar contexto ou arquivos"
+                  >
+                    <Paperclip size={15}/>
+                  </button>
+
                   {previousPromptForUndo !== null ? (
-                    <button className="enhance-prompt-btn undo" aria-label="Desfazer Melhoria" onClick={handleUndoEnhance} disabled={busy || isEnhancingPrompt} title="Desfazer melhoria e voltar ao original" style={{ background: "rgba(255, 255, 255, 0.05)", padding: "0 10px", borderRadius: "12px", border: "1px solid rgba(255, 255, 255, 0.1)", color: "#a899b4", display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", fontWeight: 600 }}>
-                      <Undo2 size={14}/> Desfazer
+                    <button 
+                      type="button"
+                      className="composer-action-btn enhance-btn undo" 
+                      aria-label="Desfazer Melhoria" 
+                      onClick={handleUndoEnhance} 
+                      disabled={busy || isEnhancingPrompt} 
+                      title="Desfazer melhoria e voltar ao original"
+                    >
+                      <Undo2 size={14}/>
+                      <span>Desfazer</span>
                     </button>
                   ) : (
-                    <button className={`enhance-prompt-btn ${isEnhancingPrompt ? "loading" : ""}`} aria-label="Melhorar Prompt" onClick={() => void handleEnhancePrompt()} disabled={busy || isEnhancingPrompt || !input.trim()} title="Melhorar instrução gratuitamente" style={{ background: "rgba(168, 85, 247, 0.1)", padding: "0 10px", borderRadius: "12px", border: "1px solid rgba(168, 85, 247, 0.2)", color: "#c084fc", display: "flex", alignItems: "center", gap: "6px", fontSize: "11px", fontWeight: 600 }}>
-                      {isEnhancingPrompt ? <Loader2 size={14} className="spin"/> : <Sparkles size={14}/>} Melhorar
+                    <button 
+                      type="button"
+                      className={`composer-action-btn enhance-btn ${isEnhancingPrompt ? "loading" : ""}`} 
+                      aria-label="Melhorar Prompt" 
+                      onClick={() => void handleEnhancePrompt()} 
+                      disabled={busy || isEnhancingPrompt || !input.trim()} 
+                      title="Melhorar instrução com IA gratuitamente"
+                    >
+                      {isEnhancingPrompt ? <Loader2 size={14} className="spin"/> : <Sparkles size={14}/>}
+                      <span>Melhorar Prompt</span>
                     </button>
                   )}
-                  <div className="model-anchor" ref={modelAnchorRef}>
-                    <button className="model-inline" onClick={() => {
-                      setModelOpen(v => {
-                        const next = !v;
-                        if (next && selectedModel?.providerID) {
-                          setChatAccordionOpenProvider(selectedModel.providerID);
-                        }
-                        return next;
-                      });
-                    }} disabled={busy} aria-expanded={modelOpen} aria-label="Selecionar modelo">
-                      <span className="spark">{selected ? <ProviderIcon id={selected.providerID} size={15}/> : <Sparkles size={15}/>}</span>
-                      <span>{selected?.name || "Selecionar modelo"}</span>
-                      <ChevronDown size={14}/>
-                    </button>
-                    {modelOpen && <div className="model-popover" role="dialog" aria-label="Selecionar modelo">
-                      <div className="model-search"><Search size={15}/><input autoFocus value={modelSearch} onChange={e => setModelSearch(e.target.value)} placeholder="Buscar modelos" aria-label="Buscar modelos" /></div>
-                      <div className="model-list" onWheel={e => e.stopPropagation()}>
-                        {modelGroups.length ? modelGroups.map(group => {
-                          const isSearching = modelSearch.trim().length > 0;
-                          const isSelectedProvider = selectedModel?.providerID === group.providerID;
-                          const isOpen = isSearching || (chatAccordionOpenProvider === group.providerID) || (!chatAccordionOpenProvider && isSelectedProvider);
 
-                          // Find active model in this group
-                          const activeModelInGroup = group.models.find(m => selectedModel?.providerID === group.providerID && selectedModel?.modelID === m.modelID);
-                          const headerTitle = activeModelInGroup ? `${group.providerName} — ${activeModelInGroup.name}` : group.providerName;
-
-                          // Visual projection of models inside this group: active selected model always first, others in original relative order
-                          let displayModels = group.models;
-                          if (isSelectedProvider && activeModelInGroup) {
-                            displayModels = [activeModelInGroup, ...group.models.filter(m => m.modelID !== activeModelInGroup.modelID)];
-                          }
-
-                          return (
-                            <section className={`model-picker-group ${isOpen ? "open" : "collapsed"}`} key={group.providerID}>
-                              <button
-                                type="button"
-                                className="model-picker-accordion-header"
-                                onClick={() => setChatAccordionOpenProvider(prev => prev === group.providerID ? null : group.providerID)}
-                                aria-expanded={isOpen}
-                              >
-                                <span className="model-picker-provider-icon"><ProviderIcon id={group.providerID} size={14}/></span>
-                                <span className="model-picker-header-text" title={headerTitle}>{headerTitle}</span>
-                                <span className="model-picker-header-meta">
-                                  <ChevronDown size={13} className={`accordion-caret ${isOpen ? "rotated" : ""}`}/>
-                                </span>
-                              </button>
-                              {isOpen && (
-                                <div className="model-picker-items">
-                                  {displayModels.map(m => {
-                                    const isItemActive = selectedModel?.providerID === m.providerID && selectedModel?.modelID === m.modelID;
-                                    const isConnected = m.connected;
-                                    return (
-                                      <button
-                                        key={`${m.providerID}:${m.modelID}`}
-                                        className={`model-choice ${isItemActive ? "selected" : ""} ${!isConnected ? "unconfigured" : ""}`}
-                                        onClick={() => {
-                                          modelPickSourceRef.current = "user";
-                                          setSelectedModel({ providerID: m.providerID, modelID: m.modelID });
-                                          setChatAccordionOpenProvider(m.providerID);
-                                          setModelOpen(false);
-                                        }}
-                                      >
-                                        <span className="model-glyph"><ProviderIcon id={m.providerID} size={15}/></span>
-                                        <span className="model-choice-labels">
-                                          <b>{m.name}</b>
-                                          <small>{m.modelID}{!isConnected ? " • Não configurado" : ""}</small>
-                                        </span>
-                                        {!isConnected && <span className="model-unconfigured-tag">Não configurado</span>}
-                                        {isItemActive && isConnected && <i><Check size={14}/></i>}
-                                      </button>
-                                    );
-                                  })}
-                                </div>
-                              )}
-                            </section>
-                          );
-                        }) : <div className="model-picker-empty">{modelSearch ? "Nenhum modelo encontrado." : "Nenhum modelo disponível no catálogo."}</div>}
-                      </div>
-                      <button className="manage-models" onClick={() => { setModelOpen(false); setModal("models"); }}><Settings2 size={15}/> Gerenciar modelos</button>
-                    </div>}
-                  </div>
-                  <button className="effort" onClick={() => setEffort(effort === "Low" ? "Medium" : effort === "Medium" ? "High" : "Low")} disabled={busy}>{effort} <ChevronDown size={14}/></button>
-                  <div className="chat-mode-anchor" ref={chatModeAnchorRef}>
-                    <button
-                      className={`chat-mode-trigger ${planMode ? "plan" : "build"}`}
-                      onClick={() => { if (!busy) setChatModeMenuOpen(v => !v); }}
-                      disabled={busy}
-                      aria-haspopup="listbox"
-                      aria-expanded={chatModeMenuOpen}
-                      aria-label={`Modo: ${chatModeLabel(chatMode)}`}
-                      title={`${chatModeLabel(chatMode)} — Tab alterna para ${chatModeLabel(nextChatMode(chatMode))}`}
-                    >
-                      {planMode ? <FileCode2 size={14}/> : <Zap size={14}/>}
-                      <span>{chatModeLabel(chatMode)}</span>
-                      <ChevronDown size={13} className="chat-mode-caret"/>
-                    </button>
-                    {chatModeMenuOpen && (
-                      <div className="chat-mode-menu" role="listbox" aria-label="Modo do chat">
-                        {CHAT_MODES.map(m => (
-                          <button key={m} role="option" aria-selected={chatMode === m} className={`chat-mode-item ${chatMode === m ? "selected" : ""}`} onClick={() => selectChatMode(m)}>
-                            <span className="chat-mode-check">{chatMode === m ? <Check size={13}/> : null}</span>
-                            <span>{chatModeLabel(m)}</span>
-                          </button>
-                        ))}
-                      </div>
+                  <button
+                    type="button"
+                    className={`composer-action-btn voice-btn ${isRecordingAudio ? "recording" : ""} ${isTranscribingAudio ? "transcribing" : ""}`}
+                    aria-label={isRecordingAudio ? "Parar gravação de voz" : isTranscribingAudio ? "Transcrevendo voz..." : "Prompt por voz"}
+                    onClick={() => void handleToggleVoiceRecording()}
+                    disabled={busy || isTranscribingAudio}
+                    title={isRecordingAudio ? "Clique para concluir e transcrever" : isTranscribingAudio ? "Transcrevendo áudio..." : "Gravar prompt por voz"}
+                  >
+                    {isTranscribingAudio ? (
+                      <Loader2 size={15} className="spin"/>
+                    ) : isRecordingAudio ? (
+                      <MicOff size={15}/>
+                    ) : (
+                      <Mic size={15}/>
                     )}
+                    {isRecordingAudio && <span className="recording-pulse-dot" />}
+                  </button>
+                </div>
+
+                <div className="composer-bar">
+                  <div className="composer-bar-left">
+                    <div className="model-anchor" ref={modelAnchorRef}>
+                      <button className="model-inline" onClick={() => {
+                        setModelOpen(v => {
+                          const next = !v;
+                          if (next && selectedModel?.providerID) {
+                            setChatAccordionOpenProvider(selectedModel.providerID);
+                          }
+                          return next;
+                        });
+                      }} disabled={busy} aria-expanded={modelOpen} aria-label="Selecionar modelo">
+                        <span className="spark">{selected ? <ProviderIcon id={selected.providerID} size={14}/> : <Sparkles size={14}/>}</span>
+                        <span>{selected?.name || "Selecionar modelo"}</span>
+                        <ChevronDown size={13}/>
+                      </button>
+                      {modelOpen && <div className="model-popover" role="dialog" aria-label="Selecionar modelo">
+                        <div className="model-search"><Search size={15}/><input autoFocus value={modelSearch} onChange={e => setModelSearch(e.target.value)} placeholder="Buscar modelos" aria-label="Buscar modelos" /></div>
+                        <div className="model-list" onWheel={e => e.stopPropagation()}>
+                          {modelGroups.length ? modelGroups.map(group => {
+                            const isSearching = modelSearch.trim().length > 0;
+                            const isSelectedProvider = selectedModel?.providerID === group.providerID;
+                            const isOpen = isSearching || (chatAccordionOpenProvider === group.providerID) || (!chatAccordionOpenProvider && isSelectedProvider);
+
+                            // Find active model in this group
+                            const activeModelInGroup = group.models.find(m => selectedModel?.providerID === group.providerID && selectedModel?.modelID === m.modelID);
+                            const headerTitle = activeModelInGroup ? `${group.providerName} — ${activeModelInGroup.name}` : group.providerName;
+
+                            // Visual projection of models inside this group: active selected model always first, others in original relative order
+                            let displayModels = group.models;
+                            if (isSelectedProvider && activeModelInGroup) {
+                              displayModels = [activeModelInGroup, ...group.models.filter(m => m.modelID !== activeModelInGroup.modelID)];
+                            }
+
+                            return (
+                              <section className={`model-picker-group ${isOpen ? "open" : "collapsed"}`} key={group.providerID}>
+                                <button
+                                  type="button"
+                                  className="model-picker-accordion-header"
+                                  onClick={() => setChatAccordionOpenProvider(prev => prev === group.providerID ? null : group.providerID)}
+                                  aria-expanded={isOpen}
+                                >
+                                  <span className="model-picker-provider-icon"><ProviderIcon id={group.providerID} size={14}/></span>
+                                  <span className="model-picker-header-text" title={headerTitle}>{headerTitle}</span>
+                                  <span className="model-picker-header-meta">
+                                    <ChevronDown size={13} className={`accordion-caret ${isOpen ? "rotated" : ""}`}/>
+                                  </span>
+                                </button>
+                                {isOpen && (
+                                  <div className="model-picker-items">
+                                    {displayModels.map(m => {
+                                      const isItemActive = selectedModel?.providerID === m.providerID && selectedModel?.modelID === m.modelID;
+                                      const isConnected = m.connected;
+                                      return (
+                                        <button
+                                          key={`${m.providerID}:${m.modelID}`}
+                                          className={`model-choice ${isItemActive ? "selected" : ""} ${!isConnected ? "unconfigured" : ""}`}
+                                          onClick={() => {
+                                            modelPickSourceRef.current = "user";
+                                            setSelectedModel({ providerID: m.providerID, modelID: m.modelID });
+                                            setChatAccordionOpenProvider(m.providerID);
+                                            setModelOpen(false);
+                                          }}
+                                        >
+                                          <span className="model-glyph"><ProviderIcon id={m.providerID} size={15}/></span>
+                                          <span className="model-choice-labels">
+                                            <b>{m.name}</b>
+                                            <small>{m.modelID}{!isConnected ? " • Não configurado" : ""}</small>
+                                          </span>
+                                          {!isConnected && <span className="model-unconfigured-tag">Não configurado</span>}
+                                          {isItemActive && isConnected && <i><Check size={14}/></i>}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </section>
+                            );
+                          }) : <div className="model-picker-empty">{modelSearch ? "Nenhum modelo encontrado." : "Nenhum modelo disponível no catálogo."}</div>}
+                        </div>
+                        <button className="manage-models" onClick={() => { setModelOpen(false); setModal("models"); }}><Settings2 size={15}/> Gerenciar modelos</button>
+                      </div>}
+                    </div>
+
+                    <button className="effort" onClick={() => setEffort(effort === "Low" ? "Medium" : effort === "Medium" ? "High" : "Low")} disabled={busy}>
+                      <BarChart2 size={13}/>
+                      <span>{effort}</span>
+                      <ChevronDown size={13}/>
+                    </button>
                   </div>
-                  <button className={`send-btn ${busy ? "stop" : ""}`} onClick={() => void (busy ? stopDevelopment() : send())} disabled={!sessionId || (!busy && !input.trim() && attachments.length === 0)} aria-label={busy ? "Parar desenvolvimento" : "Enviar"}>{busy ? <Square size={13} fill="currentColor"/> : <ArrowUp size={17}/>}</button>
+
+                  <div className="composer-bar-right">
+                    <div className="chat-mode-anchor" ref={chatModeAnchorRef}>
+                      <button
+                        className={`chat-mode-trigger ${planMode ? "plan" : "build"}`}
+                        onClick={() => { if (!busy) setChatModeMenuOpen(v => !v); }}
+                        disabled={busy}
+                        aria-haspopup="listbox"
+                        aria-expanded={chatModeMenuOpen}
+                        aria-label={`Modo: ${chatModeLabel(chatMode)}`}
+                        title={`${chatModeLabel(chatMode)} — Tab alterna para ${chatModeLabel(nextChatMode(chatMode))}`}
+                      >
+                        {planMode ? <FileCode2 size={13}/> : <Zap size={13}/>}
+                        <span>{chatModeLabel(chatMode)}</span>
+                        <ChevronDown size={12} className="chat-mode-caret"/>
+                      </button>
+                      {chatModeMenuOpen && (
+                        <div className="chat-mode-menu" role="listbox" aria-label="Modo do chat">
+                          {CHAT_MODES.map(m => (
+                            <button key={m} role="option" aria-selected={chatMode === m} className={`chat-mode-item ${chatMode === m ? "selected" : ""}`} onClick={() => selectChatMode(m)}>
+                              <span className="chat-mode-check">{chatMode === m ? <Check size={13}/> : null}</span>
+                              <span>{chatModeLabel(m)}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <button 
+                      className={`send-btn ${busy ? "stop" : ""}`} 
+                      onClick={() => void (busy ? stopDevelopment() : send())} 
+                      disabled={!sessionId || (!busy && !input.trim() && attachments.length === 0)} 
+                      aria-label={busy ? "Parar desenvolvimento" : "Enviar"}
+                    >
+                      {busy ? (
+                        <>
+                          <Square size={13} fill="currentColor"/>
+                          <span>Parar</span>
+                        </>
+                      ) : (
+                        <>
+                          <Send size={13}/>
+                          <span>Enviar</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

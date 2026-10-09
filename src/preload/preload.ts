@@ -148,6 +148,7 @@ contextBridge.exposeInMainWorld("neko", {
   onVercelLog: (callback: (message: string) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: string) => callback(data); ipcRenderer.on("vercel:log", listener); return () => ipcRenderer.removeListener("vercel:log", listener); },
   licenseGetState: () => ipcRenderer.invoke("license:get-state"),
   licenseGetGrant: () => ipcRenderer.invoke("license:get-grant"),
+  transcribeAudio: (payload: { audioBase64: string; mimeType: string }) => ipcRenderer.invoke("ai:transcribe-audio", payload),
   licenseActivate: (licenseKey: string) => ipcRenderer.invoke("license:activate", { licenseKey }),
   licenseResetDevice: (licenseKey: string) => ipcRenderer.invoke("license:reset-device", { licenseKey }),
   licenseValidate: () => ipcRenderer.invoke("license:validate"),

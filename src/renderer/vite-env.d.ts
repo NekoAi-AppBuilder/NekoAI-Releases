@@ -136,6 +136,12 @@ interface Window {
       reason?: "LOCAL_DEACTIVATION" | "REMOTE_TRANSFER" | "INITIAL_CHECK" | "VERIFIED" | string;
     }>;
     licenseGetGrant(): Promise<string | null>;
+    transcribeAudio(payload: { audioBase64: string; mimeType: string }): Promise<{
+      success: boolean;
+      text?: string;
+      error?: string;
+      message?: string;
+    }>;
     licenseActivate(licenseKey: string): Promise<{
       ok: boolean;
       grant?: string;

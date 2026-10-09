@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, shell, WebContentsView, webFrameMain, type OpenDialogOptions } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, session, shell, WebContentsView, webFrameMain, type OpenDialogOptions } from "electron";
 import path from "node:path";
 import http from "node:http";
 import { spawn, spawnSync, ChildProcess } from "node:child_process";
@@ -10424,8 +10424,45 @@ app.whenReady().then(() => {
     }
   });
 
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    if (permission === "media") {
+      callback(true);
+      return;
+    }
+    callback(false);
+  });
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
+    if (permission === "media") return true;
+    return false;
+  });
+
   ipcMain.handle("license:get-state", () => licenseManager.getState());
   ipcMain.handle("license:get-grant", () => licenseManager.getGrant());
+  ipcMain.handle("ai:transcribe-audio", async (_event, payload: { audioBase64: string; mimeType: string }) => {
+    try {
+      const grant = (await licenseManager.getGrant()) || "";
+      if (!grant) {
+        return { success: false, error: "Credencial de licenciamento ativa não encontrada. Verifique se a sua licença está ativada." };
+      }
+      const url = "https://igadprvhgmfnyvyqavhy.supabase.co/functions/v1/transcribe-audio";
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-neko-license-grant": grant
+        },
+        body: JSON.stringify({
+          audio: payload?.audioBase64 || "",
+          mimeType: payload?.mimeType || "audio/webm"
+        })
+      });
+      const data = await res.json();
+      return data;
+    } catch (err: any) {
+      console.error("[Neko/Voice] Falha ao transcrever áudio via IPC:", err);
+      return { success: false, error: err?.message || String(err) };
+    }
+  });
   ipcMain.handle("license:activate", (_event, payload: { licenseKey: string }) =>
     licenseManager.activate(payload?.licenseKey)
   );
