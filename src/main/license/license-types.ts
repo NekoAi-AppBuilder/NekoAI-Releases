@@ -41,6 +41,10 @@ export interface LicenseStateInfo {
   deviceId: string;
   licenseId?: string;
   userId?: string;
+  maxDevices?: number;
+  activeDevices?: number;
+  licenseType?: string;
+  grant?: string;
   reason?: "LOCAL_DEACTIVATION" | "REMOTE_TRANSFER" | "INITIAL_CHECK" | "VERIFIED" | string;
 }
 
@@ -48,6 +52,9 @@ export interface StoredLicenseVault {
   version: number;
   grant: string;
   keyMask?: string;
+  maxDevices?: number;
+  activeDevices?: number;
+  licenseType?: string;
   lastCheckedAt?: string;
 }
 

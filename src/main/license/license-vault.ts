@@ -48,13 +48,22 @@ export class LicenseVault {
     }
   }
 
-  public async saveGrant(grant: string, keyMask?: string): Promise<void> {
+  public async saveGrant(
+    grant: string,
+    keyMask?: string,
+    maxDevices?: number,
+    activeDevices?: number,
+    licenseType?: string
+  ): Promise<void> {
     const vaultPath = this.getVaultPath();
     const existing = await this.loadVault();
     const vaultData: StoredLicenseVault = {
       version: 1,
       grant,
       keyMask: keyMask || existing?.keyMask,
+      maxDevices: typeof maxDevices === "number" ? maxDevices : existing?.maxDevices,
+      activeDevices: typeof activeDevices === "number" ? activeDevices : existing?.activeDevices,
+      licenseType: licenseType || existing?.licenseType,
       lastCheckedAt: new Date().toISOString(),
     };
 

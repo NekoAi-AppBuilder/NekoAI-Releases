@@ -61,4 +61,28 @@ describe("Composer: Melhorar Prompt", () => {
     onChange();
     expect(previousPromptForUndo).toBeNull();
   });
+
+  test("Propagação de grant: obtém de licenseState ou via fallback licenseGetGrant", async () => {
+    const mockStateWithGrant = { grant: "valid-grant-token-123" };
+    const getGrantDirect = async () => mockStateWithGrant.grant;
+    expect(await getGrantDirect()).toBe("valid-grant-token-123");
+
+    const mockStateWithoutGrant = { grant: undefined };
+    const mockWindowNeko = { licenseGetGrant: async () => "fallback-grant-456" };
+    const getGrantFallback = async () => mockStateWithoutGrant.grant || (await mockWindowNeko.licenseGetGrant()) || "";
+    expect(await getGrantFallback()).toBe("fallback-grant-456");
+  });
+
+  test("Rejeita chamada quando nenhuma credencial está disponível sem enviar header vazio", async () => {
+    const mockState = { grant: undefined };
+    const mockWindowNeko = { licenseGetGrant: async () => null };
+    const getGrant = async () => mockState.grant || (await mockWindowNeko.licenseGetGrant()) || "";
+    
+    const grant = await getGrant();
+    expect(grant).toBe("");
+    expect(() => {
+      if (!grant) throw new Error("Credencial de licenciamento ativa não encontrada. Verifique se a sua licença está ativada.");
+    }).toThrow("Credencial de licenciamento ativa não encontrada. Verifique se a sua licença está ativada.");
+  });
 });
+

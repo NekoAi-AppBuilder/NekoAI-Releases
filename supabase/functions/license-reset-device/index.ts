@@ -130,6 +130,16 @@ Deno.serve(async (req: Request) => {
   const expiresAt = new Date(dbResult.expires_at);
   const safeGraceUntil = computeSafeGraceUntil(now, expiresAt, 7);
 
+  const isTestLicense =
+    licenseKey.startsWith("NEKO-TEST-") ||
+    String(dbResult.license_type || "").toUpperCase() === "TEST" ||
+    String(dbResult.plan || "").toUpperCase() === "TEST" ||
+    String(dbResult.plan || "").toUpperCase() === "TESTE" ||
+    String(dbResult.key_mask || "").toUpperCase().startsWith("NEKO-TEST-");
+
+  const effectivePlan = isTestLicense ? "TEST" : dbResult.plan;
+  const effectiveLicenseType = isTestLicense ? "TEST" : (dbResult.license_type || "NORMAL");
+
   const grantPayload: GrantPayload = {
     jti: crypto.randomUUID(),
     iss: "https://nekoai.app/auth",
@@ -137,7 +147,7 @@ Deno.serve(async (req: Request) => {
     license_id: dbResult.license_id,
     user_id: dbResult.user_id,
     device_id: deviceId,
-    plan: dbResult.plan,
+    plan: effectivePlan,
     status: dbResult.status,
     entitlements: dbResult.entitlements,
     issued_at: now.toISOString(),
@@ -161,7 +171,10 @@ Deno.serve(async (req: Request) => {
     ok: true,
     grant: signedGrant,
     expires_at: dbResult.expires_at,
-    plan: dbResult.plan,
+    plan: effectivePlan,
     key_mask: dbResult.key_mask,
+    license_type: effectiveLicenseType,
+    max_devices: dbResult.max_devices ?? 1,
+    active_devices: dbResult.active_devices ?? 1,
   }, 200);
 });

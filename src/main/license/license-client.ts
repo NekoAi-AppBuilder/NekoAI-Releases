@@ -9,6 +9,9 @@ export interface LicenseActivateResponse {
   expires_at?: string;
   plan?: string;
   key_mask?: string;
+  max_devices?: number;
+  active_devices?: number;
+  license_type?: string;
   error_code?: string;
   message?: string;
 }
@@ -19,6 +22,9 @@ export interface LicenseValidateResponse {
   expires_at?: string;
   plan?: string;
   key_mask?: string;
+  max_devices?: number;
+  active_devices?: number;
+  license_type?: string;
   error_code?: string;
   message?: string;
   retry_after?: number;
@@ -37,6 +43,9 @@ export interface LicenseResetResponse {
   expires_at?: string;
   plan?: string;
   key_mask?: string;
+  max_devices?: number;
+  active_devices?: number;
+  license_type?: string;
   error_code?: string;
   message?: string;
   retry_after?: number;
@@ -103,7 +112,7 @@ export class LicenseClient {
     }
   }
 
-  public async validate(deviceId: string, grant?: string): Promise<LicenseValidateResponse> {
+  public async validate(deviceId: string, grant?: string, licenseId?: string): Promise<LicenseValidateResponse> {
     const url = `${this.baseUrl}/license-validate`;
     try {
       const res = await fetch(url, {
@@ -114,11 +123,32 @@ export class LicenseClient {
         body: JSON.stringify({
           device_id: deviceId,
           grant: grant || "",
+          license_id: licenseId || undefined,
         }),
       });
 
-      const data = await res.json();
-      return data;
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = {};
+      }
+
+      if (!res.ok) {
+        if (res.status >= 500) {
+          return { ok: false, error_code: "SERVER_UNAVAILABLE", message: "Servidor de licenças temporariamente indisponível." };
+        }
+        if (res.status === 429) {
+          return { ok: false, error_code: "RATE_LIMITED", message: data?.message || "Muitas tentativas.", retry_after: data?.retry_after };
+        }
+        return {
+          ok: false,
+          error_code: data?.error_code || "INVALID_REQUEST",
+          message: data?.message || "Não foi possível validar a licença.",
+        };
+      }
+
+      return { ok: true, ...data };
     } catch (err) {
       console.error("[Neko/LicenseClient] Falha de rede ao validar licença:", err);
       return { ok: false, error_code: "NETWORK_ERROR", message: "Não foi possível conectar ao servidor de licenças." };

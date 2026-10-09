@@ -1376,7 +1376,10 @@ function App() {
     setPreviousPromptForUndo(null);
     setIsEnhancingPrompt(true);
     try {
-      const grant = licenseState.grant || "";
+      const grant = licenseState.grant || (await window.neko.licenseGetGrant?.()) || "";
+      if (!grant) {
+        throw new Error("Credencial de licenciamento ativa não encontrada. Verifique se a sua licença está ativada.");
+      }
       const url = "https://igadprvhgmfnyvyqavhy.supabase.co/functions/v1/enhance-prompt";
       const res = await fetch(url, {
         method: "POST",
@@ -1394,8 +1397,11 @@ function App() {
       setInput(data.improvedPrompt);
     } catch (err: any) {
       console.error("[Composer] Erro ao melhorar prompt:", err);
-      // Fallback gracioso, não afeta o fluxo normal e não consome créditos.
-      window.alert(err.message || "O serviço auxiliar está temporariamente ocupado. Tente novamente mais tarde.");
+      // Notificação nativa elegante, não invasiva e sem bloquear a tela do usuário
+      notificationManager.showGlobalNotification({
+        message: err.message || "O serviço auxiliar está temporariamente ocupado. Tente novamente mais tarde.",
+        type: "warning",
+      });
     } finally {
       setIsEnhancingPrompt(false);
     }
@@ -1655,6 +1661,23 @@ function App() {
       || /^NEKO-TEST-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(key);
   };
 
+  const formatLicensePlan = (plan?: string, licenseType?: string, keyMask?: string): string => {
+    if (
+      String(licenseType || "").toUpperCase() === "TEST" ||
+      String(keyMask || "").toUpperCase().startsWith("NEKO-TEST-") ||
+      String(plan || "").toUpperCase() === "TEST" ||
+      String(plan || "").toUpperCase() === "TESTE"
+    ) {
+      return "Teste";
+    }
+    if (!plan) return "Anual";
+    const p = plan.toUpperCase().trim();
+    if (p === "MONTHLY" || p === "MENSAL") return "Mensal";
+    if (p === "QUARTERLY" || p === "TRIMESTRAL") return "Trimestral";
+    if (p === "ANNUAL" || p === "YEARLY" || p === "ANUAL") return "Anual";
+    return plan.charAt(0).toUpperCase() + plan.slice(1).toLowerCase();
+  };
+
   // License System States
   const [licenseState, setLicenseState] = React.useState<{
     state: "MISSING" | "INVALID" | "VALID" | "GRACE" | "EXPIRED";
@@ -1667,6 +1690,10 @@ function App() {
     keyMask?: string;
     deviceId: string;
     licenseId?: string;
+    maxDevices?: number;
+    activeDevices?: number;
+    licenseType?: string;
+    grant?: string;
   }>({
     state: "MISSING",
     isLicensed: false,
@@ -1693,6 +1720,9 @@ function App() {
       if (current) {
         console.log("[BLACKSCREEN] license:initial-fetch", { state: current.state, isLicensed: current.isLicensed });
         setLicenseState(current);
+        setLicenseSuccessMessage(null);
+        setLicenseError(null);
+        setLicenseErrorCode(null);
       }
     } catch (err) {
       console.warn("[Neko/LicenseUI] Falha ao carregar estado de licença:", err);
@@ -9072,15 +9102,9 @@ function App() {
               <div className="home-brand-logo-wrap">
                 <img className="home-brand-logo" src={nekoLogo} alt="NekoAI Logo" />
               </div>
-              <h1 className="home-hero-title">
-                {licenseState.state === "EXPIRED" ? "Licença Expirada" : licenseState.state === "INVALID" ? "Licença Inválida" : "Ative sua licença"}
-              </h1>
+              <h1 className="home-hero-title">Ative sua licença</h1>
               <p className="home-hero-subtitle">
-                {licenseState.state === "EXPIRED"
-                  ? "Sua assinatura do NekoAI expirou. Renove sua licença para continuar utilizando o workspace."
-                  : licenseState.state === "INVALID"
-                  ? "O certificado de licença local é inválido. Insira uma chave de licença válida para desbloquear o aplicativo."
-                  : "Para começar a criar e editar projetos com IA, ative sua licença."}
+                Para começar a criar e editar projetos com IA, ative sua licença.
               </p>
               <div className="license-lock-card">
                 {licenseSuccessMessage && (
@@ -12731,12 +12755,12 @@ function App() {
             )}
 
             {/* Visualização de Licença Ativa / Grace */}
-            {(licenseState.state === "VALID" || licenseState.state === "GRACE" || licenseState.state === "EXPIRED") && (
+            {(licenseState.state === "VALID" || licenseState.state === "GRACE") && (
               <div className="license-details-card">
                 <div className="license-detail-grid">
                   <div className="license-detail-item">
                     <span className="detail-label"><ShieldCheck size={14}/> Plano</span>
-                    <strong className="detail-value">{licenseState.plan || "ANNUAL"}</strong>
+                    <strong className="detail-value">{formatLicensePlan(licenseState.plan, licenseState.licenseType, licenseState.keyMask)}</strong>
                   </div>
                   <div className="license-detail-item">
                     <span className="detail-label"><Calendar size={14}/> Validade</span>
@@ -12756,6 +12780,12 @@ function App() {
                     <span className="detail-label"><Laptop size={14}/> Dispositivo</span>
                     <strong className="detail-value" title={licenseState.deviceId}>
                       {licenseState.deviceId ? `${licenseState.deviceId.slice(0, 8)}••••••••` : "Este computador"}
+                    </strong>
+                  </div>
+                  <div className="license-detail-item">
+                    <span className="detail-label"><Monitor size={14}/> Conexões</span>
+                    <strong className="detail-value">
+                      {`${licenseState.activeDevices || 1}/${licenseState.maxDevices || 1}`}
                     </strong>
                   </div>
                 </div>
@@ -12782,8 +12812,8 @@ function App() {
               </div>
             )}
 
-            {/* Formulário de Ativação (MISSING ou INVALID) */}
-            {(licenseState.state === "MISSING" || licenseState.state === "INVALID") && (
+            {/* Formulário de Ativação (MISSING, INVALID ou EXPIRED) */}
+            {(licenseState.state === "MISSING" || licenseState.state === "INVALID" || licenseState.state === "EXPIRED") && (
               <>
                 {licenseErrorCode === "DEVICE_ALREADY_ACTIVE" && (
                   <div className="branch-discard-warning-card" style={{ marginBottom: 14, borderColor: "rgba(234, 179, 8, .3)", background: "rgba(234, 179, 8, .06)" }}>
@@ -12824,6 +12854,7 @@ function App() {
                     <button
                       type="submit"
                       className="primary"
+                      style={{ width: "100%", justifyContent: "center" }}
                       disabled={licenseBusy || !isLicenseKeyComplete(licenseKeyInput)}
                     >
                       {licenseBusy ? <Loader2 size={16} className="spin"/> : <Check size={16}/>}
@@ -13179,13 +13210,13 @@ function App() {
                 </div>
               )}
 
-              {/* Visualização de Licença Ativa / Grace / Expired */}
-              {(licenseState.state === "VALID" || licenseState.state === "GRACE" || licenseState.state === "EXPIRED") && (
+              {/* Visualização de Licença Ativa / Grace */}
+              {(licenseState.state === "VALID" || licenseState.state === "GRACE") && (
                 <div className="license-details-card" style={{ marginTop: 10 }}>
                   <div className="license-detail-grid">
                     <div className="license-detail-item">
                       <span className="detail-label"><ShieldCheck size={14}/> Plano</span>
-                      <strong className="detail-value">{licenseState.plan || "ANNUAL"}</strong>
+                      <strong className="detail-value">{formatLicensePlan(licenseState.plan, licenseState.licenseType, licenseState.keyMask)}</strong>
                     </div>
                     <div className="license-detail-item">
                       <span className="detail-label"><Calendar size={14}/> Validade</span>
@@ -13210,7 +13241,7 @@ function App() {
                     <div className="license-detail-item">
                       <span className="detail-label"><Monitor size={14}/> Conexões</span>
                       <strong className="detail-value">
-                        {`1/${(licenseState as any).maxDevices || 1}`}
+                        {`${licenseState.activeDevices || 1}/${licenseState.maxDevices || 1}`}
                       </strong>
                     </div>
                   </div>
@@ -13237,8 +13268,8 @@ function App() {
                 </div>
               )}
 
-              {/* Formulário de Ativação (MISSING ou INVALID) */}
-              {(licenseState.state === "MISSING" || licenseState.state === "INVALID") && (
+              {/* Formulário de Ativação (MISSING, INVALID ou EXPIRED) */}
+              {(licenseState.state === "MISSING" || licenseState.state === "INVALID" || licenseState.state === "EXPIRED") && (
                 <div style={{ marginTop: 12 }}>
                   {licenseErrorCode === "DEVICE_ALREADY_ACTIVE" && (
                     <div className="branch-discard-warning-card" style={{ marginBottom: 14, borderColor: "rgba(234, 179, 8, .3)", background: "rgba(234, 179, 8, .06)" }}>
@@ -13278,6 +13309,7 @@ function App() {
                       <button
                         type="submit"
                         className="primary"
+                        style={{ width: "100%", justifyContent: "center" }}
                         disabled={licenseBusy || !isLicenseKeyComplete(licenseKeyInput)}
                       >
                         {licenseBusy ? <Loader2 size={16} className="spin"/> : <Check size={16}/>}

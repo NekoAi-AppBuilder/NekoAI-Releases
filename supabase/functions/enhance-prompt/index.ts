@@ -108,7 +108,8 @@ Deno.serve(async (req: Request) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  const geminiApiKey = Deno.env.get("GEMINI_API_KEY") || Deno.env.get("GEMINI_FREE_API_KEY");
+  const rawApiKey = Deno.env.get("GEMINI_API_KEY") || Deno.env.get("GEMINI_FREE_API_KEY");
+  const geminiApiKey = rawApiKey ? rawApiKey.trim().replace(/^["']|["']$/g, "").trim() : "";
 
   if (!supabaseUrl || !supabaseServiceKey || !geminiApiKey) {
     console.error("[enhance-prompt] Erro: Segredos não configurados.");
@@ -159,44 +160,75 @@ Deno.serve(async (req: Request) => {
     return json({ success: false, error_code: "RATE_LIMITED", message: "Muitas tentativas. Aguarde um instante e tente novamente." }, 429);
   }
 
-  // Chamada ao Gemini Free Tier (utilizando gemini-3.5-flash-lite)
-  try {
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent?key=${geminiApiKey}`;
-    const geminiRes = await fetch(geminiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: {
-          parts: [{ text: SYSTEM_PROMPT }]
+  // Lista de modelos suportados para failover automático contra picos de demanda
+  const CANDIDATE_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.1-flash-lite",
+  ];
+
+  let lastStatus = 0;
+  let lastErrorDetail = "";
+  let improvedPrompt: string | null = null;
+
+  for (const model of CANDIDATE_MODELS) {
+    try {
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`;
+      const geminiRes = await fetch(geminiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": geminiApiKey,
         },
-        contents: [
-          { parts: [{ text: originalPrompt }] }
-        ],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 2000,
+        body: JSON.stringify({
+          system_instruction: {
+            parts: [{ text: SYSTEM_PROMPT }]
+          },
+          contents: [
+            { parts: [{ text: originalPrompt }] }
+          ],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 2000,
+          }
+        })
+      });
+
+      if (!geminiRes.ok) {
+        const errBody = await geminiRes.text();
+        lastStatus = geminiRes.status;
+        console.warn(`[enhance-prompt] Modelo ${model} retornou ${geminiRes.status}. Tentando próximo modelo da fila...`);
+        try {
+          const parsed = JSON.parse(errBody);
+          lastErrorDetail = parsed?.error?.message || errBody;
+        } catch {
+          lastErrorDetail = errBody;
         }
-      })
-    });
-
-    if (!geminiRes.ok) {
-      if (geminiRes.status === 429) {
-         return json({ success: false, error_code: "PROVIDER_RATE_LIMIT", message: "O serviço de melhoria está temporariamente ocupado. Tente novamente mais tarde." }, 503);
+        continue;
       }
-      return json({ success: false, error_code: "PROVIDER_ERROR", message: "O serviço de melhoria não está disponível." }, 502);
+
+      const geminiData = await geminiRes.json();
+      const candidate = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (candidate && typeof candidate === "string" && candidate.trim()) {
+        improvedPrompt = candidate.trim();
+        break; // Sucesso com este modelo!
+      }
+    } catch (err) {
+      console.warn(`[enhance-prompt] Falha de rede temporária com modelo ${model}:`, err);
+      continue;
     }
-
-    const geminiData = await geminiRes.json();
-    const candidate = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!candidate || typeof candidate !== "string" || !candidate.trim()) {
-      return json({ success: false, error_code: "INVALID_RESPONSE", message: "Não foi possível melhorar este prompt no momento." }, 502);
-    }
-
-    return json({ success: true, improvedPrompt: candidate.trim() }, 200);
-
-  } catch (err) {
-    console.error("[enhance-prompt] Falha de comunicação:", err);
-    return json({ success: false, error_code: "NETWORK_ERROR", message: "Falha ao comunicar com o serviço auxiliar." }, 500);
   }
+
+  if (!improvedPrompt) {
+    console.error("[enhance-prompt] Todos os modelos candidatos falharam:", lastStatus, lastErrorDetail);
+    return json({
+      success: false,
+      error_code: "PROVIDER_BUSY",
+      message: "O serviço de IA está temporariamente com alta demanda. Tente novamente em instantes."
+    }, 503);
+  }
+
+  return json({ success: true, improvedPrompt }, 200);
 });

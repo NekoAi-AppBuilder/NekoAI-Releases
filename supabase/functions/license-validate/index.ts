@@ -5,6 +5,7 @@ import {
   createJsonResponse,
   extractNormalizedClientIp,
   signGrant,
+  verifySignedGrant,
   computeSafeGraceUntil,
   GrantPayload,
 } from "./license-crypto.ts";
@@ -34,7 +35,7 @@ Deno.serve(async (req: Request) => {
     auth: { persistSession: false },
   });
 
-  let body: { device_id?: string; grant?: string };
+  let body: { device_id?: string; grant?: string; license_id?: string };
   try {
     body = await req.json();
   } catch {
@@ -45,6 +46,38 @@ Deno.serve(async (req: Request) => {
   if (!/^[0-9a-fA-F]{32}$/.test(deviceId)) {
     return createJsonResponse({ error_code: "INVALID_DEVICE_ID", message: "Identificador de máquina inválido." }, 400);
   }
+
+  // Extrai license_id explicitamente e/ou decodifica e verifica criptograficamente do grant
+  let grantLicenseId: string | null = null;
+  const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+  if (typeof body.grant === "string" && body.grant.trim().length > 0) {
+    const grantCheck = await verifySignedGrant(body.grant.trim(), deviceId);
+    if (!grantCheck.valid || !grantCheck.payload) {
+      return createJsonResponse({
+        error_code: "INVALID_REQUEST",
+        message: "Certificado de licença inválido ou assinatura corrompida.",
+      }, 400);
+    }
+    if (typeof grantCheck.payload.license_id === "string" && uuidRegex.test(grantCheck.payload.license_id.trim())) {
+      grantLicenseId = grantCheck.payload.license_id.trim().toLowerCase();
+    }
+  }
+
+  let bodyLicenseId: string | null = null;
+  if (typeof body.license_id === "string" && uuidRegex.test(body.license_id.trim())) {
+    bodyLicenseId = body.license_id.trim().toLowerCase();
+  }
+
+  // Rejeita tentativas de falsificação ou divergência entre grant e license_id declarado
+  if (grantLicenseId && bodyLicenseId && grantLicenseId !== bodyLicenseId) {
+    return createJsonResponse({
+      error_code: "INVALID_REQUEST",
+      message: "Divergência entre o certificado de licença e o identificador fornecido.",
+    }, 400);
+  }
+
+  const licenseId: string | null = bodyLicenseId || grantLicenseId;
 
   // 1. Rate Limiting persistente por device_id e IP (60 tentativas/minuto)
   // Utiliza device_id para não colidir entre máquinas na mesma rede/NAT
@@ -73,12 +106,43 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // 2. Invoca a função atômica PostgreSQL SECURITY DEFINER (Sem qualquer UPDATE/INSERT direto)
-  const { data: dbResult, error: dbError } = await supabaseAdmin.rpc("fn_validate_license_device", {
+  // 2. Invoca a função atômica PostgreSQL SECURITY DEFINER (com suporte a p_license_id e fallback controlado)
+  let dbResult: any = null;
+  let dbError: any = null;
+
+  const rpcRes = await supabaseAdmin.rpc("fn_validate_license_device", {
     p_device_id: deviceId,
+    p_license_id: licenseId || null,
     p_ip: clientIp,
     p_user_agent: userAgent,
   });
+
+  dbResult = rpcRes.data;
+  dbError = rpcRes.error;
+
+  // Fallback defensivo controlado:
+  // Se o banco remoto ainda não tiver aplicado a migração com p_license_id (código PostgREST PGRST202):
+  // - Se licenseId foi especificado, NÃO podemos cair no fallback legado (descartaria a identidade da licença).
+  //   Retorna erro de configuração 500 para preservar o cofre local sem marcar como EXPIRED.
+  // - Se licenseId for nulo (descoberta), o fallback de 3 parâmetros é seguro pois o license_id já era nulo.
+  if (dbError && (dbError.code === "PGRST202" || dbError.message?.includes("p_license_id") || dbError.details?.includes("p_license_id"))) {
+    if (licenseId) {
+      console.error("[license-validate] Banco remoto não possui RPC com p_license_id para validar licença específica. Bloqueando fallback para evitar troca indevida de licença.");
+      return createJsonResponse({
+        error_code: "DB_CONFIG_ERROR",
+        message: "A validação da licença específica requer a atualização da RPC no banco de dados.",
+      }, 500);
+    } else {
+      console.warn("[license-validate] RPC com p_license_id não encontrada durante descoberta sem grant, executando fallback legado...");
+      const fallbackRes = await supabaseAdmin.rpc("fn_validate_license_device", {
+        p_device_id: deviceId,
+        p_ip: clientIp,
+        p_user_agent: userAgent,
+      });
+      dbResult = fallbackRes.data;
+      dbError = fallbackRes.error;
+    }
+  }
 
   if (dbError) {
     console.error("[license-validate] RPC fn_validate_license_device error:", {
@@ -113,6 +177,15 @@ Deno.serve(async (req: Request) => {
   const expiresAt = new Date(dbResult.expires_at);
   const safeGraceUntil = computeSafeGraceUntil(now, expiresAt, 7);
 
+  const isTestLicense =
+    String(dbResult.license_type || "").toUpperCase() === "TEST" ||
+    String(dbResult.plan || "").toUpperCase() === "TEST" ||
+    String(dbResult.plan || "").toUpperCase() === "TESTE" ||
+    String(dbResult.key_mask || "").toUpperCase().startsWith("NEKO-TEST-");
+
+  const effectivePlan = isTestLicense ? "TEST" : dbResult.plan;
+  const effectiveLicenseType = isTestLicense ? "TEST" : (dbResult.license_type || "NORMAL");
+
   const grantPayload: GrantPayload = {
     jti: crypto.randomUUID(),
     iss: "https://nekoai.app/auth",
@@ -120,7 +193,7 @@ Deno.serve(async (req: Request) => {
     license_id: dbResult.license_id,
     user_id: dbResult.user_id,
     device_id: deviceId,
-    plan: dbResult.plan,
+    plan: effectivePlan,
     status: dbResult.status,
     entitlements: dbResult.entitlements,
     issued_at: now.toISOString(),
@@ -143,8 +216,10 @@ Deno.serve(async (req: Request) => {
     ok: true,
     grant: signedGrant,
     expires_at: dbResult.expires_at,
-    plan: dbResult.plan,
+    plan: effectivePlan,
     key_mask: dbResult.key_mask,
-    license_type: dbResult.license_type,
+    license_type: effectiveLicenseType,
+    max_devices: dbResult.max_devices ?? 1,
+    active_devices: dbResult.active_devices ?? 1,
   }, 200);
 });

@@ -253,13 +253,13 @@ describe("Admin — sincronização de status ao alterar expires_at", () => {
     // Procura o bloco update_license
     const idx = ADMIN_LIC_SRC.indexOf('body.action === "update_license"');
     expect(idx).toBeGreaterThan(0);
-    const block = ADMIN_LIC_SRC.slice(idx, idx + 2000);
+    const block = ADMIN_LIC_SRC.slice(idx, idx + 3500);
     expect(block).toContain('updatePayload.status = "expired"');
   });
 
   test("T28: update_license reativa licença expirada quando expires_at é futura", () => {
     const idx = ADMIN_LIC_SRC.indexOf('body.action === "update_license"');
-    const block = ADMIN_LIC_SRC.slice(idx, idx + 2000);
+    const block = ADMIN_LIC_SRC.slice(idx, idx + 3500);
     expect(block).toContain('updatePayload.status = "active"');
     // Só reativa se status era "expired"
     expect(block).toContain('currentLic.status === "expired"');
@@ -267,13 +267,13 @@ describe("Admin — sincronização de status ao alterar expires_at", () => {
 
   test("T29: Revoked nunca é alterado automaticamente", () => {
     const idx = ADMIN_LIC_SRC.indexOf('body.action === "update_license"');
-    const block = ADMIN_LIC_SRC.slice(idx, idx + 2000);
+    const block = ADMIN_LIC_SRC.slice(idx, idx + 3500);
     expect(block).toContain('currentLic.status !== "revoked"');
   });
 
   test("T30: Cancelled nunca é alterado automaticamente", () => {
     const idx = ADMIN_LIC_SRC.indexOf('body.action === "update_license"');
-    const block = ADMIN_LIC_SRC.slice(idx, idx + 2000);
+    const block = ADMIN_LIC_SRC.slice(idx, idx + 3500);
     expect(block).toContain('currentLic.status !== "cancelled"');
   });
 });

@@ -63,6 +63,23 @@ if (process.platform === "win32") {
   }
 }
 
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  console.log("[NekoAI] Segunda instância detectada. Encerrando imediatamente.");
+  app.quit();
+  process.exit(0);
+}
+
+app.on("second-instance", (event, commandLine, workingDirectory) => {
+  console.log("[NekoAI] Requisição de segunda instância interceptada. Focando a janela principal.");
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+  }
+});
+
 interface WorkspaceContext {
   readonly generation: number;
   readonly projectPath: string;
@@ -9259,6 +9276,7 @@ ipcMain.handle("preview:navigate", async (_event, routePath: string) => {
 // Site Clone — analysis IPC. Deterministic static crawl of a public URL.
 // Progress is streamed to the renderer through "siteclone:event".
 ipcMain.handle("siteClone:analyze", async (_event, payload: { url: string; limits?: SiteCloneLimits }) => {
+  licenseManager.assertAccess("clonagem de sites");
   const send = (type: string, properties: Record<string, any>) => {
     try {
       mainWindow?.webContents.send("siteclone:event", { type, properties });
@@ -9281,6 +9299,7 @@ ipcMain.handle("siteClone:cancel", async () => {
 // uma janela oculta com partition isolada, navega só a origem fornecida e
 // devolve um snapshot estruturado. Nunca substitui o Preview normal.
 ipcMain.handle("siteClone:capture", async (_event, payload: { url?: string }) => {
+  licenseManager.assertAccess("captura de sites");
   const rawUrl = String(payload?.url ?? "").trim();
   console.log(`[SiteClone] capture-request url=${rawUrl}`);
   const snapshot = await captureSiteChromium(rawUrl, { BrowserWindow });
@@ -9291,6 +9310,7 @@ ipcMain.handle("siteClone:capture", async (_event, payload: { url?: string }) =>
 // Download public image/font assets into the ACTIVE project (public/clone-assets)
 // so the reconstruction uses real local files instead of placeholders/hotlinks.
 ipcMain.handle("siteClone:importAssets", async (_event, payload: { assets?: { url: string; kind: string }[] }) => {
+  licenseManager.assertAccess("importação de recursos de sites");
   const projectRoot = assertProjectRootSafe(currentProject, "site-clone-assets");
   const assets = Array.isArray(payload?.assets) ? payload.assets : [];
   console.log(`[SiteClone] import-assets project=${projectRoot} count=${assets.length}`);
@@ -9587,6 +9607,7 @@ ipcMain.handle("supabase:refresh-projects", async (_event, clearNotice: boolean 
 });
 
 ipcMain.handle("supabase:create-project", async (_event, payload: SupabaseCreateProjectPayload) => {
+  licenseManager.assertAccess("criação de projetos Supabase");
   try {
     return await supabaseManager.createProject(payload);
   } catch (error: any) {
@@ -9600,6 +9621,7 @@ ipcMain.handle("supabase:create-project", async (_event, payload: SupabaseCreate
 });
 
 ipcMain.handle("supabase:select-project", async (_event, ref: string) => {
+  licenseManager.assertAccess("seleção de projetos Supabase");
   const projectRoot = getActiveProjectRoot();
   if (!projectRoot) {
     const parsed = parseSupabaseError("Nenhum projeto ativo.");
@@ -10403,6 +10425,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("license:get-state", () => licenseManager.getState());
+  ipcMain.handle("license:get-grant", () => licenseManager.getGrant());
   ipcMain.handle("license:activate", (_event, payload: { licenseKey: string }) =>
     licenseManager.activate(payload?.licenseKey)
   );
@@ -10477,6 +10500,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("lovable:link-project", async (_event, projectId?: string) => {
+    licenseManager.assertAccess("vínculo com Lovable");
     try {
       return await lovableCloudManager.linkProject(projectId);
     } catch (error: any) {

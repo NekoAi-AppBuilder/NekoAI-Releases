@@ -132,8 +132,10 @@ interface Window {
       deviceId: string;
       licenseId?: string;
       userId?: string;
+      grant?: string;
       reason?: "LOCAL_DEACTIVATION" | "REMOTE_TRANSFER" | "INITIAL_CHECK" | "VERIFIED" | string;
     }>;
+    licenseGetGrant(): Promise<string | null>;
     licenseActivate(licenseKey: string): Promise<{
       ok: boolean;
       grant?: string;
@@ -181,6 +183,7 @@ interface Window {
       deviceId: string;
       licenseId?: string;
       userId?: string;
+      grant?: string;
       reason?: "LOCAL_DEACTIVATION" | "REMOTE_TRANSFER" | "INITIAL_CHECK" | "VERIFIED" | string;
     }) => void): () => void;
     updaterGetState(): Promise<{

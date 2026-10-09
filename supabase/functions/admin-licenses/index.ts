@@ -428,10 +428,16 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      const isLicTest =
+        String(lic.license_type || "").toUpperCase() === "TEST" ||
+        String(lic.plan || "").toUpperCase() === "TEST" ||
+        String(lic.plan || "").toUpperCase() === "TESTE" ||
+        String(lic.key_mask || "").toUpperCase().startsWith("NEKO-TEST-");
+
       return {
         id: lic.id,
         key_mask: lic.key_mask,
-        plan: lic.plan,
+        plan: isLicTest ? "TEST" : lic.plan,
         status: effectiveStatus,
         max_devices: lic.max_devices || 1,
         expires_at: lic.expires_at,
@@ -440,7 +446,7 @@ Deno.serve(async (req: Request) => {
         customer_email: lic.customer_email || null,
         customer_whatsapp: lic.customer_whatsapp || null,
         has_stored_key: !!(lic.encrypted_key && lic.encrypted_key.length > 0),
-        license_type: lic.license_type || "NORMAL",
+        license_type: isLicTest ? "TEST" : (lic.license_type || "NORMAL"),
         reseller_id: lic.reseller_id || null,
         reseller_name: resellerInfo?.name || null,
         reseller_email: resellerInfo?.email || null,
@@ -495,9 +501,31 @@ Deno.serve(async (req: Request) => {
       const isTestKey = /^NEKO-TEST-\*{4}-\*{4}-\*{4}$/.test(key_mask);
       const isLegacyTestKey = /^NEKO-TEST-\*{3}-\*{3}-\*{3}$/.test(key_mask);
       if (!isTestKey && !isLegacyTestKey && !/^NEKO-\*{4}-\*{4}-\*{4}-[A-Z0-9]{4}$/.test(key_mask)) return json({ ok: false, message: "Máscara de chave inválida." }, 400);
-      if (!["MONTHLY", "QUARTERLY", "ANNUAL"].includes(plan)) return json({ ok: false, message: "Plano inválido." }, 400);
+      const allowedPlans = ["MONTHLY", "QUARTERLY", "ANNUAL", "TEST", "TESTE"];
+      if (!plan || !allowedPlans.includes(String(plan).toUpperCase())) return json({ ok: false, message: "Plano inválido." }, 400);
 
-      const licenseType: "NORMAL" | "TEST" = body.license_type === "TEST" ? "TEST" : "NORMAL";
+      const isShortDuration = Boolean(
+        expires_at && 
+        !Number.isNaN(new Date(expires_at).getTime()) && 
+        (new Date(expires_at).getTime() - Date.now()) <= (7 * 24 * 60 * 60 * 1000 + 3600000) &&
+        !["QUARTERLY", "ANNUAL"].includes(String(plan || "").toUpperCase())
+      );
+
+      const isTest = 
+        String(body.license_type || "").toUpperCase() === "TEST" ||
+        String(body.type || "").toUpperCase() === "TEST" ||
+        String(plan || "").toUpperCase() === "TEST" ||
+        String(plan || "").toUpperCase() === "TESTE" ||
+        Boolean(body.is_test) ||
+        Boolean(body.test_duration_label) ||
+        isShortDuration ||
+        isTestKey ||
+        isLegacyTestKey;
+
+      const licenseType: "NORMAL" | "TEST" = isTest ? "TEST" : "NORMAL";
+      // A tabela licenses possui a constraint chk_licenses_plan_enum ('MONTHLY', 'QUARTERLY', 'ANNUAL').
+      // Para licenças de teste, gravamos license_type = 'TEST' e plan = 'MONTHLY'.
+      const dbPlan = licenseType === "TEST" ? "MONTHLY" : String(plan).toUpperCase();
 
       const targetMaxDevices = Number.isInteger(max_devices) && max_devices >= 1 ? max_devices : 1;
       const defaultEntitlements = ["agent_execution", "preview_server", "file_manipulation", "cloud_supabase", "cloud_github", "cloud_vercel"];
@@ -517,7 +545,7 @@ Deno.serve(async (req: Request) => {
           user_id: null,
           key_hash,
           key_mask,
-          plan,
+          plan: dbPlan,
           license_type: licenseType,
           status: "active",
           max_devices: targetMaxDevices,
@@ -582,7 +610,13 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      return json({ ok: true, license: newLic, email_delivery: emailResult });
+      const returnedLic = {
+        ...newLic,
+        plan: licenseType === "TEST" ? "TEST" : newLic.plan,
+        license_type: licenseType,
+      };
+
+      return json({ ok: true, license: returnedLic, email_delivery: emailResult });
     }
 
     // Ação: Enviar / Reenviar E-mail de Licença com Chave Completa (Sem Máscara)
@@ -752,7 +786,16 @@ Deno.serve(async (req: Request) => {
       if (typeof customer_name !== "undefined") updatePayload.customer_name = customer_name ? String(customer_name).trim().slice(0, 128) : null;
       if (typeof customer_email !== "undefined") updatePayload.customer_email = customer_email ? String(customer_email).trim().slice(0, 255) : null;
       if (typeof customer_whatsapp !== "undefined") updatePayload.customer_whatsapp = customer_whatsapp ? String(customer_whatsapp).trim().slice(0, 32) : null;
-      if (plan && ["MONTHLY", "QUARTERLY", "ANNUAL"].includes(plan)) updatePayload.plan = plan;
+      if (plan && ["MONTHLY", "QUARTERLY", "ANNUAL", "TEST", "TESTE"].includes(String(plan).toUpperCase())) {
+        const normPlan = ["TEST", "TESTE"].includes(String(plan).toUpperCase()) ? "TEST" : String(plan).toUpperCase();
+        if (normPlan === "TEST") {
+          updatePayload.license_type = "TEST";
+          updatePayload.plan = "MONTHLY";
+        } else {
+          updatePayload.plan = normPlan;
+          updatePayload.license_type = "NORMAL";
+        }
+      }
       if (expires_at) {
         updatePayload.expires_at = expires_at;
         // Sincronizar status persistido com a nova data de expiração.
