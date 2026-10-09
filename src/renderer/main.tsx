@@ -20,6 +20,7 @@ import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import { ReleaseNotesRenderer } from "./components/ReleaseNotesRenderer";
 import { TimelineView, type TaskTimeline, type TimelineItem, type TimelineItemType } from "./components/TimelineView";
 import { GlobalNotificationToast } from "./components/GlobalNotificationToast";
+import { VoiceWaveformVisualizer } from "./components/VoiceWaveformVisualizer";
 import {
   notificationManager,
   type NotificationType,
@@ -1414,11 +1415,21 @@ function App() {
     }
   };
 
+  const sendRef = React.useRef<(overrideText?: string) => Promise<void>>(() => Promise.resolve());
   const [isRecordingAudio, setIsRecordingAudio] = React.useState(false);
   const [isTranscribingAudio, setIsTranscribingAudio] = React.useState(false);
+  const [recordingDuration, setRecordingDuration] = React.useState(0);
+  const formatRecordingTime = React.useCallback((secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  }, []);
+  const recordingTimerIntervalRef = React.useRef<any>(null);
   const mediaRecorderRef = React.useRef<MediaRecorder | null>(null);
   const audioChunksRef = React.useRef<Blob[]>([]);
   const audioStreamRef = React.useRef<MediaStream | null>(null);
+  const targetActionRef = React.useRef<"stop" | "send">("stop");
+  const isCancelledRef = React.useRef(false);
 
   const cleanupAudioStream = React.useCallback(() => {
     if (audioStreamRef.current) {
@@ -1434,23 +1445,65 @@ function App() {
   React.useEffect(() => {
     return () => {
       cleanupAudioStream();
+      if (recordingTimerIntervalRef.current) {
+        clearInterval(recordingTimerIntervalRef.current);
+        recordingTimerIntervalRef.current = null;
+      }
     };
   }, [cleanupAudioStream]);
 
-  const handleStopAndTranscribe = async () => {
+  const handleCancelRecording = React.useCallback(() => {
+    isCancelledRef.current = true;
+    if (recordingTimerIntervalRef.current) {
+      clearInterval(recordingTimerIntervalRef.current);
+      recordingTimerIntervalRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      try { recorder.stop(); } catch {}
+    }
+    cleanupAudioStream();
+    setIsRecordingAudio(false);
+    setIsTranscribingAudio(false);
+    setRecordingDuration(0);
+    setTimeout(() => composerRef.current?.focus(), 50);
+  }, [cleanupAudioStream]);
+
+  const handleFinishRecording = React.useCallback(async (targetAction: "stop" | "send") => {
+    if (isTranscribingAudio) return;
+    targetActionRef.current = targetAction;
+    isCancelledRef.current = false;
+
+    if (recordingTimerIntervalRef.current) {
+      clearInterval(recordingTimerIntervalRef.current);
+      recordingTimerIntervalRef.current = null;
+    }
+
     const recorder = mediaRecorderRef.current;
     if (!recorder || recorder.state === "inactive") {
       cleanupAudioStream();
       setIsRecordingAudio(false);
+      setIsTranscribingAudio(false);
+      setRecordingDuration(0);
       return;
     }
 
     return new Promise<void>((resolve) => {
       recorder.onstop = async () => {
+        if (isCancelledRef.current) {
+          cleanupAudioStream();
+          setIsRecordingAudio(false);
+          setIsTranscribingAudio(false);
+          setRecordingDuration(0);
+          resolve();
+          return;
+        }
+
         const chunks = [...audioChunksRef.current];
         const mimeType = recorder.mimeType || "audio/webm";
         cleanupAudioStream();
         setIsRecordingAudio(false);
+        setRecordingDuration(0);
 
         if (!chunks || chunks.length === 0) {
           notificationManager.showGlobalNotification({
@@ -1477,6 +1530,11 @@ function App() {
           reader.readAsDataURL(audioBlob);
           reader.onloadend = async () => {
             try {
+              if (isCancelledRef.current) {
+                resolve();
+                return;
+              }
+
               const base64Data = (reader.result as string)?.split(",")?.[1] || "";
               if (!base64Data) {
                 throw new Error("Falha ao codificar o áudio capturado.");
@@ -1502,19 +1560,36 @@ function App() {
 
               const transcribedText = (res.text || "").trim();
               if (!transcribedText) {
-                notificationManager.showGlobalNotification({
-                  message: "Nenhuma fala foi detectada no áudio gravado.",
-                  type: "info"
-                });
+                if (targetActionRef.current === "send") {
+                  notificationManager.showGlobalNotification({
+                    message: "Nenhuma fala detectada. A mensagem não foi enviada.",
+                    type: "info"
+                  });
+                } else {
+                  notificationManager.showGlobalNotification({
+                    message: "Nenhuma fala foi detectada no áudio gravado.",
+                    type: "info"
+                  });
+                }
               } else {
-                setInput(prev => {
-                  const trimmed = prev.trim();
-                  return trimmed ? `${trimmed} ${transcribedText}` : transcribedText;
-                });
-                notificationManager.showGlobalNotification({
-                  message: "Voz transcrita com sucesso!",
-                  type: "success"
-                });
+                if (targetActionRef.current === "send") {
+                  const finalText = input.trim() ? `${input.trim()} ${transcribedText}` : transcribedText;
+                  setInput("");
+                  setIsTranscribingAudio(false);
+                  void sendRef.current(finalText);
+                  resolve();
+                  return;
+                } else {
+                  setInput(prev => {
+                    const trimmed = prev.trim();
+                    return trimmed ? `${trimmed} ${transcribedText}` : transcribedText;
+                  });
+                  notificationManager.showGlobalNotification({
+                    message: "Voz transcrita com sucesso!",
+                    type: "success"
+                  });
+                  setTimeout(() => composerRef.current?.focus(), 50);
+                }
               }
             } catch (err: any) {
               console.error("[Composer/Voice] Erro ao transcrever:", err);
@@ -1550,16 +1625,18 @@ function App() {
       } catch (err) {
         cleanupAudioStream();
         setIsRecordingAudio(false);
+        setIsTranscribingAudio(false);
+        setRecordingDuration(0);
         resolve();
       }
     });
-  };
+  }, [cleanupAudioStream, input, isTranscribingAudio]);
 
   const handleToggleVoiceRecording = async () => {
     if (busy || isTranscribingAudio) return;
 
     if (isRecordingAudio) {
-      await handleStopAndTranscribe();
+      await handleFinishRecording("stop");
       return;
     }
 
@@ -1568,6 +1645,7 @@ function App() {
         throw new Error("Seu ambiente não suporta captura de microfone.");
       }
 
+      isCancelledRef.current = false;
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioStreamRef.current = stream;
       audioChunksRef.current = [];
@@ -1592,6 +1670,8 @@ function App() {
         console.error("[Composer/Voice] Erro no gravador de áudio:", e);
         cleanupAudioStream();
         setIsRecordingAudio(false);
+        if (recordingTimerIntervalRef.current) clearInterval(recordingTimerIntervalRef.current);
+        setRecordingDuration(0);
         notificationManager.showGlobalNotification({
           message: "Falha na gravação de áudio.",
           type: "warning"
@@ -1600,10 +1680,17 @@ function App() {
 
       mediaRecorderRef.current = recorder;
       recorder.start(250);
+      setRecordingDuration(0);
+      if (recordingTimerIntervalRef.current) clearInterval(recordingTimerIntervalRef.current);
+      recordingTimerIntervalRef.current = setInterval(() => {
+        setRecordingDuration(d => d + 1);
+      }, 1000);
       setIsRecordingAudio(true);
     } catch (err: any) {
       cleanupAudioStream();
       setIsRecordingAudio(false);
+      if (recordingTimerIntervalRef.current) clearInterval(recordingTimerIntervalRef.current);
+      setRecordingDuration(0);
       console.error("[Composer/Voice] Erro ao acessar microfone:", err);
       let msg = "Não foi possível acessar o microfone.";
       if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
@@ -1617,6 +1704,22 @@ function App() {
       });
     }
   };
+
+  // Atalhos de teclado durante gravação de voz (Escape para cancelar, Enter para enviar)
+  React.useEffect(() => {
+    if (!isRecordingAudio && !isTranscribingAudio) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        handleCancelRecording();
+      } else if (e.key === "Enter" && !e.shiftKey && isRecordingAudio && !isTranscribingAudio) {
+        e.preventDefault();
+        void handleFinishRecording("send");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isRecordingAudio, isTranscribingAudio, handleCancelRecording, handleFinishRecording]);
   const [busy, setBusy] = React.useState(false);
   const [activity, setActivity] = React.useState<Activity[]>([]);
   const [workingStatus, setWorkingStatus] = React.useState<string>("");
@@ -5942,9 +6045,9 @@ function App() {
     setModal("newProject");
   }
 
-  const send = React.useCallback(async () => {
+  const send = React.useCallback(async (overrideText?: string) => {
     if (!sessionId || requestInFlightRef.current) return;
-    const text = input.trim();
+    const text = (typeof overrideText === "string" ? overrideText : input).trim();
     const hasAttachments = attachments.length > 0;
     if (!text && !hasAttachments) return;
 
@@ -6144,6 +6247,7 @@ function App() {
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
     }
   }, [sessionId, input, attachments, selectedModel, planMode, effort, messages.length, getEffectiveModel, sanitizeUserFacingText, upsertActivity, project, previewUrl, previewStatus, previewFramework, previewMessage, tree, githubLinkStatus, terminalLines, consoleEntries]);
+  sendRef.current = send;
 
   const stopDevelopment = React.useCallback(async () => {
     if (!sessionId) return;
@@ -8873,7 +8977,85 @@ function App() {
             </div>
 
           <div className="composer-wrap">
-              <div className="composer">
+              <div className={`composer ${isRecordingAudio || isTranscribingAudio ? "voice-recording-mode" : ""}`}>
+                {isRecordingAudio || isTranscribingAudio ? (
+                  <div className="composer-voice-recording-view">
+                    <div className="voice-recording-top">
+                      <div className="voice-recording-indicator">
+                        <span className={`voice-pulse-dot ${isTranscribingAudio ? "transcribing" : "recording"}`} />
+                        <span className="voice-recording-label">
+                          {isTranscribingAudio ? "Transcrevendo voz com IA..." : "Gravando áudio..."}
+                        </span>
+                        {isRecordingAudio && (
+                          <span className="voice-recording-timer">
+                            {formatRecordingTime(recordingDuration)}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        className="voice-cancel-btn"
+                        onClick={handleCancelRecording}
+                        disabled={isTranscribingAudio}
+                        title="Cancelar gravação (Esc)"
+                        aria-label="Cancelar gravação"
+                      >
+                        <X size={13} />
+                        <span>Cancelar</span>
+                      </button>
+                    </div>
+
+                    <div className="voice-waveform-area">
+                      <VoiceWaveformVisualizer
+                        stream={audioStreamRef.current}
+                        isRecording={isRecordingAudio}
+                        isTranscribing={isTranscribingAudio}
+                      />
+                    </div>
+
+                    <div className="voice-recording-bottom">
+                      <div className="voice-recording-hint">
+                        {isTranscribingAudio ? (
+                          <span className="voice-transcribing-hint">
+                            <Loader2 size={13} className="spin" />
+                            Processando reconhecimento de fala...
+                          </span>
+                        ) : (
+                          <span>Fale no microfone • Esc para cancelar • Enter para enviar</span>
+                        )}
+                      </div>
+                      <div className="voice-recording-actions">
+                        <button
+                          type="button"
+                          className="voice-action-btn stop-btn"
+                          onClick={() => void handleFinishRecording("stop")}
+                          disabled={isTranscribingAudio}
+                          title="Parar e inserir texto no campo de prompt"
+                          aria-label="Parar gravação"
+                        >
+                          <Square size={12} fill="currentColor" />
+                          <span>Parar</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="voice-action-btn send-btn"
+                          onClick={() => void handleFinishRecording("send")}
+                          disabled={isTranscribingAudio}
+                          title="Enviar transcrição diretamente ao chat (Enter)"
+                          aria-label="Enviar transcrição"
+                        >
+                          {isTranscribingAudio ? (
+                            <Loader2 size={13} className="spin" />
+                          ) : (
+                            <Send size={13} />
+                          )}
+                          <span>Enviar</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <>
                 <textarea
                   ref={composerRef}
                   value={input}
@@ -9189,6 +9371,8 @@ function App() {
                     </button>
                   </div>
                 </div>
+                  </>
+                )}
               </div>
             </div>
           </section>

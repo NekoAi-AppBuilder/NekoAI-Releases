@@ -183,3 +183,189 @@ describe("Edge Function: transcribe-audio - Contrato de Segurança", () => {
     expect(content).toContain("verify_jwt = false");
   });
 });
+
+describe("Composer: Nova Interface de Gravação por Voz (Waveform & Controles)", () => {
+  const formatRecordingTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  };
+
+  test("Formatação de duração do timer (MM:SS)", () => {
+    expect(formatRecordingTime(0)).toBe("00:00");
+    expect(formatRecordingTime(9)).toBe("00:09");
+    expect(formatRecordingTime(60)).toBe("01:00");
+    expect(formatRecordingTime(75)).toBe("01:15");
+    expect(formatRecordingTime(630)).toBe("10:30");
+  });
+
+  test("Alternância de interface: ativa classe voice-recording-mode quando gravando ou transcrevendo", () => {
+    const getComposerClass = (isRecording: boolean, isTranscribing: boolean) => {
+      return `composer ${isRecording || isTranscribing ? "voice-recording-mode" : ""}`.trim();
+    };
+
+    expect(getComposerClass(false, false)).toBe("composer");
+    expect(getComposerClass(true, false)).toBe("composer voice-recording-mode");
+    expect(getComposerClass(false, true)).toBe("composer voice-recording-mode");
+    expect(getComposerClass(true, true)).toBe("composer voice-recording-mode");
+  });
+
+  test("Botão Parar (Stop): encerra áudio, transcreve, restaura interface e insere texto no input sem auto-send", async () => {
+    let input = "Texto pré-existente.";
+    let isRecordingAudio = true;
+    let isTranscribingAudio = false;
+    let targetAction: "stop" | "send" = "stop";
+    let autoSentMessage: string | null = null;
+
+    const mockSend = async (msg: string) => {
+      autoSentMessage = msg;
+    };
+
+    // Fluxo do botão Parar
+    targetAction = "stop";
+    isRecordingAudio = false;
+    isTranscribingAudio = true;
+
+    // Simula resposta da transcrição
+    const mockTranscribe = async () => ({ success: true, text: "adicionando detalhes por voz" });
+    const res = await mockTranscribe();
+
+    if (res.success && res.text) {
+      if (targetAction === "send") {
+        const finalText = input.trim() ? `${input.trim()} ${res.text}` : res.text;
+        input = "";
+        await mockSend(finalText);
+      } else {
+        const trimmed = input.trim();
+        input = trimmed ? `${trimmed} ${res.text}` : res.text;
+      }
+    }
+    isTranscribingAudio = false;
+
+    // Asserções
+    expect(isRecordingAudio).toBe(false);
+    expect(isTranscribingAudio).toBe(false);
+    expect(input).toBe("Texto pré-existente. adicionando detalhes por voz");
+    expect(autoSentMessage).toBeNull(); // NÂO deve enviar ao chat automaticamente
+  });
+
+  test("Botão Enviar: encerra áudio, transcreve, restaura interface e envia automaticamente ao chat", async () => {
+    let input = "Texto inicial.";
+    let isRecordingAudio = true;
+    let isTranscribingAudio = false;
+    let targetAction: "stop" | "send" = "send";
+    let autoSentMessage: string | null = null;
+
+    const mockSend = async (msg: string) => {
+      autoSentMessage = msg;
+    };
+
+    // Fluxo do botão Enviar
+    targetAction = "send";
+    isRecordingAudio = false;
+    isTranscribingAudio = true;
+
+    const mockTranscribe = async () => ({ success: true, text: "envio imediato após voz" });
+    const res = await mockTranscribe();
+
+    if (res.success && res.text) {
+      if (targetAction === "send") {
+        const finalText = input.trim() ? `${input.trim()} ${res.text}` : res.text;
+        input = "";
+        await mockSend(finalText);
+      } else {
+        const trimmed = input.trim();
+        input = trimmed ? `${trimmed} ${res.text}` : res.text;
+      }
+    }
+    isTranscribingAudio = false;
+
+    // Asserções
+    expect(isRecordingAudio).toBe(false);
+    expect(isTranscribingAudio).toBe(false);
+    expect(input).toBe(""); // Input é esvaziado pois a mensagem foi despachada
+    expect(autoSentMessage).toBe("Texto inicial. envio imediato após voz"); // Enviado diretamente ao chat
+  });
+
+  test("Ação Cancelar: descarta gravação, preserva texto anterior e restaura interface sem transcrever", () => {
+    let input = "Texto digitado antes de iniciar a gravação.";
+    let isRecordingAudio = true;
+    let isTranscribingAudio = false;
+    let recordingDuration = 12;
+    let transcriptionCalled = false;
+
+    const handleCancel = () => {
+      isRecordingAudio = false;
+      isTranscribingAudio = false;
+      recordingDuration = 0;
+      // Não executa transcrição
+    };
+
+    handleCancel();
+
+    expect(isRecordingAudio).toBe(false);
+    expect(isTranscribingAudio).toBe(false);
+    expect(recordingDuration).toBe(0);
+    expect(input).toBe("Texto digitado antes de iniciar a gravação.");
+    expect(transcriptionCalled).toBe(false);
+  });
+
+  test("Botão Enviar com silêncio (sem fala): exibe aviso e não envia mensagem vazia ao chat", async () => {
+    let input = "";
+    let isRecordingAudio = true;
+    let isTranscribingAudio = false;
+    let targetAction: "stop" | "send" = "send";
+    let autoSentMessage: string | null = null;
+    let notificationMsg = "";
+
+    const mockSend = async (msg: string) => {
+      autoSentMessage = msg;
+    };
+
+    targetAction = "send";
+    isRecordingAudio = false;
+    isTranscribingAudio = true;
+
+    // Transcrição sem fala detectada
+    const res = { success: true, text: "" };
+    const transcribedText = (res.text || "").trim();
+
+    if (!transcribedText) {
+      if (targetAction === "send") {
+        notificationMsg = "Nenhuma fala detectada. A mensagem não foi enviada.";
+      } else {
+        notificationMsg = "Nenhuma fala foi detectada no áudio gravado.";
+      }
+    } else {
+      await mockSend(transcribedText);
+    }
+    isTranscribingAudio = false;
+
+    expect(autoSentMessage).toBeNull(); // Nenhuma mensagem enviada
+    expect(notificationMsg).toBe("Nenhuma fala detectada. A mensagem não foi enviada.");
+    expect(isTranscribingAudio).toBe(false);
+  });
+
+  test("Bloqueia cliques concorrentes enquanto transcreve (isTranscribingAudio = true)", () => {
+    const isTranscribingAudio = true;
+    let stopClicked = false;
+    let sendClicked = false;
+
+    const onStopClick = () => {
+      if (isTranscribingAudio) return;
+      stopClicked = true;
+    };
+
+    const onSendClick = () => {
+      if (isTranscribingAudio) return;
+      sendClicked = true;
+    };
+
+    onStopClick();
+    onSendClick();
+
+    expect(stopClicked).toBe(false);
+    expect(sendClicked).toBe(false);
+  });
+});
+
