@@ -1487,8 +1487,17 @@ function App() {
                 mimeType
               });
 
-              if (!res.success) {
-                throw new Error(res.message || res.error || "Falha na transcrição de voz.");
+              if (!res || !res.success) {
+                const rawError = res?.message || res?.error || "Falha na transcrição de voz.";
+                let friendlyMsg = rawError;
+                if (/Missing authorization header|UNAUTHORIZED_NO_AUTH_HEADER|unauthorized/i.test(rawError)) {
+                  friendlyMsg = "Licença não autorizada ou expirada para transcrição por voz.";
+                } else if (/rate limit|muitas tentativas/i.test(rawError)) {
+                  friendlyMsg = "Muitas tentativas em pouco tempo. Aguarde um instante e tente novamente.";
+                } else if (/503|PROVIDER_BUSY|temporariamente instável/i.test(rawError)) {
+                  friendlyMsg = "Serviço de voz temporariamente ocupado. Tente novamente em instantes.";
+                }
+                throw new Error(friendlyMsg);
               }
 
               const transcribedText = (res.text || "").trim();

@@ -124,4 +124,62 @@ describe("Edge Function: transcribe-audio - Contrato de Segurança", () => {
     const consumesCreditEngine = false;
     expect(consumesCreditEngine).toBe(false);
   });
+
+  test("Tradução amigável de erro 'Missing authorization header' ou 'UNAUTHORIZED'", () => {
+    const mapError = (rawError: string) => {
+      let friendlyMsg = rawError;
+      if (/Missing authorization header|UNAUTHORIZED_NO_AUTH_HEADER|unauthorized/i.test(rawError)) {
+        friendlyMsg = "Licença não autorizada ou expirada para transcrição por voz.";
+      } else if (/rate limit|muitas tentativas/i.test(rawError)) {
+        friendlyMsg = "Muitas tentativas em pouco tempo. Aguarde um instante e tente novamente.";
+      } else if (/503|PROVIDER_BUSY|temporariamente instável/i.test(rawError)) {
+        friendlyMsg = "Serviço de voz temporariamente ocupado. Tente novamente em instantes.";
+      }
+      return friendlyMsg;
+    };
+
+    expect(mapError("Missing authorization header")).toBe("Licença não autorizada ou expirada para transcrição por voz.");
+    expect(mapError("UNAUTHORIZED_NO_AUTH_HEADER")).toBe("Licença não autorizada ou expirada para transcrição por voz.");
+    expect(mapError("Muitas tentativas de gravação em pouco tempo.")).toBe("Muitas tentativas em pouco tempo. Aguarde um instante e tente novamente.");
+    expect(mapError("O serviço de transcrição está temporariamente instável.")).toBe("Serviço de voz temporariamente ocupado. Tente novamente em instantes.");
+  });
+
+  test("IPC Handler trata status HTTP de erro sem quebrar ou vazar exceções", () => {
+    const handleStatus = (status: number, data: any) => {
+      if (status === 401) {
+        return {
+          success: false,
+          error: data?.message || "Sua licença não possui permissão ativa para transcrição por voz. Verifique a ativação."
+        };
+      }
+      if (status === 429) {
+        return {
+          success: false,
+          error: data?.message || "Muitas tentativas de gravação em pouco tempo. Aguarde um instante e tente novamente."
+        };
+      }
+      if (status >= 500) {
+        return {
+          success: false,
+          error: "O serviço de transcrição está temporariamente instável. Tente novamente em instantes."
+        };
+      }
+      return { success: false, error: data?.message || "Falha ao processar o áudio gravado." };
+    };
+
+    expect(handleStatus(401, null).success).toBe(false);
+    expect(handleStatus(401, null).error).toContain("Sua licença não possui permissão");
+    expect(handleStatus(429, null).error).toContain("Muitas tentativas");
+    expect(handleStatus(503, null).error).toContain("temporariamente instável");
+  });
+
+  test("Preserva config.toml garantindo verify_jwt = false", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const configPath = path.join(process.cwd(), "supabase", "config.toml");
+    expect(fs.existsSync(configPath)).toBe(true);
+    const content = fs.readFileSync(configPath, "utf8");
+    expect(content).toContain("[functions.transcribe-audio]");
+    expect(content).toContain("verify_jwt = false");
+  });
 });

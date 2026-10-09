@@ -1,0 +1,56 @@
+# Supabase CLI configuration
+project_id = "igadprvhgmfnyvyqavhy"
+
+[functions.transcribe-audio]
+verify_jwt = false
+
+[functions.enhance-prompt]
+verify_jwt = false
+
+[functions.license-activate]
+verify_jwt = false
+
+[functions.license-validate]
+verify_jwt = false
+
+[functions.license-deactivate-device]
+verify_jwt = false
+
+[functions.license-reset-device]
+verify_jwt = false
+
+[functions.public-test-license]
+verify_jwt = false
+
+[functions.reseller-api]
+verify_jwt = false
+
+[functions.reseller-customers]
+verify_jwt = false
+
+[functions.admin-auth]
+verify_jwt = false
+
+[functions.admin-licenses]
+verify_jwt = false
+
+[functions.admin-sales]
+verify_jwt = false
+
+[functions.admin-customers]
+verify_jwt = false
+
+[functions.admin-resellers]
+verify_jwt = false
+
+[functions.admin-payments]
+verify_jwt = false
+
+[functions.admin-settings]
+verify_jwt = false
+
+[functions.billing-webhook]
+verify_jwt = false
+
+[functions.mercadopago-webhook]
+verify_jwt = false

@@ -10456,8 +10456,40 @@ app.whenReady().then(() => {
           mimeType: payload?.mimeType || "audio/webm"
         })
       });
-      const data = await res.json();
-      return data;
+
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+
+      if (!res.ok) {
+        if (res.status === 401) {
+          return {
+            success: false,
+            error: data?.message || "Sua licença não possui permissão ativa para transcrição por voz. Verifique a ativação."
+          };
+        }
+        if (res.status === 429) {
+          return {
+            success: false,
+            error: data?.message || "Muitas tentativas de gravação em pouco tempo. Aguarde um instante e tente novamente."
+          };
+        }
+        if (res.status >= 500) {
+          return {
+            success: false,
+            error: "O serviço de transcrição está temporariamente instável. Tente novamente em instantes."
+          };
+        }
+        return {
+          success: false,
+          error: data?.message || "Falha ao processar o áudio gravado."
+        };
+      }
+
+      return data || { success: false, error: "Resposta vazia do servidor." };
     } catch (err: any) {
       console.error("[Neko/Voice] Falha ao transcrever áudio via IPC:", err);
       return { success: false, error: err?.message || String(err) };
