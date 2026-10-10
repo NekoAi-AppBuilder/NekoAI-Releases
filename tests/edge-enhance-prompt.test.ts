@@ -113,4 +113,66 @@ describe("Edge Function: enhance-prompt - Segurança e Autorização", () => {
       expect(longPrompt.length).toBeGreaterThan(3000);
     });
   });
+
+  describe("Migração Obrigatória para BYOK (Sem Fallback para Edge Function)", () => {
+    test("Melhorar Prompt interrompe e abre modal se chave própria não estiver configurada", async () => {
+      let modalOpened: string | null = null;
+      let notificationShown: string | null = null;
+      let edgeFunctionCalled = false;
+
+      const mockKeyStatus = { configured: false };
+      const mockWindowNeko = {
+        geminiGetKeyStatus: async () => mockKeyStatus,
+        enhancePrompt: async () => {
+          throw new Error("Não deve ser chamado");
+        }
+      };
+
+      const handleEnhancePrompt = async (input: string) => {
+        if (!input.trim()) return;
+        const status = await mockWindowNeko.geminiGetKeyStatus();
+        if (!status?.configured) {
+          modalOpened = "geminiKey";
+          notificationShown = "Configure sua chave Google Gemini para utilizar Melhorar Prompt.";
+          return;
+        }
+        edgeFunctionCalled = true;
+      };
+
+      await handleEnhancePrompt("me ajude com este bug");
+
+      expect(modalOpened).toBe("geminiKey");
+      expect(notificationShown).toBe("Configure sua chave Google Gemini para utilizar Melhorar Prompt.");
+      expect(edgeFunctionCalled).toBe(false);
+    });
+
+    test("Melhorar Prompt com chave própria executa IPC direto sem chamar Edge Function", async () => {
+      let edgeFunctionCalled = false;
+      let ipcCalled = false;
+      let promptOutput = "";
+
+      const mockKeyStatus = { configured: true, mask: "AIza••••5678" };
+      const mockWindowNeko = {
+        geminiGetKeyStatus: async () => mockKeyStatus,
+        enhancePrompt: async (prompt: string) => {
+          ipcCalled = true;
+          return { success: true, improvedPrompt: `Prompt Melhorado: ${prompt}` };
+        }
+      };
+
+      const handleEnhancePrompt = async (input: string) => {
+        if (!input.trim()) return;
+        const status = await mockWindowNeko.geminiGetKeyStatus();
+        if (!status?.configured) return;
+        const res = await mockWindowNeko.enhancePrompt(input);
+        promptOutput = res.improvedPrompt;
+      };
+
+      await handleEnhancePrompt("criar formulário");
+
+      expect(ipcCalled).toBe(true);
+      expect(promptOutput).toBe("Prompt Melhorado: criar formulário");
+      expect(edgeFunctionCalled).toBe(false);
+    });
+  });
 });

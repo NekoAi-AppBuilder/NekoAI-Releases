@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   ArrowLeft, ArrowRight, ArrowUp, Check, ChevronDown, ChevronUp, ChevronRight, CircleAlert, AlertCircle, Terminal, Code2, Download,
-  ExternalLink, Eye, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
+  ExternalLink, Eye, EyeOff, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
   Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitCommit, GitPullRequest, GitMerge, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
   Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info, Mic, MicOff, BarChart2, MicAudioLines
@@ -884,7 +884,7 @@ type GitStatus = {
   summary?: GitStatusSummary;
 };
 
-type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "githubMergeConfirm" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | "gitSync" | "gitCenter" | null;
+type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "githubMergeConfirm" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | "gitSync" | "gitCenter" | "geminiKey" | null;
 
 // Compara caminhos de projeto ignorando separador final (mesma identidade real).
 function pathNormalizedEqual(a: string, b: string): boolean {
@@ -1372,39 +1372,100 @@ function App() {
   const [isEnhancingPrompt, setIsEnhancingPrompt] = React.useState(false);
   const [previousPromptForUndo, setPreviousPromptForUndo] = React.useState<string | null>(null);
 
+  const currentEnhanceOpIdRef = React.useRef<string | null>(null);
+
+  const handleCancelEnhance = React.useCallback(async () => {
+    const activeOpId = currentEnhanceOpIdRef.current;
+    currentEnhanceOpIdRef.current = null;
+    setIsEnhancingPrompt(false);
+    if (activeOpId) {
+      try {
+        await window.neko.cancelEnhancePrompt?.(activeOpId);
+      } catch (err) {
+        console.warn("[Composer] Erro ao propagar cancelamento de melhoria:", err);
+      }
+    }
+    setTimeout(() => composerRef.current?.focus(), 50);
+  }, []);
+
   const handleEnhancePrompt = async () => {
     if (!input.trim() || isEnhancingPrompt) return;
+
+    // Verificação obrigatória da chave própria do Google Gemini
+    if (geminiKeyStatus && !geminiKeyStatus.configured) {
+      setModal("geminiKey");
+      notificationManager.showGlobalNotification({
+        message: "Configure sua chave Google Gemini para utilizar Melhorar Prompt.",
+        type: "warning",
+      });
+      return;
+    }
+
+    const opId = `enhance-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    currentEnhanceOpIdRef.current = opId;
     setPreviousPromptForUndo(null);
     setIsEnhancingPrompt(true);
+
+    // Se o status ainda não estiver carregado no state, faz validação via IPC
+    if (!geminiKeyStatus) {
+      try {
+        const status = await window.neko.geminiGetKeyStatus?.();
+        if (!status?.configured) {
+          setIsEnhancingPrompt(false);
+          setModal("geminiKey");
+          notificationManager.showGlobalNotification({
+            message: "Configure sua chave Google Gemini para utilizar Melhorar Prompt.",
+            type: "warning",
+          });
+          return;
+        }
+      } catch {
+        setIsEnhancingPrompt(false);
+        setModal("geminiKey");
+        return;
+      }
+    }
+
     try {
-      const grant = licenseState.grant || (await window.neko.licenseGetGrant?.()) || "";
-      if (!grant) {
-        throw new Error("Credencial de licenciamento ativa não encontrada. Verifique se a sua licença está ativada.");
+      const res = await window.neko.enhancePrompt(input, opId);
+
+      // Se a operação foi cancelada ou outra operação iniciou, descarta resposta tardia
+      if (currentEnhanceOpIdRef.current !== opId) {
+        return;
       }
-      const url = "https://igadprvhgmfnyvyqavhy.supabase.co/functions/v1/enhance-prompt";
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-neko-license-grant": grant,
-        },
-        body: JSON.stringify({ prompt: input }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) {
-        throw new Error(data.message || "Falha ao melhorar prompt.");
+
+      if (res?.cancelled) {
+        return;
       }
+
+      if (!res || !res.success) {
+        if (/configure sua chave/i.test(res?.error || "")) {
+          setModal("geminiKey");
+        }
+        throw new Error(res?.error || "Falha ao melhorar prompt com o Google Gemini.");
+      }
+
       setPreviousPromptForUndo(input);
-      setInput(data.improvedPrompt);
+      setInput(res.improvedPrompt || input);
+      setTimeout(() => composerRef.current?.focus(), 50);
     } catch (err: any) {
+      // Se a operação foi cancelada intencionalmente, silencia erro
+      if (currentEnhanceOpIdRef.current !== opId) {
+        return;
+      }
+      if (err?.name === "AbortError" || /cancelad/i.test(err?.message || "")) {
+        return;
+      }
       console.error("[Composer] Erro ao melhorar prompt:", err);
-      // Notificação nativa elegante, não invasiva e sem bloquear a tela do usuário
       notificationManager.showGlobalNotification({
-        message: err.message || "O serviço auxiliar está temporariamente ocupado. Tente novamente mais tarde.",
+        message: err.message || "Não foi possível melhorar o prompt com o Google Gemini.",
         type: "warning",
       });
     } finally {
-      setIsEnhancingPrompt(false);
+      if (currentEnhanceOpIdRef.current === opId) {
+        currentEnhanceOpIdRef.current = null;
+        setIsEnhancingPrompt(false);
+      }
     }
   };
 
@@ -1547,15 +1608,10 @@ function App() {
 
               if (!res || !res.success) {
                 const rawError = res?.message || res?.error || "Falha na transcrição de voz.";
-                let friendlyMsg = rawError;
-                if (/Missing authorization header|UNAUTHORIZED_NO_AUTH_HEADER|unauthorized/i.test(rawError)) {
-                  friendlyMsg = "Licença não autorizada ou expirada para transcrição por voz.";
-                } else if (/rate limit|muitas tentativas/i.test(rawError)) {
-                  friendlyMsg = "Muitas tentativas em pouco tempo. Aguarde um instante e tente novamente.";
-                } else if (/503|PROVIDER_BUSY|temporariamente instável/i.test(rawError)) {
-                  friendlyMsg = "Serviço de voz temporariamente ocupado. Tente novamente em instantes.";
+                if (/configure sua chave/i.test(rawError) || /não foi aceita|permissão|inválida/i.test(rawError)) {
+                  setModal("geminiKey");
                 }
-                throw new Error(friendlyMsg);
+                throw new Error(rawError);
               }
 
               const transcribedText = (res.text || "").trim();
@@ -1637,6 +1693,22 @@ function App() {
 
     if (isRecordingAudio) {
       await handleFinishRecording("stop");
+      return;
+    }
+
+    // Verificação obrigatória da chave Google Gemini ANTES de inicializar o microfone ou MediaRecorder
+    try {
+      const status = await window.neko.geminiGetKeyStatus?.();
+      if (!status?.configured) {
+        setModal("geminiKey");
+        notificationManager.showGlobalNotification({
+          message: "Configure sua chave Google Gemini para utilizar a gravação por voz.",
+          type: "warning",
+        });
+        return;
+      }
+    } catch {
+      setModal("geminiKey");
       return;
     }
 
@@ -1797,6 +1869,115 @@ function App() {
   const [apiKey, setApiKey] = React.useState("");
   const [authBusy, setAuthBusy] = React.useState(false);
   const [authError, setAuthError] = React.useState("");
+
+  // Gemini BYOK (Bring Your Own Key) States & Handlers
+  const [geminiKeyInput, setGeminiKeyInput] = React.useState("");
+  const [showGeminiKey, setShowGeminiKey] = React.useState(false);
+  const [geminiKeyStatus, setGeminiKeyStatus] = React.useState<{ configured: boolean; mask?: string; updatedAt?: string } | null>(null);
+  const [geminiKeyTesting, setGeminiKeyTesting] = React.useState(false);
+  const [geminiKeySaving, setGeminiKeySaving] = React.useState(false);
+  const [geminiKeyDeleting, setGeminiKeyDeleting] = React.useState(false);
+  const [geminiKeyError, setGeminiKeyError] = React.useState<string | null>(null);
+  const [geminiKeySuccess, setGeminiKeySuccess] = React.useState<string | null>(null);
+
+  const refreshGeminiKeyStatus = React.useCallback(async () => {
+    try {
+      const status = await window.neko.geminiGetKeyStatus?.();
+      setGeminiKeyStatus(status || { configured: false });
+      return status;
+    } catch {
+      setGeminiKeyStatus({ configured: false });
+      return { configured: false };
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refreshGeminiKeyStatus();
+  }, [refreshGeminiKeyStatus]);
+
+  React.useEffect(() => {
+    if (modal === "geminiKey") {
+      setGeminiKeyError(null);
+      setGeminiKeySuccess(null);
+      setGeminiKeyInput("");
+      void refreshGeminiKeyStatus();
+    }
+  }, [modal, refreshGeminiKeyStatus]);
+
+  const handleTestGeminiKey = async () => {
+    if (geminiKeyTesting) return;
+    setGeminiKeyError(null);
+    setGeminiKeySuccess(null);
+    const keyToTest = geminiKeyInput.trim() || undefined;
+    if (!keyToTest && !geminiKeyStatus?.configured) {
+      setGeminiKeyError("Digite uma chave de API para testar.");
+      return;
+    }
+    setGeminiKeyTesting(true);
+    try {
+      const res = await window.neko.geminiTestKey(keyToTest);
+      if (res.success) {
+        setGeminiKeySuccess(res.message || "Chave validada com sucesso pelo Google Gemini!");
+      } else {
+        setGeminiKeyError(res.error || "A chave informada não pôde ser validada pelo Google.");
+      }
+    } catch (err: any) {
+      setGeminiKeyError(err?.message || "Não foi possível testar a chave. Verifique sua conexão.");
+    } finally {
+      setGeminiKeyTesting(false);
+    }
+  };
+
+  const handleSaveGeminiKey = async () => {
+    if (geminiKeySaving) return;
+    const trimmed = geminiKeyInput.trim();
+    if (!trimmed) {
+      setGeminiKeyError("Por favor, insira uma chave de API válida.");
+      return;
+    }
+    setGeminiKeyError(null);
+    setGeminiKeySuccess(null);
+    setGeminiKeySaving(true);
+    try {
+      const res = await window.neko.geminiSaveKey(trimmed);
+      if (res.success) {
+        setGeminiKeyInput("");
+        await refreshGeminiKeyStatus();
+        setGeminiKeySuccess("Chave Google Gemini salva com sucesso!");
+        notificationManager.showGlobalNotification({
+          message: "Chave Google Gemini configurada com sucesso!",
+          type: "info",
+        });
+      } else {
+        setGeminiKeyError(res.error || "Falha ao salvar chave com segurança.");
+      }
+    } catch (err: any) {
+      setGeminiKeyError(err?.message || "Erro inesperado ao salvar a chave.");
+    } finally {
+      setGeminiKeySaving(false);
+    }
+  };
+
+  const handleDeleteGeminiKey = async () => {
+    if (geminiKeyDeleting) return;
+    setGeminiKeyError(null);
+    setGeminiKeySuccess(null);
+    setGeminiKeyDeleting(true);
+    try {
+      await window.neko.geminiDeleteKey();
+      await refreshGeminiKeyStatus();
+      setGeminiKeyInput("");
+      setGeminiKeySuccess("Chave removida. Para utilizar Melhorar Prompt e Voz, configure uma nova chave.");
+      notificationManager.showGlobalNotification({
+        message: "Chave Google Gemini removida.",
+        type: "warning",
+      });
+    } catch (err: any) {
+      setGeminiKeyError(err?.message || "Erro ao remover chave.");
+    } finally {
+      setGeminiKeyDeleting(false);
+    }
+  };
   const [previewUrl, setPreviewUrl] = React.useState<string | null>(null);
   const [previewFramework, setPreviewFramework] = React.useState<string | null>(null);
   const [previewPackageManager, setPreviewPackageManager] = React.useState<string | null>(null);
@@ -9017,11 +9198,11 @@ function App() {
                       <div className="voice-recording-hint">
                         {isTranscribingAudio ? (
                           <span className="voice-transcribing-hint">
-                            <Loader2 size={13} className="spin" />
-                            Processando reconhecimento de fala...
+                            <Loader2 size={13} className="spin" style={{ flexShrink: 0 }} />
+                            <span className="voice-transcribing-text">Processando reconhecimento de fala...</span>
                           </span>
                         ) : (
-                          <span>Fale no microfone • Esc para cancelar • Enter para enviar</span>
+                          <span className="voice-default-hint">Fale no microfone • Esc para cancelar • Enter para enviar</span>
                         )}
                       </div>
                       <div className="voice-recording-actions">
@@ -9038,7 +9219,7 @@ function App() {
                         </button>
                         <button
                           type="button"
-                          className="voice-action-btn send-btn"
+                          className="voice-action-btn send-btn voice-send-btn"
                           onClick={() => void handleFinishRecording("send")}
                           disabled={isTranscribingAudio}
                           title="Enviar transcrição diretamente ao chat (Enter)"
@@ -9201,16 +9382,32 @@ function App() {
                       <Undo2 size={13}/>
                       <span>Desfazer</span>
                     </button>
+                  ) : isEnhancingPrompt ? (
+                    <div className="enhancing-prompt-container">
+                      <span className="composer-action-btn enhance-btn loading" style={{ cursor: "default" }}>
+                        <Loader2 size={13} className="spin"/>
+                        <span>Melhorando...</span>
+                      </span>
+                      <button
+                        type="button"
+                        className="composer-action-btn enhance-cancel-btn"
+                        onClick={handleCancelEnhance}
+                        title="Cancelar melhoria do prompt"
+                        aria-label="Cancelar melhoria"
+                      >
+                        <X size={12}/>
+                        <span>Cancelar</span>
+                      </button>
+                    </div>
                   ) : (
                     <button 
                       type="button"
-                      className={`composer-action-btn enhance-btn ${isEnhancingPrompt ? "loading" : ""}`} 
+                      className="composer-action-btn enhance-btn" 
                       aria-label="Melhorar Prompt" 
                       onClick={() => void handleEnhancePrompt()} 
-                      disabled={busy || isEnhancingPrompt || !input.trim()} 
-                      title="Melhorar instrução com IA gratuitamente"
+                      disabled={busy || !input.trim()} 
+                      title={geminiKeyStatus?.configured ? "Melhorar instrução com IA (Google Gemini)" : "Configurar chave Gemini para melhorar prompt"}
                     >
-                      {isEnhancingPrompt && <Loader2 size={13} className="spin"/>}
                       <span>Melhorar Prompt</span>
                     </button>
                   )}
@@ -9221,7 +9418,7 @@ function App() {
                     aria-label={isRecordingAudio ? "Parar gravação de voz" : isTranscribingAudio ? "Transcrevendo voz..." : "Prompt por voz"}
                     onClick={() => void handleToggleVoiceRecording()}
                     disabled={busy || isTranscribingAudio}
-                    title={isRecordingAudio ? "Clique para concluir e transcrever" : isTranscribingAudio ? "Transcrevendo áudio..." : "Gravar prompt por voz"}
+                    title={isRecordingAudio ? "Clique para concluir e transcrever" : isTranscribingAudio ? "Transcrevendo áudio..." : geminiKeyStatus?.configured ? "Gravar prompt por voz (Google Gemini)" : "Configurar chave Gemini para gravar por voz"}
                   >
                     {isTranscribingAudio ? (
                       <Loader2 size={16} className="spin"/>
@@ -9231,6 +9428,31 @@ function App() {
                       <MicAudioLines size={16}/>
                     )}
                     {isRecordingAudio && <span className="recording-pulse-dot" />}
+                  </button>
+
+                  <button
+                    type="button"
+                    className="composer-action-btn gemini-settings-btn"
+                    aria-label="Configurar Chave Google Gemini"
+                    onClick={() => setModal("geminiKey")}
+                    disabled={busy || isRecordingAudio || isTranscribingAudio}
+                    title={geminiKeyStatus?.configured ? `Chave Gemini configurada (${geminiKeyStatus.mask}) - Clique para gerenciar` : "Configurar Chave Google Gemini (Obrigatória para IA e Voz)"}
+                    style={{ position: "relative" }}
+                  >
+                    <Key size={13} style={{ color: geminiKeyStatus?.configured ? "var(--primary, #a855f7)" : "#f59e0b" }}/>
+                    {!geminiKeyStatus?.configured && (
+                      <span
+                        style={{
+                          position: "absolute",
+                          top: 4,
+                          right: 4,
+                          width: 5,
+                          height: 5,
+                          borderRadius: "50%",
+                          background: "#f59e0b"
+                        }}
+                      />
+                    )}
                   </button>
                 </div>
 
@@ -9356,18 +9578,9 @@ function App() {
                       onClick={() => void (busy ? stopDevelopment() : send())} 
                       disabled={!sessionId || (!busy && !input.trim() && attachments.length === 0)} 
                       aria-label={busy ? "Parar desenvolvimento" : "Enviar"}
+                      title={busy ? "Parar desenvolvimento" : "Enviar"}
                     >
-                      {busy ? (
-                        <>
-                          <Square size={13} fill="currentColor"/>
-                          <span>Parar</span>
-                        </>
-                      ) : (
-                        <>
-                          <Send size={13}/>
-                          <span>Enviar</span>
-                        </>
-                      )}
+                      {busy ? <Square size={13} fill="currentColor"/> : <ArrowUp size={17}/>}
                     </button>
                   </div>
                 </div>
@@ -13517,6 +13730,41 @@ function App() {
                 </div>
               </div>
             </div>
+            {/* Card de Configuração da Chave Google Gemini */}
+            <div className="settings-section-card">
+              <div className="settings-section-head">
+                <div className="settings-section-title">
+                  <Key size={16} className="text-primary"/>
+                  <strong>Chave Google Gemini (BYOK)</strong>
+                </div>
+                {geminiKeyStatus?.configured ? (
+                  <span className="settings-version-badge" style={{ background: "rgba(34, 197, 94, 0.15)", color: "#86efac", borderColor: "rgba(34, 197, 94, 0.3)" }}>
+                    Configurada
+                  </span>
+                ) : (
+                  <span className="settings-version-badge" style={{ background: "rgba(245, 158, 11, 0.15)", color: "#fcd34d", borderColor: "rgba(245, 158, 11, 0.3)" }}>
+                    Pendente
+                  </span>
+                )}
+              </div>
+              <div className="settings-sound-row">
+                <span className="settings-sound-label">
+                  {geminiKeyStatus?.configured
+                    ? `Chave própria configurada (${geminiKeyStatus.mask}). Habilitada para Melhorar Prompt e Prompt por voz.`
+                    : "Configure sua chave própria do Google Gemini para desbloquear Melhorar Prompt e Prompt por voz."}
+                </span>
+                <div className="settings-sound-controls">
+                  <button
+                    type="button"
+                    className="settings-sound-test"
+                    onClick={() => setModal("geminiKey")}
+                  >
+                    {geminiKeyStatus?.configured ? "Gerenciar Chave" : "Configurar Agora"}
+                  </button>
+                </div>
+              </div>
+            </div>
+
             {/* Card de Atualização */}
             <div className="settings-section-card">
               <div className="settings-section-head">
@@ -13832,6 +14080,155 @@ function App() {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modal === "geminiKey" && (
+        <div className="license-modal-container gemini-key-modal-container">
+          <div className="modal-head">
+            <div>
+              <h2 id="modal-title" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Key size={19} className="text-primary"/> Configurar Chave Google Gemini
+              </h2>
+              <p>Configure sua chave própria de API para Melhorar Prompt e Prompt por voz.</p>
+            </div>
+            <button className="close-btn" onClick={() => setModal(null)} aria-label="Fechar"><X size={17}/></button>
+          </div>
+
+          <div className="modal-scroll-body" style={{ padding: "16px 0 0 0" }}>
+            <p style={{ margin: "0 0 14px", fontSize: 13, color: "var(--foreground-muted, #a1a1aa)", lineHeight: 1.5 }}>
+              Para utilizar Melhorar Prompt e Prompt por voz, você precisa configurar sua própria chave de API do Google Gemini. O NekoAI utilizará essa chave diretamente para executar esses recursos.
+            </p>
+
+            <div style={{ marginBottom: 16, padding: "12px 14px", background: "rgba(168, 85, 247, 0.08)", border: "1px solid rgba(168, 85, 247, 0.2)", borderRadius: 8, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 6 }}>
+              <span style={{ fontSize: 12, color: "#d8b4fe" }}>Não tem uma chave da API do Gemini?</span>
+              <a
+                href="https://aistudio.google.com/app/api-keys"
+                style={{ fontSize: 12, color: "#c084fc", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 5, textDecoration: "none" }}
+                onClick={(e) => {
+                  e.preventDefault();
+                  void window.neko.openExternal("https://aistudio.google.com/app/api-keys");
+                }}
+              >
+                <span>Obter minha chave no Google AI Studio</span>
+                <ExternalLink size={13}/>
+              </a>
+            </div>
+
+            {/* Status atual da chave configurada */}
+            {geminiKeyStatus?.configured && (
+              <div style={{ marginBottom: 16, padding: "12px 14px", background: "rgba(34, 197, 94, 0.08)", border: "1px solid rgba(34, 197, 94, 0.25)", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <CheckCircle2 size={18} color="#22c55e"/>
+                  <div>
+                    <strong style={{ display: "block", fontSize: 13, color: "#86efac" }}>Chave Configurada</strong>
+                    <span style={{ fontSize: 11, color: "rgba(255,255,255,0.6)" }}>
+                      Máscara: <code style={{ color: "#ffffff", background: "rgba(0,0,0,0.3)", padding: "1px 5px", borderRadius: 4 }}>{geminiKeyStatus.mask}</code>
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="secondary"
+                  style={{ fontSize: 11, padding: "5px 10px", borderColor: "rgba(239, 68, 68, 0.35)", color: "#fca5a5" }}
+                  disabled={geminiKeyDeleting || geminiKeyTesting || geminiKeySaving}
+                  onClick={() => void handleDeleteGeminiKey()}
+                  title="Remover esta chave do dispositivo"
+                >
+                  {geminiKeyDeleting ? <Loader2 size={13} className="spin"/> : <Trash2 size={13}/>}
+                  <span>Remover Chave</span>
+                </button>
+              </div>
+            )}
+
+            {/* Mensagem de Erro */}
+            {geminiKeyError && (
+              <div className="creation-error" style={{ margin: "0 0 14px", display: "flex", alignItems: "center", gap: 8, color: "#fca5a5", background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)", padding: "10px 12px", borderRadius: 8, fontSize: 12 }}>
+                <AlertTriangle size={15} style={{ flexShrink: 0 }}/>
+                <span>{geminiKeyError}</span>
+              </div>
+            )}
+
+            {/* Mensagem de Sucesso */}
+            {geminiKeySuccess && (
+              <div style={{ margin: "0 0 14px", display: "flex", alignItems: "center", gap: 8, color: "#86efac", background: "rgba(34,197,94,0.1)", border: "1px solid rgba(34,197,94,0.3)", padding: "10px 12px", borderRadius: 8, fontSize: 12 }}>
+                <CheckCircle2 size={15} style={{ flexShrink: 0 }}/>
+                <span>{geminiKeySuccess}</span>
+              </div>
+            )}
+
+            {/* Campo da Chave */}
+            <div className="input-group" style={{ marginBottom: 14 }}>
+              <label htmlFor="gemini-key-input" style={{ display: "block", marginBottom: 6, fontSize: 12, fontWeight: 500, color: "var(--foreground, #fff)" }}>
+                {geminiKeyStatus?.configured ? "Substituir Chave Gemini:" : "Chave de API do Google Gemini:"}
+              </label>
+              <div style={{ position: "relative", width: "100%", display: "flex", alignItems: "center" }}>
+                <input
+                  id="gemini-key-input"
+                  type={showGeminiKey ? "text" : "password"}
+                  className="api-input"
+                  style={{ width: "100%", paddingRight: 40, margin: 0, boxSizing: "border-box" }}
+                  value={geminiKeyInput}
+                  onChange={(e) => setGeminiKeyInput(e.target.value)}
+                  placeholder={geminiKeyStatus?.configured ? "Digite uma nova chave para substituir..." : "AIzaSy..."}
+                  disabled={geminiKeySaving || geminiKeyTesting}
+                  spellCheck={false}
+                  autoFocus
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && geminiKeyInput.trim()) {
+                      e.preventDefault();
+                      void handleSaveGeminiKey();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", color: "var(--foreground-muted, #71717a)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 4 }}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setShowGeminiKey(v => !v);
+                  }}
+                  title={showGeminiKey ? "Ocultar chave" : "Mostrar chave"}
+                  aria-label={showGeminiKey ? "Ocultar chave" : "Mostrar chave"}
+                >
+                  {showGeminiKey ? <EyeOff size={16}/> : <Eye size={16}/>}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="modal-actions" style={{ padding: "14px 0 0 0", marginTop: 14, display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid rgba(255,255,255,0.08)" }}>
+            <button
+              type="button"
+              className="secondary"
+              disabled={geminiKeyTesting || geminiKeySaving || (!geminiKeyInput.trim() && !geminiKeyStatus?.configured)}
+              onClick={() => void handleTestGeminiKey()}
+              title="Testar a chave informada ou a já configurada"
+            >
+              {geminiKeyTesting ? <Loader2 size={14} className="spin"/> : <Sparkles size={14}/>}
+              <span>{geminiKeyTesting ? "Testando conexão..." : "Testar Chave"}</span>
+            </button>
+
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setModal(null)}
+              >
+                Fechar
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={!geminiKeyInput.trim() || geminiKeySaving || geminiKeyTesting}
+                onClick={() => void handleSaveGeminiKey()}
+              >
+                {geminiKeySaving ? <Loader2 size={15} className="spin"/> : <Check size={15}/>}
+                <span>{geminiKeySaving ? "Salvando com segurança..." : "Salvar Chave"}</span>
+              </button>
             </div>
           </div>
         </div>

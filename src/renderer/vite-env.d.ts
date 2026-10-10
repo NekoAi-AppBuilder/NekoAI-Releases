@@ -136,6 +136,12 @@ interface Window {
       reason?: "LOCAL_DEACTIVATION" | "REMOTE_TRANSFER" | "INITIAL_CHECK" | "VERIFIED" | string;
     }>;
     licenseGetGrant(): Promise<string | null>;
+    geminiGetKeyStatus(): Promise<{ configured: boolean; mask?: string; updatedAt?: string }>;
+    geminiSaveKey(key: string): Promise<{ success: boolean; error?: string }>;
+    geminiDeleteKey(): Promise<{ success: boolean; error?: string }>;
+    geminiTestKey(key?: string): Promise<{ success: boolean; message?: string; error?: string }>;
+    enhancePrompt(prompt: string, operationId?: string): Promise<{ success: boolean; improvedPrompt?: string; error?: string; cancelled?: boolean }>;
+    cancelEnhancePrompt(operationId?: string): Promise<boolean>;
     transcribeAudio(payload: { audioBase64: string; mimeType: string }): Promise<{
       success: boolean;
       text?: string;

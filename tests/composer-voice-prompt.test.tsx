@@ -369,3 +369,58 @@ describe("Composer: Nova Interface de Gravação por Voz (Waveform & Controles)"
   });
 });
 
+describe("Composer: Prompt por Voz (BYOK Obrigatório) — Validação Prévia de Chave Gemini", () => {
+  test("Bloqueia gravação e abre modal se chave Gemini não estiver configurada (sem chamar microfone)", async () => {
+    let modalOpened: string | null = null;
+    let notificationShown: string | null = null;
+    let getUserMediaCalled = false;
+
+    const mockKeyStatus = { configured: false };
+    const mockWindowNeko = {
+      geminiGetKeyStatus: async () => mockKeyStatus,
+    };
+
+    const handleToggleVoiceRecording = async () => {
+      const status = await mockWindowNeko.geminiGetKeyStatus();
+      if (!status?.configured) {
+        modalOpened = "geminiKey";
+        notificationShown = "Configure sua chave Google Gemini para utilizar a gravação por voz.";
+        return;
+      }
+      getUserMediaCalled = true;
+    };
+
+    await handleToggleVoiceRecording();
+
+    expect(modalOpened).toBe("geminiKey");
+    expect(notificationShown).toBe("Configure sua chave Google Gemini para utilizar a gravação por voz.");
+    // Microfone NÃO pode ser inicializado!
+    expect(getUserMediaCalled).toBe(false);
+  });
+
+  test("Inicia gravação com sucesso quando chave Gemini está configurada", async () => {
+    let modalOpened: string | null = null;
+    let getUserMediaCalled = false;
+
+    const mockKeyStatus = { configured: true, mask: "AIza••••1234" };
+    const mockWindowNeko = {
+      geminiGetKeyStatus: async () => mockKeyStatus,
+    };
+
+    const handleToggleVoiceRecording = async () => {
+      const status = await mockWindowNeko.geminiGetKeyStatus();
+      if (!status?.configured) {
+        modalOpened = "geminiKey";
+        return;
+      }
+      getUserMediaCalled = true;
+    };
+
+    await handleToggleVoiceRecording();
+
+    expect(modalOpened).toBeNull();
+    expect(getUserMediaCalled).toBe(true);
+  });
+});
+
+

@@ -42,6 +42,8 @@ import { extractFetchErrorDetails, formatProcessExitDiagnostic, formatStartupTim
 import { packageManagerExecutable, isPackageManagerAvailable, resolveEffectivePackageManager } from "./preview-package-manager";
 import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolveConflictFile, finalizeConflictResolution, getConflictFiles, checkAndRefreshConflicts, parseLinkedRepo, type GitSyncStatus, type PullResult, type GitConflictFile, type GitSyncCombineResult, type ConflictRefreshResult } from "./git-sync";
 import { normalizeRepoRelativePath, diagnoseGitFilePath } from "./git-path-normalizer";
+import { geminiVault } from "./gemini/gemini-vault";
+import { geminiService } from "./gemini/gemini-service";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -10438,62 +10440,39 @@ app.whenReady().then(() => {
 
   ipcMain.handle("license:get-state", () => licenseManager.getState());
   ipcMain.handle("license:get-grant", () => licenseManager.getGrant());
+  // Gemini BYOK & AI Assistant IPC Handlers
+  ipcMain.handle("gemini:get-key-status", async () => {
+    return geminiVault.getKeyStatus();
+  });
+
+  ipcMain.handle("gemini:save-key", async (_event, payload: { key: string }) => {
+    const key = typeof payload?.key === "string" ? payload.key : "";
+    return geminiVault.saveKey(key);
+  });
+
+  ipcMain.handle("gemini:delete-key", async () => {
+    await geminiVault.deleteKey();
+    return { success: true };
+  });
+
+  ipcMain.handle("gemini:test-key", async (_event, payload?: { key?: string }) => {
+    const key = typeof payload?.key === "string" ? payload.key : undefined;
+    return geminiService.testKey(key);
+  });
+
+  ipcMain.handle("ai:enhance-prompt", async (_event, payload: { prompt: string; operationId?: string }) => {
+    const prompt = typeof payload?.prompt === "string" ? payload.prompt : "";
+    const operationId = typeof payload?.operationId === "string" ? payload.operationId : undefined;
+    return geminiService.enhancePrompt(prompt, operationId);
+  });
+
+  ipcMain.handle("ai:cancel-enhance-prompt", async (_event, payload?: { operationId?: string }) => {
+    const operationId = typeof payload?.operationId === "string" ? payload.operationId : undefined;
+    return geminiService.cancelEnhancePrompt(operationId);
+  });
+
   ipcMain.handle("ai:transcribe-audio", async (_event, payload: { audioBase64: string; mimeType: string }) => {
-    try {
-      const grant = (await licenseManager.getGrant()) || "";
-      if (!grant) {
-        return { success: false, error: "Credencial de licenciamento ativa não encontrada. Verifique se a sua licença está ativada." };
-      }
-      const url = "https://igadprvhgmfnyvyqavhy.supabase.co/functions/v1/transcribe-audio";
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-neko-license-grant": grant
-        },
-        body: JSON.stringify({
-          audio: payload?.audioBase64 || "",
-          mimeType: payload?.mimeType || "audio/webm"
-        })
-      });
-
-      let data: any = null;
-      try {
-        data = await res.json();
-      } catch {
-        data = null;
-      }
-
-      if (!res.ok) {
-        if (res.status === 401) {
-          return {
-            success: false,
-            error: data?.message || "Sua licença não possui permissão ativa para transcrição por voz. Verifique a ativação."
-          };
-        }
-        if (res.status === 429) {
-          return {
-            success: false,
-            error: data?.message || "Muitas tentativas de gravação em pouco tempo. Aguarde um instante e tente novamente."
-          };
-        }
-        if (res.status >= 500) {
-          return {
-            success: false,
-            error: "O serviço de transcrição está temporariamente instável. Tente novamente em instantes."
-          };
-        }
-        return {
-          success: false,
-          error: data?.message || "Falha ao processar o áudio gravado."
-        };
-      }
-
-      return data || { success: false, error: "Resposta vazia do servidor." };
-    } catch (err: any) {
-      console.error("[Neko/Voice] Falha ao transcrever áudio via IPC:", err);
-      return { success: false, error: err?.message || String(err) };
-    }
+    return geminiService.transcribeAudio(payload);
   });
   ipcMain.handle("license:activate", (_event, payload: { licenseKey: string }) =>
     licenseManager.activate(payload?.licenseKey)
