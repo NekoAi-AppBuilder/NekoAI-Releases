@@ -254,6 +254,11 @@ interface Window {
     skillsInstall(skillId: string, projectPath?: string): Promise<any>;
     skillsRemove(skillId: string, projectPath?: string): Promise<any>;
     skillsGetPrompt(skillId: string): Promise<{ prompt: string; rotulo: string; pedido: string }>;
+    windowMinimize?(): Promise<void>;
+    windowToggleMaximize?(): Promise<boolean>;
+    windowIsMaximized?(): Promise<boolean>;
+    windowClose?(): Promise<void>;
+    onWindowMaximizedChange?(callback: (isMaximized: boolean) => void): () => void;
   };
 }
 

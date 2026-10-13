@@ -14,7 +14,7 @@ class NekoUpdaterManager {
   private window: BrowserWindow | null = null;
   private state: UpdaterState = {
     status: "idle",
-    currentVersion: app.getVersion(),
+    currentVersion: "0.5.00",
     updateInfo: null,
     progress: null,
     error: null,
@@ -23,15 +23,19 @@ class NekoUpdaterManager {
 
   public initialize(window: BrowserWindow | null) {
     this.window = window;
-    this.state.currentVersion = app.getVersion();
+    this.state.currentVersion = "0.5.00";
 
-    // Configurações do autoUpdater
-    autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.allowDowngrade = false;
-    autoUpdater.allowPrerelease = false;
+    try {
+      // Configurações do autoUpdater
+      autoUpdater.autoDownload = false;
+      autoUpdater.autoInstallOnAppQuit = true;
+      autoUpdater.allowDowngrade = false;
+      autoUpdater.allowPrerelease = false;
 
-    this.registerEvents();
+      this.registerEvents();
+    } catch (err) {
+      console.warn("[Neko/Updater] Não foi possível carregar autoUpdater:", err);
+    }
   }
 
   public setWindow(window: BrowserWindow | null) {
