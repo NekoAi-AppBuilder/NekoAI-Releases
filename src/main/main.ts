@@ -44,6 +44,9 @@ import { checkGitSyncStatus, pullFastForwardOnly, syncAndCombineProject, resolve
 import { normalizeRepoRelativePath, diagnoseGitFilePath } from "./git-path-normalizer";
 import { geminiVault } from "./gemini/gemini-vault";
 import { geminiService } from "./gemini/gemini-service";
+import { chatGptManager } from "./chatgpt/chatgpt-manager";
+import { CHATGPT_PROVIDER_ID, CHATGPT_PROVIDER_NAME } from "./chatgpt/chatgpt-types";
+import { skillsManager } from "./skills/skills-manager";
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -2708,6 +2711,14 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     ? ["/d", "/s", "/c", windowsCommandLine(executable, rawArgs)]
     : rawArgs;
 
+  if (chatGptManager.isConnected()) {
+    try {
+      await chatGptManager.syncOpenCodeConfig(safeProjectPath);
+    } catch (err: any) {
+      console.warn("[Neko/ChatGpt] Falha ao sincronizar opencode.json antes do start:", err?.message || err);
+    }
+  }
+
   const runtimeEnv = await runtimeManager.getOpenCodeScopedEnv(safeProjectPath);
   const child = spawn(
     spawnExecutable,
@@ -2885,6 +2896,8 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
 async function startOpenCode(projectPath: string) {
   await stopOpenCode();
   await stopPreview();
+  skillsManager.setProject(projectPath);
+  chatGptManager.setProject(projectPath);
   await supabaseManager.setProject(projectPath);
   await lovableCloudManager.setProject(projectPath);
   await vercelManager.setProject(projectPath);
@@ -5947,6 +5960,60 @@ async function getProviders() {
       console.warn("[Providers] client.provider.auth() falhou:", logSafeText(authError?.message ?? authError));
     }
 
+    // Injeta provedor "Meu ChatGPT" com seus modelos da conta pessoal conectada
+    if (chatGptManager.isConnected()) {
+      const chatGptModels = chatGptManager.getModels();
+      const chatGptModelList: any[] = [];
+      const disabledSettings = await getModelSettings();
+      const providerSettings = await getProviderSettings();
+      const providerEnabled = providerSettings[CHATGPT_PROVIDER_ID] !== false;
+
+      // Remove eventuais duplicatas anteriores de chatgpt-personal da lista plana
+      for (let i = models.length - 1; i >= 0; i--) {
+        if (models[i].providerID === CHATGPT_PROVIDER_ID) {
+          models.splice(i, 1);
+        }
+      }
+
+      for (const m of chatGptModels) {
+        const key = `${CHATGPT_PROVIDER_ID}:${m.slug}`;
+        const userEnabled = disabledSettings[key] !== false;
+
+        providerCatalogCache.set(key, { attachment: true });
+
+        const modelEntry = {
+          providerID: CHATGPT_PROVIDER_ID,
+          providerName: CHATGPT_PROVIDER_NAME,
+          modelID: m.slug,
+          name: m.nome,
+          variants: m.niveis.map(n => n.effort),
+          enabled: providerEnabled && userEnabled,
+          connected: true,
+          catalogEnabled: true,
+          attachment: true,
+          cost: undefined,
+        };
+        chatGptModelList.push(modelEntry);
+        models.push(modelEntry);
+      }
+
+      const existingIdx = providers.findIndex((p: any) => p.id === CHATGPT_PROVIDER_ID);
+      const providerEntry = {
+        id: CHATGPT_PROVIDER_ID,
+        name: CHATGPT_PROVIDER_NAME,
+        connected: true,
+        enabled: providerEnabled,
+        methods: [{ type: "oauth", label: "OAuth PKCE" }],
+        models: chatGptModelList,
+      };
+
+      if (existingIdx >= 0) {
+        providers[existingIdx] = providerEntry;
+      } else {
+        providers.push(providerEntry);
+      }
+    }
+
     const managedModels = models.filter(m => m.catalogEnabled);
     const activeModels = managedModels.filter(m => m.enabled);
 
@@ -8682,6 +8749,34 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   logProjectWorkspace("analyze", projectRoot);
   if (!payload.sessionId) throw new Error("Sessão do Neko não encontrada.");
 
+  // Validação e prontidão para o provedor Meu ChatGPT
+  if (payload.model?.providerID === CHATGPT_PROVIDER_ID) {
+    if (!chatGptManager.isConnected()) {
+      throw new Error("Sua conta do ChatGPT não está conectada. Conecte sua conta em Janela > Integrações.");
+    }
+    // Normaliza modelID para minúsculas
+    if (payload.model.modelID) {
+      payload.model.modelID = payload.model.modelID.trim().toLowerCase();
+    }
+    await chatGptManager.ensureBridgeRunning();
+    if (currentProject) {
+      await chatGptManager.syncOpenCodeConfig(currentProject);
+      try {
+        const client: any = await getOpencodeClient();
+        const provList = await client.provider.list().catch(() => null);
+        const allProviders = provList?.data?.all ?? provList?.all ?? [];
+        const hasProvider = allProviders.some((p: any) => p.id === CHATGPT_PROVIDER_ID);
+        if (!hasProvider) {
+          console.log("[Neko/ChatGpt] Provedor chatgpt-personal ainda não registrado no OpenCode. Reiniciando OpenCode...");
+          await startOpenCode(currentProject);
+          await waitForServiceReady();
+        }
+      } catch (checkErr: any) {
+        console.warn("[Neko/ChatGpt] Aviso ao verificar prontidão do provedor OpenCode:", checkErr?.message);
+      }
+    }
+  }
+
   const uploadCount = (payload.attachments?.length ?? 0) + (payload.contextPaths?.length ?? 0);
   const modelLabel = payload.model ? `${payload.model.providerID ?? "?"}/${payload.model.modelID ?? "?"}` : "";
   perfTaskStart(payload.sessionId, payload.perf, modelLabel, uploadCount);
@@ -9573,6 +9668,8 @@ ipcMain.handle("project:stop", async (_event, payload?: { source?: string }) => 
   void supabaseManager.setProject(null);
   void vercelManager.setProject(null);
   void lovableCloudManager.setProject(null);
+  void chatGptManager.setProject(null);
+  skillsManager.setProject(null);
   await stopOpenCode();
   await stopPreview();
   return true;
@@ -9927,6 +10024,51 @@ ipcMain.handle("vercel:open-deployment", async () => {
 ipcMain.handle("vercel:open-dashboard", async () => {
   await shell.openExternal("https://vercel.com/dashboard");
   return { success: true };
+});
+
+// ============================================================
+// AGENT SKILLS IPC HANDLERS
+// ============================================================
+ipcMain.handle("skills:get-status", async (_event, payload?: any) => {
+  try {
+    const projectPath = typeof payload === "string" ? payload : payload?.projectPath;
+    const state = await skillsManager.getStatus(projectPath);
+    return { success: true, state, ...state };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle("skills:install", async (_event, payload: any) => {
+  try {
+    const skillId = typeof payload === "string" ? payload : payload?.skillId;
+    const projectPath = typeof payload === "object" ? payload?.projectPath : undefined;
+    const res = await skillsManager.installSkill(skillId, projectPath);
+    return res;
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle("skills:remove", async (_event, payload: any) => {
+  try {
+    const skillId = typeof payload === "string" ? payload : payload?.skillId;
+    const projectPath = typeof payload === "object" ? payload?.projectPath : undefined;
+    const res = await skillsManager.removeSkill(skillId, projectPath);
+    return res;
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
+});
+
+ipcMain.handle("skills:get-prompt", async (_event, payload: any) => {
+  try {
+    const skillId = typeof payload === "string" ? payload : payload?.skillId;
+    const res = skillsManager.getExecutionPrompt(skillId);
+    return { success: true, ...res };
+  } catch (err: any) {
+    return { success: false, error: err?.message || String(err) };
+  }
 });
 
 
@@ -10403,6 +10545,10 @@ app.whenReady().then(() => {
   vercelManager.setGitStatusGetter(async (p: string) => getGitStatus(p));
   void vercelManager.initialize();
   void licenseManager.initialize();
+  void chatGptManager.initialize();
+  chatGptManager.onStateChange((state) => {
+    mainWindow?.webContents.send("chatgpt:state-changed", state);
+  });
 
 
   licenseManager.setOnStateChange(async (newState, prevState) => {
@@ -10458,6 +10604,43 @@ app.whenReady().then(() => {
   ipcMain.handle("gemini:test-key", async (_event, payload?: { key?: string }) => {
     const key = typeof payload?.key === "string" ? payload.key : undefined;
     return geminiService.testKey(key);
+  });
+
+  // ChatGPT Pessoal IPC Handlers
+  ipcMain.handle("chatgpt:get-state", async () => {
+    return chatGptManager.getState();
+  });
+  ipcMain.handle("chatgpt:connect", async () => {
+    const res = await chatGptManager.startLogin();
+    if (res.success && currentProject) {
+      await chatGptManager.syncOpenCodeConfig(currentProject);
+      if (opencodeProcess) {
+        console.log("[Neko/ChatGpt] Reiniciando OpenCode para carregar novo provedor Meu ChatGPT...");
+        await startOpenCode(currentProject);
+      }
+    }
+    return res;
+  });
+  ipcMain.handle("chatgpt:cancel-login", async () => {
+    chatGptManager.cancelLogin();
+    return { success: true };
+  });
+  ipcMain.handle("chatgpt:disconnect", async () => {
+    await chatGptManager.disconnect();
+    if (currentProject) {
+      await chatGptManager.syncOpenCodeConfig(currentProject);
+      if (opencodeProcess) {
+        console.log("[Neko/ChatGpt] Reiniciando OpenCode após desconectar Meu ChatGPT...");
+        await startOpenCode(currentProject);
+      }
+    }
+    return { success: true };
+  });
+  ipcMain.handle("chatgpt:refresh-usage", async () => {
+    return chatGptManager.refreshUsage();
+  });
+  ipcMain.handle("chatgpt:refresh-models", async () => {
+    return chatGptManager.refreshModels();
   });
 
   ipcMain.handle("ai:enhance-prompt", async (_event, payload: { prompt: string; operationId?: string }) => {

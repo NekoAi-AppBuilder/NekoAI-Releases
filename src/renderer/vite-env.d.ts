@@ -243,6 +243,17 @@ interface Window {
     runtimeGetRequirements?(projectPath?: string): Promise<{ requirements: any[]; cardData: any[] }>;
     runtimeAuthorize?(payload: { runtimeId: string; version: string; approved: boolean; reason?: string }): Promise<any>;
     onRuntimeLifecycleEvent?(callback: (event: any) => void): () => void;
+    chatgptGetState(): Promise<any>;
+    chatgptConnect(): Promise<any>;
+    chatgptCancelLogin(): Promise<any>;
+    chatgptDisconnect(): Promise<any>;
+    chatgptRefreshUsage(): Promise<any>;
+    chatgptRefreshModels(): Promise<any>;
+    onChatgptStateChange(callback: (state: any) => void): () => void;
+    skillsGetStatus(projectPath?: string): Promise<any>;
+    skillsInstall(skillId: string, projectPath?: string): Promise<any>;
+    skillsRemove(skillId: string, projectPath?: string): Promise<any>;
+    skillsGetPrompt(skillId: string): Promise<{ prompt: string; rotulo: string; pedido: string }>;
   };
 }
 

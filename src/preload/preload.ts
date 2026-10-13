@@ -148,6 +148,21 @@ contextBridge.exposeInMainWorld("neko", {
   onVercelLog: (callback: (message: string) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: string) => callback(data); ipcRenderer.on("vercel:log", listener); return () => ipcRenderer.removeListener("vercel:log", listener); },
   licenseGetState: () => ipcRenderer.invoke("license:get-state"),
   licenseGetGrant: () => ipcRenderer.invoke("license:get-grant"),
+  chatgptGetState: () => ipcRenderer.invoke("chatgpt:get-state"),
+  chatgptConnect: () => ipcRenderer.invoke("chatgpt:connect"),
+  chatgptCancelLogin: () => ipcRenderer.invoke("chatgpt:cancel-login"),
+  chatgptDisconnect: () => ipcRenderer.invoke("chatgpt:disconnect"),
+  chatgptRefreshUsage: () => ipcRenderer.invoke("chatgpt:refresh-usage"),
+  chatgptRefreshModels: () => ipcRenderer.invoke("chatgpt:refresh-models"),
+  onChatgptStateChange: (callback: (state: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data);
+    ipcRenderer.on("chatgpt:state-changed", listener);
+    return () => ipcRenderer.removeListener("chatgpt:state-changed", listener);
+  },
+  skillsGetStatus: (projectPath?: string) => ipcRenderer.invoke("skills:get-status", { projectPath }),
+  skillsInstall: (skillId: string, projectPath?: string) => ipcRenderer.invoke("skills:install", { skillId, projectPath }),
+  skillsRemove: (skillId: string, projectPath?: string) => ipcRenderer.invoke("skills:remove", { skillId, projectPath }),
+  skillsGetPrompt: (skillId: string) => ipcRenderer.invoke("skills:get-prompt", { skillId }),
   geminiGetKeyStatus: () => ipcRenderer.invoke("gemini:get-key-status"),
   geminiSaveKey: (key: string) => ipcRenderer.invoke("gemini:save-key", { key }),
   geminiDeleteKey: () => ipcRenderer.invoke("gemini:delete-key"),

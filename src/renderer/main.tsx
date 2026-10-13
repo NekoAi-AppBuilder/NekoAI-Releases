@@ -15,6 +15,7 @@ import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/m
 import { nextChatMode, chatModeLabel, CHAT_MODES, type ChatMode } from "../shared/chat-mode";
 import { getUserFacingError, sanitizeErrorMessage } from "../shared/error-extractor";
 import { shouldShowLovableOnboardingModal } from "../main/lovable/lovable-types";
+import { formatChatGptResetTime, type ChatGptUsageInfo } from "../main/chatgpt/chatgpt-types";
 import { getNekoTutorials, type NekoTutorial } from "./tutorials";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
 import { ReleaseNotesRenderer } from "./components/ReleaseNotesRenderer";
@@ -31,6 +32,8 @@ import {
 import { notifyOnce, playNotify, soundEnabled, setSoundEnabled, unlockAudio } from "./sounds";
 import { buildAgentCaptureContext, htmlToText } from "../main/site-capture";
 import { CodeWorkspace } from "./components/code";
+import { SkillsPanel } from "./components/SkillsPanel";
+import type { SkillsProjectState } from "../main/skills/skills-catalog";
 import {
   AutocompleteMenu,
   detectAutocompleteTrigger,
@@ -202,8 +205,10 @@ function formatAgentError(raw: any) {
     friendly = "A execução da tarefa foi cancelada.";
   } else if (statusCode === 401 || lower.includes("unauthorized") || lower.includes("authentication") || lower.includes("invalid api key") || lower.includes("invalid_api_key")) {
     friendly = "Não foi possível autenticar este provedor. Verifique as credenciais ou a configuração da conta.";
-  } else if (statusCode === 404 || lower.includes("model not found") || lower.includes("model_not_found") || lower.includes("does not exist") || lower.includes("model unavailable") || lower.includes("unknown model")) {
-    friendly = "Este modelo não está disponível neste momento. Escolha outro modelo.";
+  } else if (lower.includes("model not found") || lower.includes("model_not_found") || lower.includes("model does not exist") || lower.includes("does not exist") || lower.includes("model unavailable") || lower.includes("unknown model") || lower.includes("model not authorized") || lower.includes("unauthorized model")) {
+    friendly = "Este modelo não está disponível ou não está autorizado para a sua conta. Escolha outro modelo.";
+  } else if (statusCode === 404) {
+    friendly = `Recurso não encontrado no provedor (HTTP 404). ${sanitizeDiagnosticMessage(message) || "Verifique o endpoint e a configuração."}`.trim();
   } else if (statusCode === 403 || lower.includes("forbidden") || lower.includes("content-blocked") || lower.includes("content blocked")) {
     friendly = "O provedor não autorizou esta operação ou a recusou por políticas de segurança.";
   } else if (statusCode === 429 || lower.includes("rate limit") || lower.includes("too many requests")) {
@@ -378,6 +383,19 @@ function getProviderPricingLabel(models: Model[] | undefined): "Grátis" | "Pago
 function modelSupportsVision(model: Model | undefined): boolean {
   if (!model) return false;
   return getModelCapabilities(model.providerID, model.modelID, { attachment: model.attachment }).imageInput;
+}
+function ChatGptIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 40 40"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d="M32.8377 17.282C33.2127 16.25 33.3072 15.218 33.2127 14.1875C33.1197 13.1571 32.7447 12.1251 32.2752 11.1876C31.4322 9.78209 30.2127 8.6571 28.8072 8.0001C27.3072 7.34461 25.7127 7.15711 24.1197 7.53211C23.3698 6.78212 22.5253 6.12512 21.5878 5.65713C20.6503 5.18913 19.5253 5.00013 18.4948 5.00013C16.8851 4.99074 15.3125 5.48246 13.9948 6.40712C12.6824 7.34311 11.7449 8.6571 11.2754 10.1571C10.1504 10.4376 9.21289 10.9071 8.27539 11.4696C7.4324 12.1251 6.77541 12.9696 6.21291 13.8126C5.36992 15.2195 5.08792 16.8125 5.27542 18.407C5.46399 19.9968 6.11605 21.496 7.1504 22.718C6.79608 23.7086 6.66795 24.7659 6.77541 25.8124C6.86991 26.8444 7.2449 27.8749 7.7129 28.8124C8.55739 30.2194 9.77538 31.3444 11.1824 31.9999C12.6824 32.6569 14.2753 32.8444 15.8698 32.4694C16.6198 33.2194 17.4628 33.8749 18.4003 34.3444C19.3378 34.8139 20.4628 34.9999 21.4948 34.9999C23.1043 35.0097 24.6769 34.5185 25.9947 33.5944C27.3072 32.6569 28.2447 31.3444 28.7127 29.8444C29.7719 29.6432 30.7682 29.1934 31.6197 28.5319C32.4627 27.8749 33.2127 27.1249 33.6822 26.1874C34.5251 24.7819 34.8071 23.1875 34.6196 21.5945C34.4322 20 33.8697 18.5015 32.8377 17.282ZM21.5878 33.0304C20.0878 33.0304 18.9628 32.5609 17.9323 31.7179C17.9323 31.7179 18.0253 31.6234 18.1198 31.6234L24.1197 28.1554C24.2862 28.0803 24.4196 27.9469 24.4947 27.7804C24.5698 27.636 24.6021 27.4731 24.5877 27.3109V18.875L27.1197 20.375V27.3124C27.1455 28.0547 27.0215 28.7945 26.755 29.4878C26.4885 30.181 26.085 30.8134 25.5687 31.3473C25.0523 31.8811 24.4337 32.3054 23.7497 32.5949C23.0658 32.8843 22.3305 33.0314 21.5878 33.0304ZM9.49488 27.8749C8.83789 26.7499 8.55739 25.4374 8.83789 24.125C8.83789 24.125 8.93239 24.2195 9.02539 24.2195L15.0253 27.6874C15.1693 27.7638 15.3325 27.7966 15.4948 27.7819C15.6823 27.7819 15.8698 27.7819 15.9628 27.6874L23.2753 23.4695V26.3749L17.1823 29.9374C16.5506 30.3042 15.8527 30.5427 15.1287 30.6393C14.4046 30.7358 13.6686 30.6884 12.9629 30.4999C11.4629 30.1249 10.2449 29.1874 9.49488 27.8749ZM7.9004 14.8445C8.56239 13.7234 9.58826 12.8627 10.8074 12.4056V19.532C10.8074 19.718 10.8074 19.907 10.9004 20C10.9755 20.1665 11.1089 20.2998 11.2754 20.375L18.5878 24.5944L16.0573 26.0944L10.0574 22.625C9.41842 22.2639 8.85742 21.7797 8.40684 21.2004C7.95627 20.6211 7.62506 19.9582 7.4324 19.25C7.05741 17.8445 7.1504 16.157 7.9004 14.8445ZM28.6197 19.625L21.3073 15.407L23.8377 13.9071L29.8377 17.375C30.7752 17.9375 31.5252 18.6875 31.9947 19.625C32.4642 20.5625 32.7447 21.5945 32.6502 22.7195C32.5603 23.7755 32.1699 24.7837 31.5252 25.6249C30.8697 26.4694 30.0252 27.1249 28.9947 27.4999V20.375C28.9947 20.1875 28.9947 20 28.9002 19.907C28.9002 19.907 28.8072 19.718 28.6197 19.625ZM31.1502 15.875C31.1502 15.875 31.0572 15.782 30.9627 15.782L24.9627 12.3126C24.7752 12.2196 24.6822 12.2196 24.4947 12.2196C24.3072 12.2196 24.1197 12.2196 24.0252 12.3126L16.7128 16.532V13.6251L22.8073 10.0626C23.7448 9.50009 24.7752 9.31259 25.9002 9.31259C26.9322 9.31259 27.9627 9.68759 28.9002 10.3446C29.7447 11.0001 30.4947 11.8446 30.8697 12.7821C31.2447 13.7196 31.3377 14.8445 31.1502 15.875ZM15.4003 21.125L12.8699 19.625V12.5946C12.8699 11.5626 13.1503 10.4376 13.7128 9.59459C14.2753 8.6571 15.1198 8.0001 16.0573 7.53211C17.0127 7.05249 18.0956 6.88812 19.1503 7.06261C20.1823 7.15711 21.2128 7.62511 22.0573 8.2821C22.0573 8.2821 21.9628 8.3751 21.8698 8.3751L15.8698 11.8446C15.7033 11.9197 15.57 12.0531 15.4948 12.2196C15.4003 12.4071 15.4003 12.5001 15.4003 12.6876V21.125ZM16.7128 18.125L19.9948 16.25L23.2753 18.125V21.875L19.9948 23.75L16.7128 21.875V18.125Z" />
+    </svg>
+  );
 }
 function VercelIcon({ size = 16 }: { size?: number }) {
   return (
@@ -884,7 +902,7 @@ type GitStatus = {
   summary?: GitStatusSummary;
 };
 
-type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "githubMergeConfirm" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | "gitSync" | "gitCenter" | "geminiKey" | null;
+type Modal = "models" | "providers" | "providerAuth" | "github" | "githubDevice" | "githubLink" | "githubClone" | "githubPublish" | "githubMergeConfirm" | "newProject" | "branchChanges" | "branchDiscardConfirm" | "branchCommit" | "supabase" | "supabaseCreate" | "lovable" | "vercel" | "chatgpt" | "license" | "licenseDeactivateConfirm" | "licenseResetConfirm" | "settings" | "siteClone" | "tutorials" | "deleteProjectConfirm" | "gitSync" | "gitCenter" | "geminiKey" | null;
 
 // Compara caminhos de projeto ignorando separador final (mesma identidade real).
 function pathNormalizedEqual(a: string, b: string): boolean {
@@ -1330,7 +1348,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.4.99");
+  const [appVersion, setAppVersion] = React.useState<string>("0.5.00");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1799,6 +1817,9 @@ function App() {
   const [timelineTaskId, setTimelineTaskId] = React.useState<string | null>(null);
   const [taskTimelines, setTaskTimelines] = React.useState<Map<string, TaskTimeline>>(new Map());
   const currentTaskTimelineRef = React.useRef<TaskTimeline | null>(null);
+  const [skillsPanelOpen, setSkillsPanelOpen] = React.useState<boolean>(false);
+  const [skillsState, setSkillsState] = React.useState<SkillsProjectState | null>(null);
+  const [skillsLoading, setSkillsLoading] = React.useState<boolean>(false);
   const [pendingPermissions, setPendingPermissions] = React.useState<PermissionRequest[]>([]);
   const [pendingQuestion, setPendingQuestion] = React.useState<AgentQuestion | null>(null);
   const pendingQuestionRef = React.useRef<AgentQuestion | null>(null);
@@ -2012,6 +2033,37 @@ function App() {
   const [vercelLogs, setVercelLogs] = React.useState<string[]>([]);
   const [vercelProjectName, setVercelProjectName] = React.useState("");
   const [vercelSwitchMode, setVercelSwitchMode] = React.useState(false);
+  const [chatgptState, setChatgptState] = React.useState<{
+    status: "disconnected" | "authorizing" | "connected" | "error";
+    email: string | null;
+    account: string | null;
+    plan: string | null;
+    models: Array<{
+      slug: string;
+      nome: string;
+      niveis: Array<{ effort: string; descricao: string }>;
+      nivelPadrao: string | null;
+      resumo: boolean;
+    }>;
+    usage: ChatGptUsageInfo | null;
+    error: string | null;
+    updatedAt: string | null;
+    bridgeRunning: boolean;
+  }>({
+    status: "disconnected",
+    email: null,
+    account: null,
+    plan: null,
+    models: [],
+    usage: null,
+    error: null,
+    updatedAt: null,
+    bridgeRunning: false,
+  });
+  const [chatgptBusy, setChatgptBusy] = React.useState(false);
+  const [chatgptError, setChatgptError] = React.useState<string | null>(null);
+  const [chatgptUsageRefreshing, setChatgptUsageRefreshing] = React.useState(false);
+  const [, setChatgptClockTick] = React.useState(0);
   const [supabaseState, setSupabaseState] = React.useState<{
     status: "disconnected" | "checking" | "authorizing" | "verifying" | "selecting" | "validating" | "installing" | "connected" | "error";
     configured: boolean;
@@ -3102,6 +3154,8 @@ function App() {
       await window.neko.stop({ source: source || "user" }).catch(() => {});
     } catch {}
     setProject(null);
+    setSkillsPanelOpen(false);
+    setSkillsState(null);
     pendingJITPromptRef.current = null;
     setStatus("offline");
     setMessages([]);
@@ -3641,6 +3695,7 @@ function App() {
   // waiting_for_user / waiting_for_approval are NOT terminal: the task is
   // paused waiting for the user and resumes on the same agent session.
   const taskPhaseRef = React.useRef<"none" | "running" | "waiting_for_user" | "waiting_for_approval" | "completed" | "cancelled" | "failed">("none");
+  const lastEmittedErrorRef = React.useRef<{ taskId: string; text: string; time: number } | null>(null);
   const isTaskTerminal = React.useCallback(() => {
     return taskPhaseRef.current === "completed" || taskPhaseRef.current === "cancelled" || taskPhaseRef.current === "failed";
   }, []);
@@ -3707,6 +3762,63 @@ function App() {
     }
     return [];
   }, [autocompleteMode, autocompleteQuery, projectItems]);
+
+  const loadSkillsState = React.useCallback(async (targetProject?: string | null) => {
+    const p = targetProject !== undefined ? targetProject : project;
+    setSkillsLoading(true);
+    try {
+      const res = await window.neko.skillsGetStatus(p || undefined);
+      const state: SkillsProjectState | null =
+        res && typeof res === "object"
+          ? (res.state && typeof res.state === "object" ? res.state : res.skills ? res : null)
+          : null;
+      if (state) {
+        setSkillsState(state);
+      }
+    } catch (err) {
+      console.error("[SKILLS] Error loading skills state:", err);
+    } finally {
+      setSkillsLoading(false);
+    }
+  }, [project]);
+
+  const handleInstallSkill = React.useCallback(async (skillId: string) => {
+    if (!project) return;
+    const res = await window.neko.skillsInstall(skillId, project);
+    if (res?.success === false) {
+      throw new Error(res.error || "Falha ao instalar a skill.");
+    }
+    showToast(`Skill instalada com sucesso em .agents/skills/${skillId}/`, "success");
+    await loadSkillsState(project);
+  }, [project, loadSkillsState, showToast]);
+
+  const handleRemoveSkill = React.useCallback(async (skillId: string) => {
+    if (!project) return;
+    const res = await window.neko.skillsRemove(skillId, project);
+    if (res?.success === false) {
+      throw new Error(res.error || "Falha ao remover a skill.");
+    }
+    showToast(`Skill removida do projeto.`, "info");
+    await loadSkillsState(project);
+  }, [project, loadSkillsState, showToast]);
+
+  const handleRunSkill = React.useCallback(async (skillId: string) => {
+    if (!project) return;
+    const res = await window.neko.skillsGetPrompt(skillId);
+    const prompt = res?.prompt;
+    if (!prompt) {
+      throw new Error(res?.error || "Não foi possível obter a instrução da skill.");
+    }
+    setInput(prompt);
+    setSkillsPanelOpen(false);
+    setTimeout(() => {
+      composerRef.current?.focus();
+    }, 50);
+  }, [project]);
+
+  React.useEffect(() => {
+    void loadSkillsState(project);
+  }, [project, loadSkillsState]);
 
   const handleAutocompleteSelect = React.useCallback((item: ChatCommand | ChatContext | ProjectItem) => {
     if (!composerRef.current) return;
@@ -3842,6 +3954,10 @@ function App() {
           void window.neko.vercelCancelLogin().catch(() => {});
           setVercelBusy(false);
         }
+        if (modal === "chatgpt" && chatgptState.status === "authorizing") {
+          void window.neko.chatgptCancelLogin().catch(() => {});
+          setChatgptBusy(false);
+        }
         setModal(null);
         return;
       }
@@ -3897,6 +4013,11 @@ function App() {
           setVercelBusy(false);
           setModal(null);
           setVercelError(null);
+        } else if (modal === "chatgpt" && chatgptState.status === "authorizing") {
+          void window.neko.chatgptCancelLogin().catch(() => {});
+          setChatgptBusy(false);
+          setModal(null);
+          setChatgptError(null);
         } else {
           setModal(null);
           setAuthError("");
@@ -4414,6 +4535,53 @@ function App() {
       unsubLog();
     };
   }, []);
+
+  React.useEffect(() => {
+    try {
+      if (typeof window.neko?.chatgptGetState === "function") {
+        void window.neko.chatgptGetState().then((s: any) => { if (s) setChatgptState(s); }).catch((err: any) => {
+          console.warn("[ChatGPT] Falha ao carregar estado inicial:", err);
+        });
+      }
+    } catch (e) {
+      console.warn("[ChatGPT] Erro ao invocar chatgptGetState:", e);
+    }
+
+    let unsubChatgpt: (() => void) | undefined;
+    try {
+      if (typeof window.neko?.onChatgptStateChange === "function") {
+        unsubChatgpt = window.neko.onChatgptStateChange((s: any) => {
+          if (s) {
+            setChatgptState(s);
+            void loadProviders();
+          }
+        });
+      }
+    } catch (e) {
+      console.warn("[ChatGPT] Erro ao registrar onChatgptStateChange:", e);
+    }
+
+    return () => {
+      try {
+        unsubChatgpt?.();
+      } catch {}
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (modal !== "chatgpt") return;
+    if (chatgptState.status === "connected") {
+      try {
+        if (typeof window.neko?.chatgptRefreshUsage === "function") {
+          void window.neko.chatgptRefreshUsage().catch(() => {});
+        }
+      } catch {}
+    }
+    const timer = setInterval(() => {
+      setChatgptClockTick((t) => t + 1);
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [modal, chatgptState.status]);
 
   React.useEffect(() => {
     window.neko.lovableGetState().then((s: any) => {
@@ -5620,6 +5788,25 @@ function App() {
           console.log(`[Neko/TaskState] session.error ignorado pois a tarefa já foi cancelada pelo usuário (type=${type})`);
           return;
         }
+
+        const diagnostic = formatAgentError(props);
+        const errorText = diagnostic.details
+          ? `ERRO\n${diagnostic.friendly}\n\n${diagnostic.details}`
+          : `ERRO\n${diagnostic.friendly}`;
+
+        // Deduplicação: se a mesma mensagem de erro já foi emitida nos últimos 5 segundos para a mesma tarefa, não duplica o card
+        const currentTask = String(currentTaskIdRef.current || sessionIdRef.current || "");
+        if (
+          lastEmittedErrorRef.current &&
+          lastEmittedErrorRef.current.taskId === currentTask &&
+          lastEmittedErrorRef.current.text === diagnostic.friendly &&
+          Date.now() - lastEmittedErrorRef.current.time < 5000
+        ) {
+          console.log(`[Neko/TaskState] Erro duplicado suprimido para taskId=${currentTask}: ${diagnostic.friendly}`);
+          return;
+        }
+        lastEmittedErrorRef.current = { taskId: currentTask, text: diagnostic.friendly, time: Date.now() };
+
         // Terminal FAILED state: delayed events must not revive busy/working.
         taskPhaseRef.current = "failed";
         setBusy(false); setWorkingStatus("");
@@ -5635,12 +5822,14 @@ function App() {
         notifyOnce("task-error", String(currentTaskIdRef.current || "fail"));
         console.log(`[Neko/TaskState] error received type=${type} phase=->failed`);
 
-        const diagnostic = formatAgentError(props);
-        const errorText = diagnostic.details
-          ? `ERRO\n${diagnostic.friendly}\n\n${diagnostic.details}`
-          : `ERRO\n${diagnostic.friendly}`;
         appendTerminalLine("error", diagnostic.friendly, "Neko");
-        setMessages(prev => [...prev, { role: "error", text: errorText, createdAt: Date.now() }]);
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          if (last && last.role === "error" && last.text === errorText) {
+            return prev;
+          }
+          return [...prev, { role: "error", text: errorText, createdAt: Date.now() }];
+        });
 
         // Defesa em runtime: se o modelo for incompatível com chat, desativá-lo e redirecionar
         const isModelIncompatible =
@@ -6370,6 +6559,7 @@ function App() {
 
     // Track active task for duration measurement
     activeTaskRef.current = { id: taskId, startedAt: Date.now(), userIndex };
+    lastEmittedErrorRef.current = null;
 
     try {
       const result = await window.neko.prompt(
@@ -8101,6 +8291,56 @@ function App() {
     }
   }
 
+  async function handleConnectChatGpt() {
+    if (chatgptBusy) return;
+    setChatgptBusy(true);
+    setChatgptError(null);
+    try {
+      const res = await window.neko.chatgptConnect();
+      if (!res.success && res.error) {
+        setChatgptError(res.error);
+      } else {
+        void loadProviders();
+      }
+    } catch (error: any) {
+      setChatgptError(error?.message || "Erro ao conectar com ChatGPT");
+    } finally {
+      setChatgptBusy(false);
+    }
+  }
+
+  async function handleCancelChatGptLogin() {
+    setChatgptBusy(false);
+    setChatgptError(null);
+    try {
+      await window.neko.chatgptCancelLogin();
+    } catch {}
+  }
+
+  async function handleDisconnectChatGpt() {
+    if (chatgptBusy) return;
+    setChatgptBusy(true);
+    setChatgptError(null);
+    try {
+      await window.neko.chatgptDisconnect();
+      void loadProviders();
+    } catch (error: any) {
+      setChatgptError(error?.message || "Erro ao desconectar conta do ChatGPT");
+    } finally {
+      setChatgptBusy(false);
+    }
+  }
+
+  async function handleRefreshChatGptUsage() {
+    if (chatgptUsageRefreshing) return;
+    setChatgptUsageRefreshing(true);
+    try {
+      await window.neko.chatgptRefreshUsage();
+    } catch {} finally {
+      setChatgptUsageRefreshing(false);
+    }
+  }
+
   async function handleUseDetectedProject() {
     if (!project || vercelBusy || vercelState.deployment === "deploying" || !vercelState.detectedProject) return;
     setVercelBusy(true);
@@ -8327,7 +8567,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.4.99"}</span>
+                  <span>Versão {appVersion || "0.5.00"}</span>
                 </div>
                 <button
                   type="button"
@@ -8497,6 +8737,23 @@ function App() {
             </button>
             {integrationsMenuOpen && (
               <div className="titlebar-dropdown-menu">
+                <button
+                  type="button"
+                  className="titlebar-dropdown-item action"
+                  onClick={() => {
+                    setIntegrationsMenuOpen(false);
+                    setChatgptError(null);
+                    if (typeof window.neko?.chatgptGetState === "function") {
+                      void window.neko.chatgptGetState().then((s: any) => { if (s) setChatgptState(s); }).catch(() => {});
+                    } else {
+                      setChatgptError("A API do ChatGPT não está disponível nesta versão.");
+                    }
+                    setModal("chatgpt");
+                  }}
+                >
+                  <ChatGptIcon size={14} />
+                  <span>ChatGPT</span>
+                </button>
                 <button
                   type="button"
                   className="titlebar-dropdown-item action"
@@ -8758,6 +9015,34 @@ function App() {
               <span>Tutoriais</span>
             </button>
             <button
+              className={`integration-status ${chatgptState.status === "connected" ? "online" : chatgptState.status === "authorizing" ? "busy" : chatgptState.status === "error" ? "error" : "idle"}`}
+              onClick={() => {
+                setChatgptError(null);
+                if (typeof window.neko?.chatgptGetState === "function") {
+                  void window.neko.chatgptGetState().then((s: any) => { if (s) setChatgptState(s); }).catch(() => {});
+                } else {
+                  setChatgptError("A API do ChatGPT não está disponível nesta versão.");
+                }
+                setModal("chatgpt");
+              }}
+              title={
+                chatgptState.status === "connected"
+                  ? `ChatGPT — Conectado (${chatgptState.email || chatgptState.plan || "Conta pessoal"})`
+                  : chatgptState.status === "authorizing"
+                  ? "ChatGPT — Aguardando autorização no navegador..."
+                  : chatgptState.status === "error"
+                  ? `ChatGPT — Erro: ${chatgptState.error || "falha na conexão"}`
+                  : "ChatGPT — Conectar conta pessoal"
+              }
+            >
+              {chatgptState.status === "authorizing" ? (
+                <Loader2 size={16} className="spin" />
+              ) : (
+                <ChatGptIcon size={17} />
+              )}
+              <span className="integration-dot" />
+            </button>
+            <button
               className={`integration-status ${vercelState.connection === "connected" ? "online" : vercelState.deployment === "deploying" ? "busy" : vercelState.connection === "error" || vercelState.deployment === "error" ? "error" : "idle"}`}
               onClick={() => {
                 setVercelError(null);
@@ -9012,7 +9297,18 @@ function App() {
 
         <main className={`studio ${chatCollapsed ? "chat-collapsed" : ""}`}>
           <section className="chat-panel">
-            <div className="messages" ref={messagesRef}>
+            {skillsPanelOpen ? (
+              <SkillsPanel
+                projectPath={project}
+                skillsState={skillsState}
+                isLoading={skillsLoading}
+                onClose={() => setSkillsPanelOpen(false)}
+                onInstall={handleInstallSkill}
+                onRemove={handleRemoveSkill}
+                onRun={handleRunSkill}
+              />
+            ) : (
+              <div className="messages" ref={messagesRef}>
               {messages.length === 0 && <div className={`empty ${project ? "project-empty" : "no-project-empty"}`}>
                 <div className="cat"><Sparkles size={24}/></div>
                 <h2>{project ? "O que vamos construir?" : "O que vamos construir?"}</h2>
@@ -9156,6 +9452,7 @@ function App() {
                 );
               })()}
             </div>
+            )}
 
           <div className="composer-wrap">
               <div className={`composer ${isRecordingAudio || isTranscribingAudio ? "voice-recording-mode" : ""}`}>
@@ -9453,6 +9750,27 @@ function App() {
                         }}
                       />
                     )}
+                  </button>
+
+                  <button
+                    type="button"
+                    className={`composer-action-btn skills-btn ${skillsPanelOpen ? "active" : ""}`}
+                    aria-label="Agent Skills"
+                    onClick={() => {
+                      const next = !skillsPanelOpen;
+                      setSkillsPanelOpen(next);
+                      if (next && project) {
+                        void loadSkillsState(project);
+                      }
+                    }}
+                    disabled={busy || isRecordingAudio || isTranscribingAudio}
+                    title="Agent Skills — Especialidades do Agente (Playbooks de especialista)"
+                  >
+                    <Sparkles size={13} style={{ color: "#a855f7" }} />
+                    <span>Skills</span>
+                    {skillsState?.installedCount ? (
+                      <span className="skills-badge-count">{skillsState.installedCount}</span>
+                    ) : null}
                   </button>
                 </div>
 
@@ -13409,6 +13727,424 @@ function App() {
                   </div>
                 </>
               )}
+            </div>
+          )}
+        </>
+      )}
+
+      {modal === "chatgpt" && (
+        <>
+          <div className="modal-head">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div className="modal-icon" style={{ background: "rgba(16, 185, 129, 0.1)", color: "#10b981", borderColor: "rgba(16, 185, 129, 0.2)" }}>
+                <ChatGptIcon size={20}/>
+              </div>
+              <div>
+                <h2 id="modal-title">ChatGPT Pessoal</h2>
+                <p>Conecte sua conta do ChatGPT para utilizar seus modelos diretamente no NekoAI.</p>
+              </div>
+            </div>
+            <button
+              className="close-btn"
+              disabled={chatgptBusy}
+              onClick={() => {
+                if (chatgptState.status === "authorizing") {
+                  void handleCancelChatGptLogin();
+                }
+                setModal(null);
+                setChatgptError(null);
+              }}
+              aria-label="Fechar"
+            >
+              <X size={17}/>
+            </button>
+          </div>
+
+          {chatgptState.status !== "connected" ? (
+            <div className="modal-scroll-body" style={{ padding: "16px 0", paddingLeft: 4 }}>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  textAlign: "center",
+                  maxWidth: 420,
+                  margin: "0 auto",
+                  gap: 16,
+                  width: "100%",
+                  boxSizing: "border-box",
+                }}
+              >
+                <div
+                  style={{
+                    width: 64,
+                    height: 64,
+                    display: "grid",
+                    placeItems: "center",
+                    borderRadius: 18,
+                    background: "rgba(16, 185, 129, 0.1)",
+                    color: "#10b981",
+                    border: "1px solid rgba(16, 185, 129, 0.25)",
+                    boxShadow: "0 8px 30px rgba(0, 0, 0, 0.4)",
+                  }}
+                >
+                  <ChatGptIcon size={38}/>
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "center" }}>
+                  <h3 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: "#f0ebf7" }}>
+                    Conecte sua conta pessoal do ChatGPT
+                  </h3>
+                  <p style={{ margin: 0, fontSize: 12, color: "#a899b4", lineHeight: 1.5, maxWidth: 360 }}>
+                    Utilize os modelos e a franquia da sua assinatura ChatGPT (Plus, Pro, Team ou Free) sem precisar de chaves de API pagas.
+                  </p>
+                </div>
+
+                {chatgptState.status === "authorizing" ? (
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12, width: "100%" }}>
+                    <div
+                      style={{
+                        width: "100%",
+                        boxSizing: "border-box",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 14,
+                        padding: "14px 18px",
+                        background: "rgba(16, 185, 129, 0.08)",
+                        border: "1px solid rgba(16, 185, 129, 0.25)",
+                        borderRadius: 10,
+                        textAlign: "left",
+                      }}
+                    >
+                      <Loader2 size={24} className="spin" style={{ color: "#10b981", flexShrink: 0 }}/>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                        <strong style={{ display: "block", fontSize: 12.5, color: "#f3e8ff", fontWeight: 600 }}>
+                          Aguardando autorização no navegador...
+                        </strong>
+                        <span style={{ fontSize: 11, color: "#9ca3af", lineHeight: 1.4 }}>
+                          Uma página da OpenAI foi aberta no seu navegador. Conclua o login para vincular.
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary btn-sm"
+                      style={{ padding: "7px 18px", fontSize: 12 }}
+                      onClick={() => void handleCancelChatGptLogin()}
+                    >
+                      Cancelar tentativa
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", justifyContent: "center", width: "100%" }}>
+                    <button
+                      type="button"
+                      className="primary"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: 8,
+                        padding: "10px 22px",
+                        fontSize: 12.5,
+                        fontWeight: 600,
+                        borderRadius: 8,
+                        cursor: chatgptBusy ? "not-allowed" : "pointer",
+                      }}
+                      disabled={chatgptBusy}
+                      onClick={() => void handleConnectChatGpt()}
+                    >
+                      {chatgptBusy ? <Loader2 size={16} className="spin"/> : <ExternalLink size={16}/>}
+                      {chatgptState.status === "error" ? "Tentar conectar novamente" : "Conectar com ChatGPT"}
+                    </button>
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    width: "100%",
+                    maxWidth: 420,
+                    boxSizing: "border-box",
+                    padding: "12px 16px",
+                    background: "rgba(255, 255, 255, 0.03)",
+                    border: "1px solid rgba(255, 255, 255, 0.08)",
+                    borderRadius: 10,
+                    fontSize: 11.5,
+                    color: "var(--foreground-muted, #a1a1aa)",
+                    lineHeight: 1.5,
+                    textAlign: "left",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                    <ShieldCheck size={14} style={{ color: "#10b981", flexShrink: 0 }}/>
+                    <strong style={{ color: "#e4e4e7", fontSize: 12 }}>Autenticação Segura (OAuth PKCE)</strong>
+                  </div>
+                  A conexão utiliza o fluxo oficial do Codex CLI com PKCE. Seus tokens ficam protegidos pelo cofre criptografado local do Windows (DPAPI) e nunca são compartilhados.
+                </div>
+
+                {(chatgptError || chatgptState.error) && (
+                  <div
+                    className="creation-error"
+                    style={{
+                      width: "100%",
+                      maxWidth: 420,
+                      boxSizing: "border-box",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      textAlign: "center",
+                      gap: 8,
+                      padding: "9px 14px",
+                    }}
+                  >
+                    <AlertTriangle size={14} style={{ flexShrink: 0 }}/>
+                    <span>{chatgptError || chatgptState.error}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="modal-scroll-body" style={{ padding: "12px 0", paddingLeft: 4 }}>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 12,
+                  width: "100%",
+                  maxWidth: 450,
+                  margin: "0 auto",
+                  boxSizing: "border-box",
+                }}
+              >
+                {/* Account summary bar */}
+                <div
+                  className="vercel-account-bar"
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    borderRadius: 10,
+                  }}
+                >
+                  <div className="vercel-user-info">
+                    <CheckCircle2 size={16} className="text-success"/>
+                    <span>
+                      Conectado como <strong>{chatgptState.email || chatgptState.account || "Usuário ChatGPT"}</strong>
+                      {chatgptState.plan && <span style={{ marginLeft: 6, fontSize: 11, padding: "2px 6px", background: "rgba(16, 185, 129, 0.15)", color: "#34d399", borderRadius: 4, textTransform: "uppercase", fontWeight: 700 }}>{chatgptState.plan}</span>}
+                    </span>
+                  </div>
+                  <div className="vercel-account-actions">
+                    <button
+                      type="button"
+                      className="secondary btn-sm danger-action"
+                      disabled={chatgptBusy}
+                      onClick={() => void handleDisconnectChatGpt()}
+                      title="Desconectar conta do ChatGPT"
+                    >
+                      <Unplug size={13}/> Desconectar
+                    </button>
+                  </div>
+                </div>
+
+                {/* Usage / Rate limits card */}
+                <div
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: 16,
+                    background: "rgba(255, 255, 255, 0.03)",
+                    border: "1px solid rgba(255, 255, 255, 0.08)",
+                    borderRadius: 10,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600, color: "#e4e4e7" }}>
+                      <BarChart2 size={15} style={{ color: "#10b981" }}/>
+                      <span>Franquia e Limites da Conta</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary btn-sm"
+                      style={{ fontSize: 11, padding: "3px 8px" }}
+                      disabled={chatgptUsageRefreshing}
+                      onClick={() => void handleRefreshChatGptUsage()}
+                      title="Atualizar dados de uso"
+                    >
+                      <RefreshCw size={12} className={chatgptUsageRefreshing ? "animate-spin" : ""} style={{ marginRight: chatgptUsageRefreshing ? 4 : 2 }}/>
+                      {chatgptUsageRefreshing ? "Atualizando..." : "Atualizar"}
+                    </button>
+                  </div>
+
+                  {chatgptState.usage ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                      {/* Monthly limit */}
+                      <div>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontSize: 12, marginBottom: 4 }}>
+                          <span style={{ color: "#a1a1aa" }}>Limite Mensal da Conta</span>
+                          {chatgptState.usage.mensalRestante != null ? (
+                            <strong style={{ color: chatgptState.usage.mensalRestante <= 20 ? "#f87171" : "#4ade80" }}>
+                              {chatgptState.usage.mensalRestante}% restante
+                              {chatgptState.usage.mensalUsado != null && (
+                                <span style={{ fontSize: 11, fontWeight: 400, color: "#71717a", marginLeft: 4 }}>
+                                  ({chatgptState.usage.mensalUsado}% usado)
+                                </span>
+                              )}
+                            </strong>
+                          ) : (
+                            <span style={{ fontSize: 11, color: "#71717a" }}>Não aplicável neste plano</span>
+                          )}
+                        </div>
+                        {chatgptState.usage.mensalRestante != null ? (
+                          <>
+                            <div style={{ width: "100%", height: 6, background: "rgba(255, 255, 255, 0.1)", borderRadius: 3, overflow: "hidden" }}>
+                              <div
+                                style={{
+                                  width: `${Math.min(100, Math.max(0, chatgptState.usage.mensalRestante))}%`,
+                                  height: "100%",
+                                  background: chatgptState.usage.mensalRestante <= 20 ? "#ef4444" : chatgptState.usage.mensalRestante <= 50 ? "#eab308" : "#10b981",
+                                  borderRadius: 3,
+                                  transition: "width 0.3s ease",
+                                }}
+                              />
+                            </div>
+                            {chatgptState.usage.resetMensal != null && (
+                              <span style={{ fontSize: 10, color: "#71717a", marginTop: 3, display: "block" }}>
+                                {formatChatGptResetTime(chatgptState.usage.resetMensal, Date.now(), { includeDuration: true })}
+                              </span>
+                            )}
+                            {chatgptState.usage.compartilhadoDescricao && (
+                              <span style={{ fontSize: 10, color: "#a1a1aa", marginTop: 2, display: "block" }}>
+                                {chatgptState.usage.compartilhadoDescricao}
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span style={{ fontSize: 10, color: "#71717a", display: "block" }}>
+                            Esta conta utiliza limites dinâmicos por janelas de 5 horas e semanal.
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Primary window (5h) */}
+                      <div>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                          <span style={{ color: "#a1a1aa" }}>Janela Recente (5 horas)</span>
+                          <strong style={{ color: (chatgptState.usage.janela5h ?? 0) > 80 ? "#f87171" : "#4ade80" }}>
+                            {chatgptState.usage.janela5h != null ? `${chatgptState.usage.janela5h}% usado` : "Disponível"}
+                          </strong>
+                        </div>
+                        <div style={{ width: "100%", height: 6, background: "rgba(255, 255, 255, 0.1)", borderRadius: 3, overflow: "hidden" }}>
+                          <div
+                            style={{
+                              width: `${Math.min(100, Math.max(0, chatgptState.usage.janela5h ?? 0))}%`,
+                              height: "100%",
+                              background: (chatgptState.usage.janela5h ?? 0) > 80 ? "#ef4444" : (chatgptState.usage.janela5h ?? 0) > 50 ? "#eab308" : "#10b981",
+                              borderRadius: 3,
+                              transition: "width 0.3s ease",
+                            }}
+                          />
+                        </div>
+                        <span style={{ fontSize: 10, color: "#71717a", marginTop: 3, display: "block" }}>
+                          {formatChatGptResetTime(chatgptState.usage.reset5h)}
+                        </span>
+                      </div>
+
+                      {/* Secondary window (Weekly) */}
+                      {chatgptState.usage.semanal != null && (
+                        <div>
+                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                            <span style={{ color: "#a1a1aa" }}>Limite Semanal</span>
+                            <strong style={{ color: (chatgptState.usage.semanal ?? 0) > 80 ? "#f87171" : "#4ade80" }}>
+                              {chatgptState.usage.semanal}% usado
+                            </strong>
+                          </div>
+                          <div style={{ width: "100%", height: 6, background: "rgba(255, 255, 255, 0.1)", borderRadius: 3, overflow: "hidden" }}>
+                            <div
+                              style={{
+                                width: `${Math.min(100, Math.max(0, chatgptState.usage.semanal ?? 0))}%`,
+                                height: "100%",
+                                background: (chatgptState.usage.semanal ?? 0) > 80 ? "#ef4444" : "#10b981",
+                                borderRadius: 3,
+                                transition: "width 0.3s ease",
+                              }}
+                            />
+                          </div>
+                          {chatgptState.usage.resetSemanal != null && (
+                            <span style={{ fontSize: 10, color: "#71717a", marginTop: 3, display: "block" }}>
+                              {formatChatGptResetTime(chatgptState.usage.resetSemanal, Date.now(), { includeDuration: true })}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <p style={{ margin: 0, fontSize: 12, color: "#a1a1aa" }}>
+                      Limites disponíveis conforme seu plano {chatgptState.plan || "ChatGPT"}. As cotas são atualizadas dinamicamente a cada requisição.
+                    </p>
+                  )}
+                </div>
+
+                {/* Available models list */}
+                <div
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    padding: 16,
+                    background: "rgba(255, 255, 255, 0.03)",
+                    border: "1px solid rgba(255, 255, 255, 0.08)",
+                    borderRadius: 10,
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#e4e4e7", marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}>
+                    <Sparkles size={15} style={{ color: "#10b981" }}/>
+                    <span>Modelos Disponíveis no Seletor ("Meu ChatGPT")</span>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {chatgptState.models.map((m) => (
+                      <div
+                        key={m.slug}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          padding: "8px 12px",
+                          background: "rgba(255, 255, 255, 0.04)",
+                          borderRadius: 6,
+                          border: "1px solid rgba(255, 255, 255, 0.06)",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <ChatGptIcon size={15}/>
+                          <strong style={{ fontSize: 13, color: "#f4f4f5" }}>{m.nome}</strong>
+                          <span style={{ fontSize: 11, color: "#71717a" }}>({m.slug})</span>
+                        </div>
+                        <span style={{ fontSize: 11, color: "#10b981", fontWeight: 600 }}>Ativo</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {(chatgptError || chatgptState.error) && (
+                  <div
+                    className="creation-error"
+                    style={{
+                      width: "100%",
+                      boxSizing: "border-box",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      textAlign: "center",
+                      gap: 8,
+                      padding: "9px 14px",
+                    }}
+                  >
+                    <AlertTriangle size={14} style={{ flexShrink: 0 }}/>
+                    <span>{chatgptError || chatgptState.error}</span>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </>
