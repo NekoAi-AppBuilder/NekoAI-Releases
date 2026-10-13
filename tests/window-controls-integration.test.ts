@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, mock } from "bun:test";
+import { describe, it, expect, beforeEach } from "bun:test";
+import semver from "semver";
 
-describe("NekoAI Desktop — Controles da Janela & Menu Window", () => {
+describe("NekoAI Desktop — Controles da Janela & Menu Window (v0.5.01)", () => {
   // Simulador representativo do ciclo de vida BrowserWindow
   class MockBrowserWindow {
     private _isMinimized = false;
@@ -131,35 +132,18 @@ describe("NekoAI Desktop — Controles da Janela & Menu Window", () => {
       }
     }
 
-    public getMenuTemplate() {
-      return [
-        {
-          label: "Window",
-          submenu: [
-            {
-              label: "Minimizar",
-              accelerator: "CmdOrCtrl+M",
-              role: "minimize",
-              click: () => this.minimizeMainWindow()
-            },
-            {
-              label: "Maximizar",
-              click: () => this.maximizeMainWindow()
-            },
-            {
-              label: "Restaurar",
-              click: () => this.restoreMainWindow()
-            },
-            { type: "separator" },
-            {
-              label: "Fechar",
-              accelerator: "Alt+F4",
-              role: "close",
-              click: () => this.closeMainWindow()
-            }
-          ]
-        }
-      ];
+    // Ações do menu personalizado "Window" do React na barra de título
+    public handleMenuAction(action: "minimize" | "toggleMaximize" | "restore" | "close") {
+      switch (action) {
+        case "minimize":
+          return this.minimizeMainWindow();
+        case "toggleMaximize":
+          return this.toggleMaximizeMainWindow();
+        case "restore":
+          return this.restoreMainWindow();
+        case "close":
+          return this.closeMainWindow();
+      }
     }
   }
 
@@ -173,13 +157,20 @@ describe("NekoAI Desktop — Controles da Janela & Menu Window", () => {
   });
 
   describe("Controles da Barra Superior", () => {
-    it("deve minimizar a janela principal corretamente", () => {
+    it("deve minimizar a janela principal corretamente pela barra superior", () => {
       expect(win.isMinimized()).toBe(false);
       controller.minimizeMainWindow();
       expect(win.isMinimized()).toBe(true);
     });
 
-    it("deve alternar maximizar e restaurar coerentemente", () => {
+    it("deve maximizar a janela principal pela barra superior", () => {
+      win.unmaximize();
+      expect(win.isMaximized()).toBe(false);
+      controller.maximizeMainWindow();
+      expect(win.isMaximized()).toBe(true);
+    });
+
+    it("deve alternar e restaurar a janela pela barra superior", () => {
       expect(win.isMaximized()).toBe(true);
       
       // Toggle deve restaurar
@@ -195,7 +186,7 @@ describe("NekoAI Desktop — Controles da Janela & Menu Window", () => {
       expect(controller.isMainWindowMaximized()).toBe(true);
     });
 
-    it("deve fechar a janela disparando eventos de ciclo de vida", () => {
+    it("deve fechar a janela pela barra superior disparando eventos de ciclo de vida", () => {
       let closeFired = false;
       let closedFired = false;
       win.on("close", () => { closeFired = true; });
@@ -208,58 +199,41 @@ describe("NekoAI Desktop — Controles da Janela & Menu Window", () => {
     });
   });
 
-  describe("Menu Nativo Window", () => {
-    it("deve executar Window → Minimize pelo callback do menu", () => {
-      const template = controller.getMenuTemplate();
-      const windowMenu = template.find(m => m.label === "Window");
-      const minimizeItem = windowMenu?.submenu.find(i => i.label === "Minimizar");
-
-      expect(minimizeItem).toBeDefined();
-      minimizeItem?.click();
+  describe("Menu Personalizado Window (React Titlebar)", () => {
+    it("deve executar Window → Minimizar", () => {
+      expect(win.isMinimized()).toBe(false);
+      controller.handleMenuAction("minimize");
       expect(win.isMinimized()).toBe(true);
     });
 
-    it("deve executar Window → Maximize pelo callback do menu", () => {
-      win.unmaximize();
+    it("deve executar Window → Alternar / Maximizar", () => {
+      expect(win.isMaximized()).toBe(true);
+      controller.handleMenuAction("toggleMaximize");
       expect(win.isMaximized()).toBe(false);
 
-      const template = controller.getMenuTemplate();
-      const windowMenu = template.find(m => m.label === "Window");
-      const maximizeItem = windowMenu?.submenu.find(i => i.label === "Maximizar");
-
-      expect(maximizeItem).toBeDefined();
-      maximizeItem?.click();
+      controller.handleMenuAction("toggleMaximize");
       expect(win.isMaximized()).toBe(true);
     });
 
-    it("deve executar Window → Restore pelo callback do menu", () => {
+    it("deve executar Window → Restaurar", () => {
       expect(win.isMaximized()).toBe(true);
-
-      const template = controller.getMenuTemplate();
-      const windowMenu = template.find(m => m.label === "Window");
-      const restoreItem = windowMenu?.submenu.find(i => i.label === "Restaurar");
-
-      expect(restoreItem).toBeDefined();
-      restoreItem?.click();
+      controller.handleMenuAction("restore");
       expect(win.isMaximized()).toBe(false);
     });
 
-    it("deve executar Window → Close pelo callback do menu", () => {
-      const template = controller.getMenuTemplate();
-      const windowMenu = template.find(m => m.label === "Window");
-      const closeItem = windowMenu?.submenu.find(i => i.label === "Fechar");
-
-      expect(closeItem).toBeDefined();
-      closeItem?.click();
+    it("deve executar Window → Fechar", () => {
+      let closedFired = false;
+      win.on("closed", () => { closedFired = true; });
+      controller.handleMenuAction("close");
+      expect(closedFired).toBe(true);
       expect(win.isDestroyed()).toBe(true);
     });
   });
 
   describe("Integração, Segurança & Resiliência", () => {
-    it("ambos os mecanismos devem operar sobre a mesma janela principal", () => {
+    it("ambos os mecanismos (barra e menu) devem operar sobre a mesma janela principal", () => {
       // Minimizar via menu
-      const template = controller.getMenuTemplate();
-      template[0].submenu.find(i => i.label === "Minimizar")?.click();
+      controller.handleMenuAction("minimize");
       expect(win.isMinimized()).toBe(true);
 
       // Restaurar via controle superior
@@ -297,17 +271,19 @@ describe("NekoAI Desktop — Controles da Janela & Menu Window", () => {
       expect(controller.isMainWindowMaximized()).toBe(false);
     });
 
-    it("deve normalizar corretamente versões com zeros à esquerda (ex: 0.5.00 -> 0.5.0) para compatibilidade SemVer", () => {
-      const raw = "0.5.00";
-      const normalized = raw
-        .split(".")
-        .map((p) => {
-          const n = parseInt(p, 10);
-          return isNaN(n) ? p : String(n);
-        })
-        .join(".");
+    it("versão canônica 0.5.1 deve ser estritamente válida segundo SemVer 2.0.0", () => {
+      const canonicalVersion = "0.5.1";
+      const parsed = semver.parse(canonicalVersion);
+      expect(parsed).not.toBeNull();
+      expect(parsed?.major).toBe(0);
+      expect(parsed?.minor).toBe(5);
+      expect(parsed?.patch).toBe(1);
+      expect(semver.valid(canonicalVersion)).toBe("0.5.1");
+    });
 
-      expect(normalized).toBe("0.5.0");
+    it("versão canônica 0.5.1 deve ser reconhecida como maior que 0.4.99 e 0.5.0 pelo updater", () => {
+      expect(semver.gt("0.5.1", "0.4.99")).toBe(true);
+      expect(semver.gt("0.5.1", "0.5.0")).toBe(true);
     });
   });
 });

@@ -1348,7 +1348,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.5.00");
+  const [appVersion, setAppVersion] = React.useState<string>("0.5.01");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -8567,7 +8567,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.5.00"}</span>
+                  <span>Versão {appVersion || "0.5.01"}</span>
                 </div>
                 <button
                   type="button"

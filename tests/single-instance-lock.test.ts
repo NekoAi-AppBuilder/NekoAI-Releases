@@ -49,6 +49,7 @@ mock.module("electron", () => {
     WebContentsView: class {},
     webFrameMain: class {},
     dialog: { showOpenDialog: async () => {} },
+    session: { defaultSession: { setPermissionRequestHandler: () => {}, setPermissionCheckHandler: () => {} } },
     default: {
       app: {
         getPath: () => "/tmp",

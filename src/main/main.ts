@@ -48,19 +48,6 @@ import { chatGptManager } from "./chatgpt/chatgpt-manager";
 import { CHATGPT_PROVIDER_ID, CHATGPT_PROVIDER_NAME } from "./chatgpt/chatgpt-types";
 import { skillsManager } from "./skills/skills-manager";
 
-// Normaliza app.getVersion() para formato SemVer estrito (ex: "0.5.00" -> "0.5.0")
-// para garantir compatibilidade com electron-updater e bibliotecas de SemVer.
-const originalAppGetVersion = app.getVersion.bind(app);
-app.getVersion = () => {
-  const raw = originalAppGetVersion();
-  const parts = raw.split(".");
-  const normalized = parts.map((p) => {
-    const n = parseInt(p, 10);
-    return isNaN(n) ? p : String(n);
-  }).join(".");
-  return normalized;
-};
-
 // Electron/Chromium cache and Service Worker storage must not depend on a
 // redirected/synced user profile (for example OneDrive). Keep browser cache
 // data in the local Windows profile while keeping NekoAI user preferences
@@ -10199,86 +10186,6 @@ export function closeMainWindow(): void {
   }
 }
 
-function setupApplicationMenu(): void {
-  const isMac = process.platform === "darwin";
-
-  const windowSubmenu: Electron.MenuItemConstructorOptions[] = [
-    {
-      label: "Minimizar",
-      accelerator: "CmdOrCtrl+M",
-      role: "minimize",
-      click: () => {
-        minimizeMainWindow();
-      }
-    },
-    {
-      label: "Maximizar",
-      click: () => {
-        maximizeMainWindow();
-      }
-    },
-    {
-      label: "Restaurar",
-      click: () => {
-        restoreMainWindow();
-      }
-    },
-    { type: "separator" },
-    {
-      label: "Fechar",
-      accelerator: isMac ? "Cmd+W" : "Alt+F4",
-      role: "close",
-      click: () => {
-        closeMainWindow();
-      }
-    }
-  ];
-
-  const template: Electron.MenuItemConstructorOptions[] = [
-    ...(isMac ? [{ role: "appMenu" as const }] : []),
-    {
-      label: "Arquivo",
-      submenu: [
-        isMac ? { role: "close" as const } : { role: "quit" as const, label: "Sair" }
-      ]
-    },
-    {
-      label: "Editar",
-      submenu: [
-        { role: "undo" as const, label: "Desfazer" },
-        { role: "redo" as const, label: "Refazer" },
-        { type: "separator" as const },
-        { role: "cut" as const, label: "Recortar" },
-        { role: "copy" as const, label: "Copiar" },
-        { role: "paste" as const, label: "Colar" },
-        { role: "selectAll" as const, label: "Selecionar Tudo" }
-      ]
-    },
-    {
-      label: "Exibir",
-      submenu: [
-        { role: "reload" as const, label: "Recarregar" },
-        { role: "forceReload" as const, label: "Forçar Recarregamento" },
-        { role: "toggleDevTools" as const, label: "Alternar Ferramentas do Desenvolvedor" },
-        { type: "separator" as const },
-        { role: "resetZoom" as const, label: "Tamanho Real" },
-        { role: "zoomIn" as const, label: "Aumentar Zoom" },
-        { role: "zoomOut" as const, label: "Diminuir Zoom" },
-        { type: "separator" as const },
-        { role: "togglefullscreen" as const, label: "Alternar Tela Cheia" }
-      ]
-    },
-    {
-      label: "Window",
-      role: "window",
-      submenu: windowSubmenu
-    }
-  ];
-
-  const menu = Menu.buildFromTemplate(template);
-  Menu.setApplicationMenu(menu);
-}
-
 function createWindow() {
   const windowIconPath = process.platform === "win32"
     ? path.join(__dirname, "../assets/icon.ico")
@@ -10300,7 +10207,7 @@ function createWindow() {
     }
   });
 
-  setupApplicationMenu();
+  Menu.setApplicationMenu(null);
 
   mainWindow.on("maximize", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -10690,7 +10597,7 @@ app.whenReady().then(() => {
     closeMainWindow();
   });
 
-  ipcMain.handle("app:version", () => "0.5.00");
+  ipcMain.handle("app:version", () => "0.5.01");
   ipcMain.handle("renderer:report-error", (_event, payload: { type: string; message: string; filename: string; lineno: number; colno: number; stack: string }) => {
     console.error(`[BLACKSCREEN-RENDERER] ${payload.type}`, { message: payload.message?.slice(0, 500), filename: payload.filename?.slice(0, 200), lineno: payload.lineno, colno: payload.colno, stack: payload.stack?.slice(0, 1000) });
   });
