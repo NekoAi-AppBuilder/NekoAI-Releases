@@ -1348,7 +1348,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.5.01");
+  const [appVersion, setAppVersion] = React.useState<string>("0.5.02");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1885,6 +1885,17 @@ function App() {
   const modalRef = React.useRef<Modal>(modal);
   React.useEffect(() => { modalRef.current = modal; }, [modal]);
   const previousModalRef = React.useRef<Modal>(null);
+
+  // Tutorial Guiado para Commits no Git Center
+  const [gitGuideStep, setGitGuideStep] = React.useState<"commit_changes" | "select_all" | "make_commit" | "save_commit" | "push" | null>(null);
+
+  React.useEffect(() => {
+    if (modal !== "gitCenter" && modal !== "branchChanges" && modal !== "branchCommit") {
+      if (gitGuideStep !== null) {
+        setGitGuideStep(null);
+      }
+    }
+  }, [modal, gitGuideStep]);
   const [providerSearch, setProviderSearch] = React.useState("");
   const [selectedProvider, setSelectedProvider] = React.useState<Provider | null>(null);
   const [apiKey, setApiKey] = React.useState("");
@@ -2627,6 +2638,174 @@ function App() {
   React.useEffect(() => {
     setSelectedCommitFiles(new Set());
   }, [githubLinkStatus.branch]);
+
+  // Transição do tutorial guiado no modal de seleção de arquivos e limpeza ao fechar modais
+  React.useEffect(() => {
+    if (!modal && gitGuideStep) {
+      setGitGuideStep(null);
+      return;
+    }
+    if (modal === "branchChanges") {
+      if ((gitGuideStep === "select_files" || gitGuideStep === "select_all") && selectedCommitFiles.size > 0) {
+        setGitGuideStep("make_commit");
+      } else if (gitGuideStep === "make_commit" && selectedCommitFiles.size === 0) {
+        setGitGuideStep("select_files");
+      }
+    }
+  }, [modal, gitGuideStep, selectedCommitFiles.size]);
+
+  function FloatingGuideTooltipCore({
+    stepKey,
+    config,
+    onDismiss
+  }: {
+    stepKey: string;
+    config: { badge: string; title: string; desc: string; preferredPlacement?: "top" | "bottom" };
+    onDismiss: () => void;
+  }) {
+    const tooltipRef = React.useRef<HTMLDivElement>(null);
+    const [coords, setCoords] = React.useState<{ top: number; left: number; placement: "top" | "bottom"; arrowLeft: number } | null>(null);
+
+    const updatePosition = React.useCallback(() => {
+      const targetEl = document.querySelector(`[data-git-guide="${stepKey}"]`) as HTMLElement | null;
+      if (!targetEl) {
+        setCoords(null);
+        return;
+      }
+      const rect = targetEl.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        setCoords(null);
+        return;
+      }
+
+      const tooltipWidth = 280;
+      const tooltipHeight = tooltipRef.current?.offsetHeight || 115;
+      const margin = 12;
+
+      const spaceAbove = rect.top;
+      const spaceBelow = window.innerHeight - rect.bottom;
+      let placement: "top" | "bottom";
+      if (config.preferredPlacement === "bottom") {
+        placement = spaceBelow >= tooltipHeight + margin ? "bottom" : (spaceAbove >= tooltipHeight + margin ? "top" : (spaceBelow >= spaceAbove ? "bottom" : "top"));
+      } else if (config.preferredPlacement === "top") {
+        placement = spaceAbove >= tooltipHeight + margin ? "top" : (spaceBelow >= tooltipHeight + margin ? "bottom" : "top");
+      } else {
+        placement = (spaceAbove >= tooltipHeight + margin || spaceAbove > spaceBelow) ? "top" : "bottom";
+      }
+
+      let top = placement === "top" ? rect.top - tooltipHeight - margin : rect.bottom + margin;
+      top = Math.max(12, Math.min(window.innerHeight - tooltipHeight - 12, top));
+
+      let left = rect.left + (rect.width / 2) - (tooltipWidth / 2);
+      left = Math.max(12, Math.min(window.innerWidth - tooltipWidth - 12, left));
+
+      const arrowLeft = Math.max(16, Math.min(tooltipWidth - 20, (rect.left + rect.width / 2) - left));
+
+      setCoords({ top, left, placement, arrowLeft });
+    }, [stepKey, config.preferredPlacement]);
+
+    React.useLayoutEffect(() => {
+      const targetEl = document.querySelector(`[data-git-guide="${stepKey}"]`) as HTMLElement | null;
+      if (targetEl) {
+        targetEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+      updatePosition();
+      const interval = setInterval(updatePosition, 100);
+      window.addEventListener("resize", updatePosition);
+      window.addEventListener("scroll", updatePosition, true);
+      return () => {
+        clearInterval(interval);
+        window.removeEventListener("resize", updatePosition);
+        window.removeEventListener("scroll", updatePosition, true);
+      };
+    }, [stepKey, updatePosition]);
+
+    return (
+      <div
+        ref={tooltipRef}
+        className={`git-guide-floating-tooltip git-guide-floating-${coords?.placement || "top"}`}
+        style={{
+          position: "fixed",
+          top: coords ? coords.top : -9999,
+          left: coords ? coords.left : -9999,
+          width: 280,
+          zIndex: 999999,
+          visibility: coords ? "visible" : "hidden"
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div
+          className="git-guide-tooltip-arrow"
+          style={{
+            left: coords ? coords.arrowLeft : "50%"
+          }}
+        />
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <Sparkles size={13} color="#c084fc" />
+          <span className="git-guide-tooltip-badge">{config.badge}</span>
+        </div>
+        <div className="git-guide-tooltip-title">{config.title}</div>
+        <div className="git-guide-tooltip-desc">{config.desc}</div>
+        <div className="git-guide-tooltip-footer">
+          <button type="button" className="git-guide-tooltip-dismiss" onClick={onDismiss}>
+            Dispensar tutorial
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Tooltip Flutuante com Seta que Sobressai Qualquer Modal/Scroll Container (Position: Fixed)
+  const GitGuideFloatingOverlay = React.useCallback(() => {
+    if (!gitGuideStep) return null;
+
+    const stepConfigs: Record<string, { badge: string; title: string; desc: string; preferredPlacement?: "top" | "bottom" }> = {
+      commit_changes: {
+        badge: "Passo 1 de 5",
+        title: "Clique em 'Comitar alterações'",
+        desc: "Inicie o processo para preparar e salvar as alterações locais."
+      },
+      select_files: {
+        badge: "Passo 2 de 5",
+        title: "Selecione os arquivos para o commit",
+        desc: "Clique em 'Selecionar todos' ou escolha manualmente na lista os arquivos que deseja commitar.",
+        preferredPlacement: "top"
+      },
+      select_all: {
+        badge: "Passo 2 de 5",
+        title: "Selecione os arquivos para o commit",
+        desc: "Clique em 'Selecionar todos' ou escolha manualmente na lista os arquivos que deseja commitar.",
+        preferredPlacement: "top"
+      },
+      make_commit: {
+        badge: "Passo 3 de 5",
+        title: "Clique em 'Fazer Commit'",
+        desc: "Avance para definir a mensagem e salvar o commit."
+      },
+      save_commit: {
+        badge: "Passo 4 de 5",
+        title: "Mensagem e Salvar Commit",
+        desc: "Personalize a mensagem se desejar e clique em 'Salvar Commit' para salvar no repositório local.",
+        preferredPlacement: "bottom"
+      },
+      push: {
+        badge: "Passo 5 de 5 (Final)",
+        title: "Clique em 'Enviar para o GitHub'",
+        desc: "Envie as alterações commitadas para o repositório remoto e finalize."
+      }
+    };
+
+    const config = stepConfigs[gitGuideStep];
+    if (!config) return null;
+
+    return (
+      <FloatingGuideTooltipCore
+        stepKey={gitGuideStep}
+        config={config}
+        onDismiss={() => setGitGuideStep(null)}
+      />
+    );
+  }, [gitGuideStep]);
 
   // Remove caminhos selecionados que não existem mais na lista de alterações locais
   React.useEffect(() => {
@@ -4908,8 +5087,8 @@ function App() {
       console.log(`[AutoCommit] Ignorado: fase da tarefa é '${taskPhaseRef.current}'`);
       return;
     }
-    if (repairState !== "idle") {
-      console.log(`[AutoCommit] Ignorado: repairState é '${repairState}'`);
+    if (repairState === "awaiting-fix") {
+      console.log(`[AutoCommit] Ignorado: reparo de tarefa em andamento (${repairState})`);
       return;
     }
 
@@ -4923,75 +5102,51 @@ function App() {
     autoCommittedTaskIdsRef.current.add(taskId);
 
     const activeProject = projectRef.current;
-    console.log(`[AutoCommit] Disparando Auto Commit para projeto=${activeProject} taskId=${taskId}`);
 
-    appendTerminalLine("log", "Executando Auto Commit e Push das alterações da tarefa...", "GitHub");
-    showToast("Enviando alterações para o GitHub...");
-
+    // 1. Obtém status atual do Git antes de qualquer ação
+    let git: GitStatus | null = null;
     try {
-      const payload = {
-        projectPath: activeProject,
-        taskId,
-        message: "NekoAI: tarefa concluída"
-      };
-      const result = await window.neko.githubAutoCommitTask?.(payload);
-
-      if (!result) return;
-
-      if (result.ok) {
-        if (result.committed) {
-          pendingInterruptedAutoCommitRef.current = null;
-          setGitPendingSyncActive(false);
-          showToast("Alterações enviadas automaticamente para o GitHub.");
-          appendTerminalLine("log", "Alterações enviadas automaticamente para o GitHub com sucesso.", "GitHub");
-          upsertActivity({
-            id: `auto-commit:${taskId}`,
-            icon: "check",
-            title: "GitHub Auto Commit",
-            detail: "Commit e push realizados com sucesso.",
-            state: "done"
-          });
-        } else if (result.skipped && result.reason === "already-committed") {
-          console.log("[AutoCommit] Tarefa já commitada no backend.");
-        } else if (!result.committed && !result.pushed) {
-          showToast("Nenhuma alteração nova para enviar ao GitHub.");
-          appendTerminalLine("log", "Nenhuma alteração pendente para commit.", "GitHub");
-        }
-        const git = await window.neko.githubGitStatus();
+      git = await window.neko.githubGitStatus?.();
+      if (git) {
         setGithubLinkStatus(git);
-        void refreshPullRequestStatus();
-      } else {
-        if (result.recoverable || result.reason === "remote-ahead" || result.reason === "diverged" || result.reason === "push-rejected") {
-          pendingInterruptedAutoCommitRef.current = payload;
-          setGitPendingSyncActive(true);
-          if (result.syncStatus) {
-            setGitSyncStatus(result.syncStatus);
-          }
-          setGitSyncViewDiff(false);
-          setGitSyncError("");
-          const msg = result.message || "Alterações externas detectadas no GitHub. Auto Commit pausado.";
-          showToast(msg);
-          appendTerminalLine("warn", `Auto Commit pausado: ${msg}`, "GitHub");
-
-          // Busca detalhes de conflito se existirem para ativar o banner visual de notificação
-          if (result.reason === "diverged" || result.reason === "conflicts") {
-            void window.neko.githubGetConflictDetails?.().then((res: any) => {
-              if (res && Array.isArray(res.conflictFiles) && res.conflictFiles.length > 0) {
-                setGitConflictFiles(res.conflictFiles);
-              }
-            }).catch(() => {});
-          }
-        } else {
-          const errorMsg = result.message || "Erro no envio automático para o GitHub.";
-          showToast(errorMsg);
-          appendTerminalLine("error", `Falha no Auto Commit: ${errorMsg}`, "GitHub");
-        }
       }
-    } catch (err: any) {
-      const friendly = getUserFacingError(err, "Erro ao enviar alterações automáticas para o GitHub.");
-      showToast(friendly);
-      appendTerminalLine("error", `Falha no Auto Commit: ${friendly}`, "GitHub");
+    } catch (statusErr) {
+      console.warn("[AutoCommit] Erro ao obter status do Git:", statusErr);
     }
+
+    if (!git || !git.initialized || !git.linkedRepo) {
+      console.log("[AutoCommit] Repositório não inicializado ou não conectado ao GitHub.");
+      return;
+    }
+
+    const hasLocalUncommittedChanges = Boolean(git.dirty);
+    const hasLocalUnpushedCommits = Boolean(git.ahead && git.ahead > 0);
+
+    // Se houver alterações locais não commitadas:
+    // Para proteger o usuário contra envio acidental de arquivos não desejados,
+    // abre o Git Center com o Tour Guide para permitir a revisão e seleção de arquivos.
+    if (hasLocalUncommittedChanges) {
+      console.log(`[AutoCommit] Alterações locais detectadas (${(git.changedFiles || []).length} arquivos). Abrindo Git Center com tutorial guiado.`);
+      appendTerminalLine("log", "Alterações locais detectadas. Abrindo o Git Center para você selecionar e commitar com segurança.", "GitHub");
+      setModal("gitCenter");
+      setGitGuideStep("commit_changes");
+      return;
+    }
+
+    // Se a árvore estiver limpa de alterações não salvas, mas houver commits locais prontos para push:
+    if (hasLocalUnpushedCommits) {
+      console.log(`[AutoCommit] Commits locais pendentes de envio (${git.ahead}). Abrindo Git Center para envio guiado.`);
+      appendTerminalLine("log", "Commits locais prontos para envio ao GitHub detectados. Abrindo Git Center para envio.", "GitHub");
+      setModal("gitCenter");
+      setGitGuideStep("push");
+      return;
+    }
+
+    // Se a árvore estiver completamente limpa de commits e pushs:
+    console.log(`[AutoCommit] Árvore de trabalho limpa de commits e pushs para projeto=${activeProject} taskId=${taskId}`);
+    showToast("Nenhuma alteração nova para enviar ao GitHub.");
+    appendTerminalLine("log", "Árvore de trabalho limpa e em dia com o GitHub. Nenhuma alteração pendente.", "GitHub");
+    void refreshPullRequestStatus();
   }, [repairState, showToast, appendTerminalLine, upsertActivity, refreshPullRequestStatus]);
 
   const checkAndResumeAutoCommit = React.useCallback(async () => {
@@ -5001,6 +5156,9 @@ function App() {
     try {
       const res = await window.neko.githubAutoCommitTask?.(pending);
       if (res && res.ok) {
+        if (pending.taskId) {
+          autoCommittedTaskIdsRef.current.add(pending.taskId);
+        }
         pendingInterruptedAutoCommitRef.current = null;
         setGitPendingSyncActive(false);
         showToast("Auto Commit retomado e concluído com sucesso!");
@@ -5116,6 +5274,9 @@ function App() {
       void syncSessionOutput();
       // Atualiza o catálogo de rotas do Preview para refletir páginas criadas/modificadas durante a tarefa
       void loadPreviewRoutes(true);
+      // Auto Commit desacoplado: disparado diretamente ao concluir a tarefa sem bloquear na validação de Preview/Build
+      const finishTaskId = currentTaskIdRef.current || (sessionIdRef.current ? `task-${sessionIdRef.current}` : undefined);
+      void triggerAutoCommitIfEligible(finishTaskId);
       // Final validation is a wrap-up, NOT a gate: the UI is already in the
       // concluded state. It manages its own busy and may trigger bounded
       // auto-repair.
@@ -5123,7 +5284,7 @@ function App() {
         void runTaskValidation();
       }
     }
-  }, [finishActivity, completeTaskTimeline, syncSessionOutput, runTaskValidation, currentErrorSignature, busy]);
+  }, [finishActivity, completeTaskTimeline, syncSessionOutput, runTaskValidation, currentErrorSignature, busy, triggerAutoCommitIfEligible]);
 
   // Authoritative task states coming from the main-process state machine.
   // The agent cycle (running -> question/approval -> running -> completed)
@@ -7768,6 +7929,9 @@ function App() {
       setModal("gitCenter");
       setPendingTargetBranch(null);
       showToast("Commit salvo com sucesso!");
+      if (gitGuideStep === "save_commit") {
+        setGitGuideStep("push");
+      }
     } catch (error: any) {
       const errMsg = getUserFacingError(error, "Erro ao realizar commit.");
       setBranchActionError(errMsg);
@@ -7804,6 +7968,12 @@ function App() {
       setGithubLinkStatus(git);
       void refreshPullRequestStatus();
       showToast("Alterações enviadas para o GitHub com sucesso!");
+      if (gitGuideStep === "push") {
+        setGitGuideStep(null);
+      }
+      if (currentTaskIdRef.current) {
+        autoCommittedTaskIdsRef.current.add(currentTaskIdRef.current);
+      }
     } catch (error: any) {
       const errMsg = getUserFacingError(error, "Erro ao enviar para o GitHub.");
       showToast(errMsg);
@@ -8567,7 +8737,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.5.01"}</span>
+                  <span>Versão {appVersion || "0.5.02"}</span>
                 </div>
                 <button
                   type="button"
@@ -10703,6 +10873,21 @@ function App() {
                     console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
                   }
                 }
+                if (next) {
+                  try {
+                    const git = await window.neko.githubGitStatus?.();
+                    if (git) {
+                      setGithubLinkStatus(git);
+                      if (git.dirty) {
+                        setModal("gitCenter");
+                        setGitGuideStep("commit_changes");
+                      } else if (git.ahead && git.ahead > 0) {
+                        setModal("gitCenter");
+                        setGitGuideStep("push");
+                      }
+                    }
+                  } catch {}
+                }
               }}
               style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", userSelect: "none" }}
             >
@@ -10719,6 +10904,21 @@ function App() {
                     } catch (err) {
                       console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
                     }
+                  }
+                  if (next) {
+                    try {
+                      const git = await window.neko.githubGitStatus?.();
+                      if (git) {
+                        setGithubLinkStatus(git);
+                        if (git.dirty) {
+                          setModal("gitCenter");
+                          setGitGuideStep("commit_changes");
+                        } else if (git.ahead && git.ahead > 0) {
+                          setModal("gitCenter");
+                          setGitGuideStep("push");
+                        }
+                      }
+                    } catch {}
                   }
                 }}
                 style={{ marginTop: 2, cursor: "pointer", width: 14, height: 14, flex: "0 0 auto", flexShrink: 0, accentColor: "#a855f7" }}
@@ -11304,185 +11504,210 @@ function App() {
           <button className="close-btn" disabled={branchActionBusy} onClick={() => { if (pendingTargetBranch) { setModal(null); setPendingTargetBranch(null); } else { setModal("gitCenter"); } }} aria-label="Fechar"><X size={17}/></button>
         </div>
         <div className="modal-scroll-body branch-changes-modal-body">
+
+
           {pendingTargetBranch ? (
             <div className="branch-target-banner">
               <span>Antes de trocar para a branch <b>{pendingTargetBranch}</b>, escolha as alterações que deseja comitar:</span>
             </div>
           ) : null}
 
-          {/* Barra de Ações Globais & Contador */}
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8, padding: "8px 12px", background: "rgba(255, 255, 255, 0.03)", borderRadius: 8, border: "1px solid rgba(255, 255, 255, 0.06)" }}>
-            <span style={{ fontSize: 12, color: "#c2b6cf", fontWeight: 600 }}>
-              {selectedCommitFiles.size} de {allChangedFiles.length} arquivo{allChangedFiles.length !== 1 ? "s" : ""} selecionado{selectedCommitFiles.size !== 1 ? "s" : ""}
-            </span>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                type="button"
-                className="secondary btn-sm"
-                onClick={async () => {
-                  try {
-                    const git = await window.neko.githubGitStatus();
-                    setGithubLinkStatus(git);
-                    showToast("Alterações locais atualizadas.");
-                  } catch {
-                    showToast("Erro ao atualizar alterações locais.");
-                  }
-                }}
-                style={{ fontSize: 11, padding: "3px 10px", display: "inline-flex", alignItems: "center", gap: 4 }}
-                title="Recarregar arquivos alterados"
-              >
-                <RefreshCw size={11}/> Atualizar
-              </button>
-              <button
-                type="button"
-                className="secondary btn-sm"
-                onClick={selectAllFiles}
-                style={{ fontSize: 11, padding: "3px 10px" }}
-              >
-                Selecionar todos
-              </button>
-              <button
-                type="button"
-                className="secondary btn-sm"
-                onClick={deselectAllFiles}
-                style={{ fontSize: 11, padding: "3px 10px" }}
-              >
-                Desmarcar todos
-              </button>
-            </div>
-          </div>
-
-          {/* Listagem com Checkboxes dividida por Grupos */}
-          <div className="branch-files-drawer" style={{ display: "block", maxHeight: "340px", overflowY: "auto" }}>
-            {allChangedFiles.length > 0 ? (
-              <div>
-                {/* Grupo: MODIFICADOS */}
-                {modifiedFiles.length > 0 && (() => {
-                  const groupState = getGroupCheckboxState(modifiedFiles);
-                  return (
-                    <div style={{ marginBottom: 14 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
-                        <GroupCheckbox
-                          checked={groupState.checked}
-                          indeterminate={groupState.indeterminate}
-                          onChange={() => toggleGroupSelection(modifiedFiles)}
-                        />
-                        <span style={{ fontSize: 11, fontWeight: 700, color: "#fde047", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                          MODIFICADOS ({modifiedFiles.length})
-                        </span>
-                      </div>
-                      <div className="branch-files-list">
-                        {modifiedFiles.map(f => (
-                          <div
-                            className="branch-file-item"
-                            key={f.path}
-                            style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
-                            onClick={() => toggleFileSelection(f.path)}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={selectedCommitFiles.has(f.path)}
-                              onChange={() => {}}
-                              style={{ cursor: "pointer", accentColor: "#a855f7" }}
-                            />
-                            <span className="branch-file-badge modified">MODIFICADO</span>
-                            <span className="branch-file-path" title={f.path}>{f.path}</span>
-                            {f.staged ? <span className="branch-staged-tag">staged</span> : null}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })()}
-
-                {/* Grupo: NOVOS */}
-                {newFiles.length > 0 && (() => {
-                  const groupState = getGroupCheckboxState(newFiles);
-                  return (
-                    <div style={{ marginBottom: 14 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
-                        <GroupCheckbox
-                          checked={groupState.checked}
-                          indeterminate={groupState.indeterminate}
-                          onChange={() => toggleGroupSelection(newFiles)}
-                        />
-                        <span style={{ fontSize: 11, fontWeight: 700, color: "#86efac", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                          NOVOS ({newFiles.length})
-                        </span>
-                      </div>
-                      <div className="branch-files-list">
-                        {newFiles.map(f => (
-                          <div
-                            className="branch-file-item"
-                            key={f.path}
-                            style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
-                            onClick={() => toggleFileSelection(f.path)}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={selectedCommitFiles.has(f.path)}
-                              onChange={() => {}}
-                              style={{ cursor: "pointer", accentColor: "#a855f7" }}
-                            />
-                            <span className="branch-file-badge added">NOVO</span>
-                            <span className="branch-file-path" title={f.path}>{f.path}</span>
-                            {f.staged ? <span className="branch-staged-tag">staged</span> : null}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })()}
-
-                {/* Grupo: EXCLUÍDOS */}
-                {deletedFiles.length > 0 && (() => {
-                  const groupState = getGroupCheckboxState(deletedFiles);
-                  return (
-                    <div style={{ marginBottom: 14 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
-                        <GroupCheckbox
-                          checked={groupState.checked}
-                          indeterminate={groupState.indeterminate}
-                          onChange={() => toggleGroupSelection(deletedFiles)}
-                        />
-                        <span style={{ fontSize: 11, fontWeight: 700, color: "#fca5a5", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                          EXCLUÍDOS ({deletedFiles.length})
-                        </span>
-                      </div>
-                      <div className="branch-files-list">
-                        {deletedFiles.map(f => (
-                          <div
-                            className="branch-file-item"
-                            key={f.path}
-                            style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
-                            onClick={() => toggleFileSelection(f.path)}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={selectedCommitFiles.has(f.path)}
-                              onChange={() => {}}
-                              style={{ cursor: "pointer", accentColor: "#a855f7" }}
-                            />
-                            <span className="branch-file-badge deleted">EXCLUÍDO</span>
-                            <span className="branch-file-path" title={f.path}>{f.path}</span>
-                            {f.staged ? <span className="branch-staged-tag">staged</span> : null}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  );
-                })()}
+          {/* Container Abrangente de Seleção de Arquivos (Tour Guide Passo 2) */}
+          <div
+            data-git-guide="select_files"
+            className={`branch-files-selection-area ${(gitGuideStep === "select_files" || gitGuideStep === "select_all") ? "git-guide-target-area" : ""}`}
+            style={{
+              padding: (gitGuideStep === "select_files" || gitGuideStep === "select_all") ? 8 : 0,
+              marginBottom: 12,
+              borderRadius: 10,
+              transition: "all 0.2s ease"
+            }}
+          >
+            {/* Barra de Ações Globais & Contador */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 8, padding: "8px 12px", background: "rgba(255, 255, 255, 0.03)", borderRadius: 8, border: "1px solid rgba(255, 255, 255, 0.06)" }}>
+              <span style={{ fontSize: 12, color: "#c2b6cf", fontWeight: 600 }}>
+                {selectedCommitFiles.size} de {allChangedFiles.length} arquivo{allChangedFiles.length !== 1 ? "s" : ""} selecionado{selectedCommitFiles.size !== 1 ? "s" : ""}
+              </span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  type="button"
+                  className="secondary btn-sm"
+                  onClick={async () => {
+                    try {
+                      const git = await window.neko.githubGitStatus();
+                      setGithubLinkStatus(git);
+                      showToast("Alterações locais atualizadas.");
+                    } catch {
+                      showToast("Erro ao atualizar alterações locais.");
+                    }
+                  }}
+                  style={{ fontSize: 11, padding: "3px 10px", display: "inline-flex", alignItems: "center", gap: 4 }}
+                  title="Recarregar arquivos alterados"
+                >
+                  <RefreshCw size={11}/> Atualizar
+                </button>
+                <button
+                  type="button"
+                  className={`secondary btn-sm ${(gitGuideStep === "select_files" || gitGuideStep === "select_all") ? "git-guide-target-pulse" : ""}`}
+                  onClick={() => {
+                    selectAllFiles();
+                  }}
+                  style={{
+                    fontSize: 11,
+                    padding: "3px 10px",
+                    ...((gitGuideStep === "select_files" || gitGuideStep === "select_all") ? {
+                      background: "#a855f7",
+                      color: "#fff",
+                      borderColor: "#a855f7",
+                      fontWeight: 600
+                    } : {})
+                  }}
+                >
+                  Selecionar todos
+                </button>
+                <button
+                  type="button"
+                  className="secondary btn-sm"
+                  onClick={deselectAllFiles}
+                  style={{ fontSize: 11, padding: "3px 10px" }}
+                >
+                  Desmarcar todos
+                </button>
               </div>
-            ) : (
-              <div className="branch-files-empty">Nenhum arquivo listado.</div>
-            )}
+            </div>
+
+            {/* Listagem com Checkboxes dividida por Grupos */}
+            <div className="branch-files-drawer" style={{ display: "block", maxHeight: "340px", overflowY: "auto" }}>
+              {allChangedFiles.length > 0 ? (
+                <div>
+                  {/* Grupo: MODIFICADOS */}
+                  {modifiedFiles.length > 0 && (() => {
+                    const groupState = getGroupCheckboxState(modifiedFiles);
+                    return (
+                      <div style={{ marginBottom: 14 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
+                          <GroupCheckbox
+                            checked={groupState.checked}
+                            indeterminate={groupState.indeterminate}
+                            onChange={() => toggleGroupSelection(modifiedFiles)}
+                          />
+                          <span style={{ fontSize: 11, fontWeight: 700, color: "#fde047", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                            MODIFICADOS ({modifiedFiles.length})
+                          </span>
+                        </div>
+                        <div className="branch-files-list">
+                          {modifiedFiles.map(f => (
+                            <div
+                              className="branch-file-item"
+                              key={f.path}
+                              style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
+                              onClick={() => toggleFileSelection(f.path)}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selectedCommitFiles.has(f.path)}
+                                onChange={() => {}}
+                                style={{ cursor: "pointer", accentColor: "#a855f7" }}
+                              />
+                              <span className="branch-file-badge modified">MODIFICADO</span>
+                              <span className="branch-file-path" title={f.path}>{f.path}</span>
+                              {f.staged ? <span className="branch-staged-tag">staged</span> : null}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Grupo: NOVOS */}
+                  {newFiles.length > 0 && (() => {
+                    const groupState = getGroupCheckboxState(newFiles);
+                    return (
+                      <div style={{ marginBottom: 14 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
+                          <GroupCheckbox
+                            checked={groupState.checked}
+                            indeterminate={groupState.indeterminate}
+                            onChange={() => toggleGroupSelection(newFiles)}
+                          />
+                          <span style={{ fontSize: 11, fontWeight: 700, color: "#86efac", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                            NOVOS ({newFiles.length})
+                          </span>
+                        </div>
+                        <div className="branch-files-list">
+                          {newFiles.map(f => (
+                            <div
+                              className="branch-file-item"
+                              key={f.path}
+                              style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
+                              onClick={() => toggleFileSelection(f.path)}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selectedCommitFiles.has(f.path)}
+                                onChange={() => {}}
+                                style={{ cursor: "pointer", accentColor: "#a855f7" }}
+                              />
+                              <span className="branch-file-badge added">NOVO</span>
+                              <span className="branch-file-path" title={f.path}>{f.path}</span>
+                              {f.staged ? <span className="branch-staged-tag">staged</span> : null}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Grupo: EXCLUÍDOS */}
+                  {deletedFiles.length > 0 && (() => {
+                    const groupState = getGroupCheckboxState(deletedFiles);
+                    return (
+                      <div style={{ marginBottom: 14 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, padding: "5px 10px", background: "rgba(255, 255, 255, 0.05)", borderRadius: 6 }}>
+                          <GroupCheckbox
+                            checked={groupState.checked}
+                            indeterminate={groupState.indeterminate}
+                            onChange={() => toggleGroupSelection(deletedFiles)}
+                          />
+                          <span style={{ fontSize: 11, fontWeight: 700, color: "#fca5a5", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                            EXCLUÍDOS ({deletedFiles.length})
+                          </span>
+                        </div>
+                        <div className="branch-files-list">
+                          {deletedFiles.map(f => (
+                            <div
+                              className="branch-file-item"
+                              key={f.path}
+                              style={{ gap: 10, cursor: "pointer", userSelect: "none" }}
+                              onClick={() => toggleFileSelection(f.path)}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selectedCommitFiles.has(f.path)}
+                                onChange={() => {}}
+                                style={{ cursor: "pointer", accentColor: "#a855f7" }}
+                              />
+                              <span className="branch-file-badge deleted">EXCLUÍDO</span>
+                              <span className="branch-file-path" title={f.path}>{f.path}</span>
+                              {f.staged ? <span className="branch-staged-tag">staged</span> : null}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <div className="branch-files-empty">Nenhum arquivo listado.</div>
+              )}
+            </div>
           </div>
 
           {branchActionError && <div className="auth-error">{branchActionError}</div>}
         </div>
-        <div className="modal-actions branch-modal-actions">
-          <button className="secondary" disabled={branchActionBusy} onClick={() => { if (pendingTargetBranch) { setModal(null); setPendingTargetBranch(null); } else { setModal("gitCenter"); } }}>Cancelar</button>
-          <button className="secondary danger-btn" disabled={branchActionBusy} onClick={() => setModal("branchDiscardConfirm")}>
+        <div className={`modal-actions branch-modal-actions ${(gitGuideStep === "select_all" || gitGuideStep === "select_files") ? "git-guide-dimmed" : ""}`}>
+          <button className={`secondary ${gitGuideStep === "make_commit" ? "git-guide-dimmed" : ""}`} disabled={branchActionBusy} onClick={() => { if (pendingTargetBranch) { setModal(null); setPendingTargetBranch(null); } else { setModal("gitCenter"); } }}>Cancelar</button>
+          <button className={`secondary danger-btn ${gitGuideStep === "make_commit" ? "git-guide-dimmed" : ""}`} disabled={branchActionBusy} onClick={() => setModal("branchDiscardConfirm")}>
             <Trash2 size={14}/> Descartar alterações
           </button>
           {pendingTargetBranch ? (
@@ -11496,7 +11721,23 @@ function App() {
               </button>
             )
           ) : (
-            <button className="primary" disabled={branchActionBusy || selectedCommitFiles.size === 0} onClick={() => setModal("branchCommit")}>
+            <button
+              type="button"
+              data-git-guide="make_commit"
+              className={`primary ${gitGuideStep === "make_commit" ? "git-guide-target-pulse" : ""}`}
+              disabled={branchActionBusy || selectedCommitFiles.size === 0}
+              style={gitGuideStep === "make_commit" ? {
+                background: "#a855f7",
+                borderColor: "#a855f7",
+                fontWeight: 600
+              } : undefined}
+              onClick={() => {
+                setModal("branchCommit");
+                if (gitGuideStep === "make_commit") {
+                  setGitGuideStep("save_commit");
+                }
+              }}
+            >
               <Check size={14}/> Fazer Commit {selectedCommitFiles.size > 0 ? `(${selectedCommitFiles.size} ${selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})` : ""}
             </button>
           )}
@@ -11559,21 +11800,38 @@ function App() {
           <button className="close-btn" disabled={branchActionBusy} onClick={() => setModal("branchChanges")} aria-label="Fechar"><X size={17}/></button>
         </div>
         <div className="modal-scroll-body branch-commit-modal-body">
-          <label>Mensagem do Commit</label>
-          <textarea
-            className="branch-commit-textarea"
-            rows={3}
-            value={branchCommitMessage}
-            onChange={e => setBranchCommitMessage(e.target.value)}
-            placeholder="Descreva as alterações realizadas..."
-            autoFocus
-          />
-          <div className="branch-commit-help">
-            {pendingTargetBranch ? (
-              <span>Após o commit, o NekoAI trocará automaticamente para <b>{pendingTargetBranch}</b>.</span>
-            ) : (
-              <span>As alterações selecionadas serão salvas em um novo commit neste projeto.</span>
-            )}
+
+          <div
+            className={gitGuideStep === "save_commit" ? "git-guide-target-input-area" : ""}
+            style={{ marginBottom: 12 }}
+          >
+            <label style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+              <span style={{ fontWeight: 600 }}>Mensagem do Commit</span>
+              {gitGuideStep === "save_commit" && (
+                <span style={{ fontSize: 10, color: "#c084fc", fontWeight: 500 }}>
+                  Você pode personalizar esta mensagem
+                </span>
+              )}
+            </label>
+            <textarea
+              className="branch-commit-textarea"
+              rows={3}
+              value={branchCommitMessage}
+              onChange={e => setBranchCommitMessage(e.target.value)}
+              placeholder="Descreva as alterações realizadas..."
+              style={gitGuideStep === "save_commit" ? {
+                borderColor: "#a855f7",
+                boxShadow: "0 0 12px rgba(168, 85, 247, 0.25)"
+              } : undefined}
+              autoFocus
+            />
+            <div className="branch-commit-help" style={{ marginTop: 6 }}>
+              {pendingTargetBranch ? (
+                <span>Após o commit, o NekoAI trocará automaticamente para <b>{pendingTargetBranch}</b>.</span>
+              ) : (
+                <span>As alterações selecionadas serão salvas em um novo commit neste projeto.</span>
+              )}
+            </div>
           </div>
           {branchActionError && (
             <div className="auth-error" style={{ display: "flex", flexDirection: "column", gap: 8, whiteSpace: "pre-line" }}>
@@ -11601,13 +11859,29 @@ function App() {
           )}
         </div>
         <div className="modal-actions branch-modal-actions">
-          <button className="secondary" disabled={branchActionBusy} onClick={() => setModal("branchChanges")}>Voltar</button>
+          <button className={`secondary ${gitGuideStep === "save_commit" ? "git-guide-dimmed" : ""}`} disabled={branchActionBusy} onClick={() => setModal("branchChanges")}>Voltar</button>
           {pendingTargetBranch ? (
             <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0} onClick={() => void handleBranchCommitAndCheckout()}>
               {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando e trocando...</> : <><Check size={14}/> Salvar e trocar para {pendingTargetBranch} ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})</>}
             </button>
           ) : (
-            <button className="primary" disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0} onClick={() => void handleManualGitCenterCommit()}>
+            <button
+              type="button"
+              data-git-guide="save_commit"
+              className={`primary ${gitGuideStep === "save_commit" ? "git-guide-target-pulse" : ""}`}
+              disabled={!branchCommitMessage.trim() || branchActionBusy || selectedCommitFiles.size === 0}
+              style={gitGuideStep === "save_commit" ? {
+                background: "#a855f7",
+                borderColor: "#a855f7",
+                fontWeight: 600
+              } : undefined}
+              onClick={() => {
+                if (gitGuideStep === "save_commit") {
+                  setGitGuideStep("push");
+                }
+                void handleManualGitCenterCommit();
+              }}
+            >
               {branchActionBusy ? <><Loader2 size={15} className="spin"/> Salvando commit...</> : <><Check size={14}/> Salvar Commit ({selectedCommitFiles.size} {selectedCommitFiles.size === 1 ? "arquivo" : "arquivos"})</>}
             </button>
           )}
@@ -11849,8 +12123,10 @@ function App() {
             </div>
 
             <div className="modal-scroll-body branch-changes-modal-body" style={{ gap: 14, display: "flex", flexDirection: "column" }}>
+
+
               {/* Banner Sintético de Situação */}
-              <div style={{
+              <div className={gitGuideStep ? "git-guide-dimmed" : ""} style={{
                 padding: "12px 14px",
                 borderRadius: 8,
                 background: `${statusBadgeColor}12`,
@@ -11878,7 +12154,7 @@ function App() {
               </div>
 
               {/* Card 1: Repositório & Conta GitHub */}
-              <div className="settings-section-card" style={{ padding: 14 }}>
+              <div className={`settings-section-card ${gitGuideStep ? "git-guide-dimmed" : ""}`} style={{ padding: 14 }}>
                 <div className="settings-section-head" style={{ paddingBottom: 8, marginBottom: 8 }}>
                   <div className="settings-section-title" style={{ fontSize: 12.5 }}>
                     <GitHubIcon size={15} /> <span>Repositório & Conexão GitHub</span>
@@ -11957,14 +12233,29 @@ function App() {
                   {isDirty && (
                     <button
                       type="button"
-                      className="primary btn-sm"
-                      style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
+                      data-git-guide="commit_changes"
+                      className={`primary btn-sm ${gitGuideStep === "commit_changes" ? "git-guide-target-pulse" : (gitGuideStep ? "git-guide-dimmed" : "")}`}
+                      style={{
+                        fontSize: 11,
+                        padding: "4px 10px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        ...(gitGuideStep === "commit_changes" ? {
+                          background: "#a855f7",
+                          borderColor: "#a855f7",
+                          fontWeight: 600
+                        } : {})
+                      }}
                       onClick={() => {
                         setPendingTargetBranch(null);
                         setBranchCommitMessage("Atualizações no projeto");
                         setSelectedCommitFiles(new Set());
                         setBranchActionError("");
                         setModal("branchChanges");
+                        if (gitGuideStep === "commit_changes") {
+                          setGitGuideStep("select_files");
+                        }
                       }}
                     >
                       <Check size={12} /> Comitar alterações ({changedCount})
@@ -11973,10 +12264,25 @@ function App() {
                   {ahead > 0 && isAccessible && (
                     <button
                       type="button"
-                      className="primary btn-sm"
+                      data-git-guide="push"
+                      className={`primary btn-sm ${gitGuideStep === "push" ? "git-guide-target-pulse" : (gitGuideStep ? "git-guide-dimmed" : "")}`}
                       disabled={gitPushBusy}
-                      style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5, background: "#a855f7", borderColor: "#a855f7" }}
-                      onClick={() => void handleManualGitPush()}
+                      style={{
+                        fontSize: 11,
+                        padding: "4px 10px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        background: "#a855f7",
+                        borderColor: "#a855f7",
+                        fontWeight: 600
+                      }}
+                      onClick={async () => {
+                        await handleManualGitPush();
+                        if (gitGuideStep === "push") {
+                          setGitGuideStep(null);
+                        }
+                      }}
                       title="Enviar commits locais para o repositório no GitHub"
                     >
                       {gitPushBusy ? <><Loader2 size={12} className="spin" /> Enviando...</> : <><CloudUpload size={12} /> Enviar para o GitHub ({ahead})</>}
@@ -11985,7 +12291,7 @@ function App() {
                   {(behind > 0 || diverged) && (
                     <button
                       type="button"
-                      className="secondary btn-sm"
+                      className={`secondary btn-sm ${gitGuideStep ? "git-guide-dimmed" : ""}`}
                       style={{ fontSize: 11, padding: "4px 10px", display: "inline-flex", alignItems: "center", gap: 5 }}
                       onClick={async () => {
                         try {
@@ -12013,7 +12319,7 @@ function App() {
                   return null;
                 }
                 return (
-                  <div className="settings-section-card" style={{ padding: 14 }}>
+                  <div className={`settings-section-card ${gitGuideStep ? "git-guide-dimmed" : ""}`} style={{ padding: 14 }}>
                     <div className="settings-section-head" style={{ paddingBottom: 8, marginBottom: 8 }}>
                       <div className="settings-section-title" style={{ fontSize: 12.5 }}>
                         <GitPullRequest size={15} color="#38bdf8" /> <span>Pull Requests</span>
@@ -12211,7 +12517,7 @@ function App() {
               })()}
             </div>
 
-            <div className="modal-actions branch-modal-actions">
+            <div className={`modal-actions branch-modal-actions ${gitGuideStep ? "git-guide-dimmed" : ""}`}>
               <button className="secondary" onClick={() => setModal(null)}>Fechar</button>
               <button className="secondary" onClick={() => {
                 previousModalRef.current = "gitCenter";
@@ -14982,6 +15288,8 @@ function App() {
       </div>,
       document.body
     )}
+
+    {gitGuideStep && createPortal(<GitGuideFloatingOverlay />, document.body)}
     </div>
   );
 }

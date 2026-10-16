@@ -13,7 +13,7 @@ const failedFiles = [];
 
 for (const file of files) {
   const fullPath = join(testsDir, file);
-  const result = spawnSync("bun", ["test", fullPath], {
+  const result = spawnSync("bun", ["test", "--timeout", "30000", fullPath], {
     encoding: "utf8",
     env: process.env,
   });

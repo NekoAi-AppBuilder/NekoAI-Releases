@@ -6,6 +6,7 @@ import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { normalizeOpenCodeEvent, clearStatusCache, clearStatusCacheForSession } from "./events/normalizer";
 import { shouldIgnoreEventPath } from "./events/filters";
 import { perfEnabled, perfTaskStart, perfMark, perfCountEvent, perfUploadBytes, perfFlushTask, perfRetryStart, perfRetryEnd } from "./perf";
@@ -1800,27 +1801,40 @@ async function ensureGitignore(projectPath: string): Promise<void> {
 }
 
 const gitProjectLocks = new Map<string, Promise<any>>();
+const projectGitLockStorage = new AsyncLocalStorage<Set<string>>();
 
 async function withProjectGitLock<T>(projectPath: string, task: () => Promise<T>): Promise<T> {
   const key = path.resolve(projectPath);
+  const currentHeld = projectGitLockStorage.getStore();
+  if (currentHeld?.has(key)) {
+    // Reentrância detectada: o contexto assíncrono atual já possui o lock deste projeto
+    return await task();
+  }
+
   const previous = gitProjectLocks.get(key) || Promise.resolve();
   let release: () => void;
   const current = new Promise<void>(res => { release = res; });
-  gitProjectLocks.set(key, previous.then(() => current, () => current));
+  const chained = previous.then(() => current, () => current);
+  gitProjectLocks.set(key, chained);
 
-  try {
-    await previous;
-    await cleanupStaleGitLocks(projectPath);
-    return await task();
-  } finally {
+  const nextHeld = new Set(currentHeld || []);
+  nextHeld.add(key);
+
+  return projectGitLockStorage.run(nextHeld, async () => {
     try {
+      await previous;
       await cleanupStaleGitLocks(projectPath);
-    } catch {}
-    release!();
-    if (gitProjectLocks.get(key) === current) {
-      gitProjectLocks.delete(key);
+      return await task();
+    } finally {
+      try {
+        await cleanupStaleGitLocks(projectPath);
+      } catch {}
+      release!();
+      if (gitProjectLocks.get(key) === chained) {
+        gitProjectLocks.delete(key);
+      }
     }
-  }
+  });
 }
 
 function isProjectGitLocked(projectPath: string): boolean {
@@ -6758,7 +6772,7 @@ async function performGithubCommitPush(
     if (!status.initialized || !status.remote || !status.linkedRepo) {
       throw new Error("Este projeto ainda não está conectado a um repositório GitHub.");
     }
-    const token = await getGithubAccessToken();
+    const token = await getGithubAccessToken(safePath);
     const branch = status.branch || "main";
 
     // Ensure .gitignore exists and is populated
@@ -6904,7 +6918,7 @@ async function performGithubPush(projectPath: string): Promise<{ ok: boolean; pu
     if (!status.initialized || !status.remote || !status.linkedRepo) {
       throw new Error("Este projeto ainda não está conectado a um repositório GitHub.");
     }
-    const token = await getGithubAccessToken();
+    const token = await getGithubAccessToken(safePath);
     const branch = status.branch || "main";
 
     // Pre-check sync status with remote
@@ -7019,8 +7033,8 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
     return { ok: false, skipped: true, reason: "not-linked", message: "Este projeto não está conectado a um repositório GitHub." };
   }
 
-  // 4. Se não houver alterações pendentes, não tenta commit nem push desnecessário
-  if (!gitStatus.dirty) {
+  // 4. Se não houver alterações pendentes nem commits locais a enviar, não tenta commit nem push desnecessário
+  if (!gitStatus.dirty && (!gitStatus.ahead || gitStatus.ahead <= 0)) {
     return { ok: true, committed: false, pushed: false, status: gitStatus, message: "Nenhuma alteração nova para enviar ao GitHub." };
   }
 
@@ -7052,30 +7066,28 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
     };
   }
 
-  return withProjectGitLock(projectPath, async () => {
-    try {
-      const commitMessage = payload?.message || "NekoAI: tarefa concluída";
-      const result = await performGithubCommitPush(projectPath, commitMessage, { isAuto: true });
-      if (taskId && result.ok) {
-        autoCommittedTaskIds.add(taskId);
-      }
-      return result;
-    } catch (err: any) {
-      const errMsg = err?.message || String(err);
-      console.warn(`[Neko/AutoCommit] Falha recuperável no Auto Commit: ${errMsg}`);
-      const isPushRejected = /push|rejected|non-fast-forward|failed to push/i.test(errMsg);
-      const isAuthError = /authentication|permission|denied|token|credentials/i.test(errMsg);
-
-      return {
-        ok: false,
-        skipped: false,
-        recoverable: true,
-        reason: isPushRejected ? "push-rejected" : (isAuthError ? "auth-error" : "git-error"),
-        status: await getGitStatus(projectPath).catch(() => undefined),
-        message: `Falha temporária no Auto Commit: ${errMsg}`
-      };
+  try {
+    const commitMessage = payload?.message || "NekoAI: tarefa concluída";
+    const result = await performGithubCommitPush(projectPath, commitMessage, { isAuto: true });
+    if (taskId && result.ok) {
+      autoCommittedTaskIds.add(taskId);
     }
-  });
+    return result;
+  } catch (err: any) {
+    const errMsg = err?.message || String(err);
+    console.warn(`[Neko/AutoCommit] Falha recuperável no Auto Commit: ${errMsg}`);
+    const isPushRejected = /push|rejected|non-fast-forward|failed to push/i.test(errMsg);
+    const isAuthError = /authentication|permission|denied|token|credentials/i.test(errMsg);
+
+    return {
+      ok: false,
+      skipped: false,
+      recoverable: true,
+      reason: isPushRejected ? "push-rejected" : (isAuthError ? "auth-error" : "git-error"),
+      status: await getGitStatus(projectPath).catch(() => undefined),
+      message: `Falha temporária no Auto Commit: ${errMsg}`
+    };
+  }
 });
 
 ipcMain.handle("github:getAutoCommit", async (_event, projectPath?: string) => {
@@ -10597,7 +10609,7 @@ app.whenReady().then(() => {
     closeMainWindow();
   });
 
-  ipcMain.handle("app:version", () => "0.5.01");
+  ipcMain.handle("app:version", () => "0.5.02");
   ipcMain.handle("renderer:report-error", (_event, payload: { type: string; message: string; filename: string; lineno: number; colno: number; stack: string }) => {
     console.error(`[BLACKSCREEN-RENDERER] ${payload.type}`, { message: payload.message?.slice(0, 500), filename: payload.filename?.slice(0, 200), lineno: payload.lineno, colno: payload.colno, stack: payload.stack?.slice(0, 1000) });
   });

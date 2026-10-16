@@ -8646,5 +8646,228 @@ body.theme-bright .skill-btn-install:hover:not(:disabled) {
   transform: none !important;
 }
 
+/* Tutorial Guiado do Git Center */
+.git-guide-banner {
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(168, 85, 247, 0.16) 0%, rgba(147, 51, 234, 0.08) 100%);
+  border: 1px solid rgba(168, 85, 247, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 4px 16px rgba(147, 51, 234, 0.12);
+  animation: git-guide-appear 0.3s ease-out;
+}
 
+@keyframes git-guide-appear {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.git-guide-banner-text {
+  font-size: 12px;
+  color: #f3e8ff;
+  line-height: 1.45;
+  font-weight: 500;
+  flex: 1;
+}
+
+.git-guide-banner-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  border-top: 1px solid rgba(168, 85, 247, 0.15);
+  padding-top: 8px;
+}
+
+.git-guide-dismiss-btn {
+  font-size: 11px;
+  padding: 3px 12px !important;
+  white-space: nowrap !important;
+  color: #d8b4fe !important;
+  border-color: rgba(168, 85, 247, 0.3) !important;
+  background: rgba(168, 85, 247, 0.08) !important;
+  border-radius: 6px;
+  transition: all 0.15s ease;
+}
+
+.git-guide-dismiss-btn:hover {
+  background: rgba(168, 85, 247, 0.2) !important;
+  color: #ffffff !important;
+  border-color: rgba(168, 85, 247, 0.5) !important;
+}
+
+/* Escurecimento de elementos inativos durante o tutorial guiado */
+.git-guide-dimmed {
+  opacity: 0.18 !important;
+  filter: grayscale(0.8) blur(0.4px) !important;
+  pointer-events: none !important;
+  user-select: none !important;
+  transition: opacity 0.25s ease, filter 0.25s ease !important;
+}
+
+/* Floating Spotlight Tooltip */
+.git-guide-tooltip-anchor {
+  position: relative !important;
+  display: inline-flex !important;
+  z-index: 90 !important;
+}
+
+.git-guide-floating-tooltip {
+  position: fixed !important;
+  z-index: 999999 !important;
+  width: 280px;
+  background: #171220;
+  border: 1.5px solid #a855f7;
+  border-radius: 9px;
+  padding: 11px 13px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.9), 0 0 20px rgba(168, 85, 247, 0.45);
+  animation: git-tooltip-pop 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  pointer-events: auto;
+  user-select: none;
+  text-align: left;
+}
+
+@keyframes git-tooltip-pop {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.git-guide-floating-top .git-guide-tooltip-arrow {
+  position: absolute;
+  top: 100%;
+  width: 0;
+  height: 0;
+  transform: translateX(-50%);
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 7px solid #a855f7;
+}
+
+.git-guide-floating-bottom .git-guide-tooltip-arrow {
+  position: absolute;
+  bottom: 100%;
+  width: 0;
+  height: 0;
+  transform: translateX(-50%);
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-bottom: 7px solid #a855f7;
+}
+
+.git-guide-tooltip-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(168, 85, 247, 0.25);
+  color: #d8b4fe;
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+.git-guide-tooltip-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #ffffff;
+  margin-top: 6px;
+  margin-bottom: 3px;
+}
+
+.git-guide-tooltip-desc {
+  font-size: 11px;
+  color: #cfc5d8;
+  line-height: 1.4;
+  margin-bottom: 8px;
+}
+
+.git-guide-tooltip-footer {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 6px;
+}
+
+.git-guide-tooltip-dismiss {
+  background: transparent !important;
+  border: none !important;
+  color: #a79cb2 !important;
+  font-size: 10.5px !important;
+  cursor: pointer !important;
+  padding: 2px 6px !important;
+  text-decoration: underline;
+  transition: color 0.15s ease;
+}
+
+.git-guide-tooltip-dismiss:hover {
+  color: #ffffff !important;
+}
+
+/* Animação com brilho e foco intenso no botão alvo */
+.git-guide-target-pulse {
+  position: relative !important;
+  animation: git-target-pulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite !important;
+  border-color: #c084fc !important;
+  background: #9333ea !important;
+  color: #ffffff !important;
+  font-weight: 700 !important;
+  z-index: 95 !important;
+}
+
+@keyframes git-target-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 3px #a855f7, 0 0 16px rgba(168, 85, 247, 0.65);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 0 6px #c084fc, 0 0 26px rgba(168, 85, 247, 0.95);
+    transform: scale(1.025);
+  }
+}
+
+/* Destaque abrangente para áreas interativas do tour guide (Seleção de Arquivos e Mensagem) */
+.git-guide-target-area {
+  position: relative !important;
+  border: 1.5px solid #a855f7 !important;
+  border-radius: 9px !important;
+  box-shadow: 0 0 0 2px rgba(168, 85, 247, 0.4), 0 0 24px rgba(168, 85, 247, 0.35) !important;
+  animation: git-area-pulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite !important;
+  background: rgba(168, 85, 247, 0.03) !important;
+  z-index: 95 !important;
+}
+
+@keyframes git-area-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 2px rgba(168, 85, 247, 0.45), 0 0 16px rgba(168, 85, 247, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(192, 132, 252, 0.7), 0 0 28px rgba(168, 85, 247, 0.45);
+  }
+}
+
+.git-guide-target-input-area {
+  position: relative !important;
+  border: 1px solid rgba(168, 85, 247, 0.5) !important;
+  border-radius: 8px !important;
+  padding: 10px !important;
+  background: rgba(168, 85, 247, 0.04) !important;
+  box-shadow: 0 0 16px rgba(168, 85, 247, 0.22) !important;
+  transition: all 0.2s ease !important;
+}
 

@@ -14,7 +14,7 @@ class NekoUpdaterManager {
   private window: BrowserWindow | null = null;
   private state: UpdaterState = {
     status: "idle",
-    currentVersion: app.getVersion() || "0.5.1",
+    currentVersion: app.getVersion() || "0.5.2",
     updateInfo: null,
     progress: null,
     error: null,
@@ -23,7 +23,7 @@ class NekoUpdaterManager {
 
   public initialize(window: BrowserWindow | null) {
     this.window = window;
-    this.state.currentVersion = app.getVersion() || "0.5.1";
+    this.state.currentVersion = app.getVersion() || "0.5.2";
 
     try {
       // Configurações do autoUpdater
