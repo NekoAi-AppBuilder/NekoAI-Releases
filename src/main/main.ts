@@ -2151,7 +2151,12 @@ function isProtectedFromDiscard(relPath: string): boolean {
 
 async function getGitStatus(targetProject?: string): Promise<GitStatus> {
   const emptySummary: GitStatusSummary = { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 };
-  const projectPath = targetProject ? assertProjectRootSafe(targetProject, "git-read") : currentProject;
+  let projectPath: string | null = null;
+  try {
+    projectPath = targetProject ? assertProjectRootSafe(targetProject, "git-read") : currentProject;
+  } catch {
+    projectPath = currentProject;
+  }
   if (!projectPath) {
     return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, ahead: 0, behind: 0, diverged: false, canFastForward: false, changedFiles: [], summary: emptySummary };
   }
@@ -7618,7 +7623,7 @@ ipcMain.handle("github:cancelPublish", async () => {
   return { ok: true, canceled: true };
 });
 
-ipcMain.handle("github:gitStatus", async () => getGitStatus());
+ipcMain.handle("github:gitStatus", async (_event, projectPath?: string) => getGitStatus(projectPath));
 
 ipcMain.handle("github:checkSync", async (_event, projectPath?: string) => {
   const target = projectPath || currentProject;
@@ -10609,7 +10614,7 @@ app.whenReady().then(() => {
     closeMainWindow();
   });
 
-  ipcMain.handle("app:version", () => "0.5.02");
+  ipcMain.handle("app:version", () => "0.5.03");
   ipcMain.handle("renderer:report-error", (_event, payload: { type: string; message: string; filename: string; lineno: number; colno: number; stack: string }) => {
     console.error(`[BLACKSCREEN-RENDERER] ${payload.type}`, { message: payload.message?.slice(0, 500), filename: payload.filename?.slice(0, 200), lineno: payload.lineno, colno: payload.colno, stack: payload.stack?.slice(0, 1000) });
   });

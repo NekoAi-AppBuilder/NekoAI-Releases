@@ -1348,7 +1348,7 @@ function App() {
     };
   }, [openCardMenuPath]);
 
-  const [appVersion, setAppVersion] = React.useState<string>("0.5.02");
+  const [appVersion, setAppVersion] = React.useState<string>("0.5.03");
   const [isMaximized, setIsMaximized] = React.useState<boolean>(false);
   const [nekoMenuOpen, setNekoMenuOpen] = React.useState<boolean>(false);
   const [viewMenuOpen, setViewMenuOpen] = React.useState<boolean>(false);
@@ -1887,7 +1887,25 @@ function App() {
   const previousModalRef = React.useRef<Modal>(null);
 
   // Tutorial Guiado para Commits no Git Center
-  const [gitGuideStep, setGitGuideStep] = React.useState<"commit_changes" | "select_all" | "make_commit" | "save_commit" | "push" | null>(null);
+  const GIT_TOUR_COMPLETED_KEY = "neko:autocommit-tutorial-completed";
+  const [gitGuideStep, setGitGuideStep] = React.useState<"commit_changes" | "select_all" | "select_files" | "make_commit" | "save_commit" | "push" | null>(null);
+
+  const isGitTourCompleted = React.useCallback((proj?: string): boolean => {
+    try {
+      if (localStorage.getItem(GIT_TOUR_COMPLETED_KEY) === "true") return true;
+      if (proj && localStorage.getItem(`${GIT_TOUR_COMPLETED_KEY}:${proj}`) === "true") return true;
+    } catch {}
+    return false;
+  }, []);
+
+  const markGitTourCompleted = React.useCallback((proj?: string): void => {
+    try {
+      localStorage.setItem(GIT_TOUR_COMPLETED_KEY, "true");
+      if (proj) {
+        localStorage.setItem(`${GIT_TOUR_COMPLETED_KEY}:${proj}`, "true");
+      }
+    } catch {}
+  }, []);
 
   React.useEffect(() => {
     if (modal !== "gitCenter" && modal !== "branchChanges" && modal !== "branchCommit") {
@@ -2802,7 +2820,9 @@ function App() {
       <FloatingGuideTooltipCore
         stepKey={gitGuideStep}
         config={config}
-        onDismiss={() => setGitGuideStep(null)}
+        onDismiss={() => {
+          setGitGuideStep(null);
+        }}
       />
     );
   }, [gitGuideStep]);
@@ -5087,7 +5107,7 @@ function App() {
       console.log(`[AutoCommit] Ignorado: fase da tarefa é '${taskPhaseRef.current}'`);
       return;
     }
-    if (repairState === "awaiting-fix") {
+    if (repairState !== "idle" && repairState !== "awaiting-preview-update") {
       console.log(`[AutoCommit] Ignorado: reparo de tarefa em andamento (${repairState})`);
       return;
     }
@@ -5102,51 +5122,64 @@ function App() {
     autoCommittedTaskIdsRef.current.add(taskId);
 
     const activeProject = projectRef.current;
+    console.log(`[AutoCommit] Disparando Auto Commit para projeto=${activeProject} taskId=${taskId}`);
 
-    // 1. Obtém status atual do Git antes de qualquer ação
-    let git: GitStatus | null = null;
+    appendTerminalLine("log", "Executando Auto Commit e Push das alterações da tarefa...", "GitHub");
+    showToast("Enviando alterações para o GitHub...");
+
     try {
-      git = await window.neko.githubGitStatus?.();
-      if (git) {
-        setGithubLinkStatus(git);
+      const result = await window.neko.githubAutoCommitTask?.({
+        projectPath: activeProject,
+        taskId,
+        message: "NekoAI: tarefa concluída"
+      });
+
+      if (!result) return;
+
+      if (result.ok) {
+        if (result.committed) {
+          showToast("Alterações enviadas automaticamente para o GitHub.");
+          appendTerminalLine("log", "Alterações enviadas automaticamente para o GitHub com sucesso.", "GitHub");
+          upsertActivity({
+            id: `auto-commit:${taskId}`,
+            icon: "check",
+            title: "GitHub Auto Commit",
+            detail: "Commit e push realizados com sucesso.",
+            state: "done"
+          });
+        } else if (result.skipped && result.reason === "already-committed") {
+          console.log("[AutoCommit] Tarefa já commitada no backend.");
+        } else if (!result.committed && !result.pushed) {
+          showToast("Nenhuma alteração nova para enviar ao GitHub.");
+          appendTerminalLine("log", "Nenhuma alteração pendente para commit.", "GitHub");
+        }
+        const git = await window.neko.githubGitStatus?.(activeProject);
+        if (git) {
+          setGithubLinkStatus(git);
+        }
+        void refreshPullRequestStatus();
+      } else {
+        if (result.reason === "remote-ahead" || result.reason === "diverged") {
+          if (result.syncStatus) {
+            setGitSyncStatus(result.syncStatus);
+          }
+          setGitSyncViewDiff(false);
+          setGitSyncError("");
+          setModal("gitSync");
+          const msg = result.message || "Alterações externas detectadas no GitHub. Auto Commit pausado.";
+          showToast(msg);
+          appendTerminalLine("warn", `Auto Commit pausado: ${msg}`, "GitHub");
+        } else {
+          const errorMsg = result.message || "Erro no envio automático para o GitHub.";
+          showToast(errorMsg);
+          appendTerminalLine("error", `Falha no Auto Commit: ${errorMsg}`, "GitHub");
+        }
       }
-    } catch (statusErr) {
-      console.warn("[AutoCommit] Erro ao obter status do Git:", statusErr);
+    } catch (err: any) {
+      const friendly = getUserFacingError(err, "Erro ao enviar alterações automáticas para o GitHub.");
+      showToast(friendly);
+      appendTerminalLine("error", `Falha no Auto Commit: ${friendly}`, "GitHub");
     }
-
-    if (!git || !git.initialized || !git.linkedRepo) {
-      console.log("[AutoCommit] Repositório não inicializado ou não conectado ao GitHub.");
-      return;
-    }
-
-    const hasLocalUncommittedChanges = Boolean(git.dirty);
-    const hasLocalUnpushedCommits = Boolean(git.ahead && git.ahead > 0);
-
-    // Se houver alterações locais não commitadas:
-    // Para proteger o usuário contra envio acidental de arquivos não desejados,
-    // abre o Git Center com o Tour Guide para permitir a revisão e seleção de arquivos.
-    if (hasLocalUncommittedChanges) {
-      console.log(`[AutoCommit] Alterações locais detectadas (${(git.changedFiles || []).length} arquivos). Abrindo Git Center com tutorial guiado.`);
-      appendTerminalLine("log", "Alterações locais detectadas. Abrindo o Git Center para você selecionar e commitar com segurança.", "GitHub");
-      setModal("gitCenter");
-      setGitGuideStep("commit_changes");
-      return;
-    }
-
-    // Se a árvore estiver limpa de alterações não salvas, mas houver commits locais prontos para push:
-    if (hasLocalUnpushedCommits) {
-      console.log(`[AutoCommit] Commits locais pendentes de envio (${git.ahead}). Abrindo Git Center para envio guiado.`);
-      appendTerminalLine("log", "Commits locais prontos para envio ao GitHub detectados. Abrindo Git Center para envio.", "GitHub");
-      setModal("gitCenter");
-      setGitGuideStep("push");
-      return;
-    }
-
-    // Se a árvore estiver completamente limpa de commits e pushs:
-    console.log(`[AutoCommit] Árvore de trabalho limpa de commits e pushs para projeto=${activeProject} taskId=${taskId}`);
-    showToast("Nenhuma alteração nova para enviar ao GitHub.");
-    appendTerminalLine("log", "Árvore de trabalho limpa e em dia com o GitHub. Nenhuma alteração pendente.", "GitHub");
-    void refreshPullRequestStatus();
   }, [repairState, showToast, appendTerminalLine, upsertActivity, refreshPullRequestStatus]);
 
   const checkAndResumeAutoCommit = React.useCallback(async () => {
@@ -7533,9 +7566,13 @@ function App() {
       await window.neko.githubCommitPush(githubCommitMessage.trim(), selectedFilesArray);
       setGithubCommitSuccess(true);
       setGithubCommitMessage("");
-      const git = await window.neko.githubGitStatus();
+      const git = await window.neko.githubGitStatus(activeProj);
       setGithubLinkStatus(git);
       void refreshPullRequestStatus();
+      markGitTourCompleted(activeProj);
+      if (gitGuideStep) {
+        setGitGuideStep(null);
+      }
       void checkAndResumeAutoCommit();
     } catch (error) {
       setGithubCommitError(getUserFacingError(error, "Erro ao enviar alterações."));
@@ -7964,11 +8001,12 @@ function App() {
       if (res?.ok === false) {
         throw new Error(res.error || "Falha ao enviar alterações para o GitHub.");
       }
-      const git = await window.neko.githubGitStatus();
+      const git = await window.neko.githubGitStatus(activeProj);
       setGithubLinkStatus(git);
       void refreshPullRequestStatus();
       showToast("Alterações enviadas para o GitHub com sucesso!");
-      if (gitGuideStep === "push") {
+      markGitTourCompleted(activeProj);
+      if (gitGuideStep === "push" || gitGuideStep) {
         setGitGuideStep(null);
       }
       if (currentTaskIdRef.current) {
@@ -8008,7 +8046,7 @@ function App() {
       selectedFilesArray.forEach(p => console.log(`[SELECTIVE-COMMIT] selected path: ${p}`));
       await window.neko.githubCommitPush(branchCommitMessage.trim(), selectedFilesArray);
       await window.neko.githubCheckoutBranch(target);
-      const git = await window.neko.githubGitStatus();
+      const git = await window.neko.githubGitStatus(activeProj);
       setGithubLinkStatus(git);
       if (git.branch) {
         setGithubBranches(prev => prev.includes(git.branch!) ? prev : [...prev, git.branch!]);
@@ -8016,6 +8054,10 @@ function App() {
       setSelectedCommitFiles(new Set());
       setModal(null);
       setPendingTargetBranch(null);
+      markGitTourCompleted(activeProj);
+      if (gitGuideStep) {
+        setGitGuideStep(null);
+      }
       showToast(`Commit realizado e alternado para "${git.branch || target}" com sucesso!`);
     } catch (error: any) {
       const errMsg = getUserFacingError(error, "Erro ao salvar e trocar de branch.");
@@ -8050,6 +8092,59 @@ function App() {
       }
     }
   }, [githubLinkStatus.linkedRepo]);
+
+  const handleToggleAutoCommit = React.useCallback(async (next: boolean) => {
+    setGithubAutoCommit(next);
+    const activeProj = projectRef.current || project;
+    if (activeProj && window.neko?.githubSetAutoCommit) {
+      try {
+        await window.neko.githubSetAutoCommit(activeProj, next);
+      } catch (err) {
+        console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
+      }
+    }
+
+    if (!next) {
+      showToast("Auto Commit desativado.");
+      return;
+    }
+
+    // Regra: O tutorial só entra se o usuário ativa o autocommit com alterações pra commitar e enviar ao GitHub
+    // Se o usuário já seguiu o tutorial anteriormente (enviando ao GitHub), ele não é exibido mais e o autocommit pode ficar ativado.
+    if (isGitTourCompleted(activeProj)) {
+      showToast("Auto Commit ativado com sucesso.");
+      return;
+    }
+
+    // Consulta status atual do Git
+    let currentGit = githubLinkStatus;
+    try {
+      const freshGit = await window.neko.githubGitStatus?.();
+      if (freshGit) {
+        currentGit = freshGit;
+        setGithubLinkStatus(freshGit);
+      }
+    } catch (err) {
+      console.warn("[AutoCommit] Erro ao obter status do Git:", err);
+    }
+
+    const uncommittedFilesCount = (currentGit.changedFiles || []).length;
+    const hasUncommitted = Boolean(currentGit.dirty || uncommittedFilesCount > 0);
+    const hasUnpushed = Boolean((currentGit.ahead && currentGit.ahead > 0) || currentGit.unpushed);
+
+    if (hasUncommitted) {
+      // Inicia o tutorial guiado no Git Center no passo 1 (preparar/comitar alterações)
+      setModal("gitCenter");
+      setGitGuideStep("commit_changes");
+    } else if (hasUnpushed) {
+      // Inicia o tutorial guiado no Git Center no passo final (envio para o GitHub)
+      setModal("gitCenter");
+      setGitGuideStep("push");
+    } else {
+      // Árvore limpa e sincronizada: não entra no tutorial, apenas ativa o autocommit
+      showToast("Auto Commit ativado com sucesso.");
+    }
+  }, [project, githubLinkStatus, isGitTourCompleted, showToast]);
 
   const handlePullExternalChanges = React.useCallback(async () => {
     if (gitSyncBusy || !projectRef.current) return;
@@ -8737,7 +8832,7 @@ function App() {
               <div className="titlebar-dropdown-menu">
                 <div className="titlebar-dropdown-item version-info">
                   <BadgeCheck size={14} />
-                  <span>Versão {appVersion || "0.5.02"}</span>
+                  <span>Versão {appVersion || "0.5.03"}</span>
                 </div>
                 <button
                   type="button"
@@ -9863,7 +9958,6 @@ function App() {
                         aria-label="Cancelar melhoria"
                       >
                         <X size={12}/>
-                        <span>Cancelar</span>
                       </button>
                     </div>
                   ) : (
@@ -10865,29 +10959,7 @@ function App() {
               onClick={async (e) => {
                 if ((e.target as HTMLElement).tagName.toLowerCase() === "input") return;
                 const next = !githubAutoCommit;
-                setGithubAutoCommit(next);
-                if (project && window.neko?.githubSetAutoCommit) {
-                  try {
-                    await window.neko.githubSetAutoCommit(project, next);
-                  } catch (err) {
-                    console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
-                  }
-                }
-                if (next) {
-                  try {
-                    const git = await window.neko.githubGitStatus?.();
-                    if (git) {
-                      setGithubLinkStatus(git);
-                      if (git.dirty) {
-                        setModal("gitCenter");
-                        setGitGuideStep("commit_changes");
-                      } else if (git.ahead && git.ahead > 0) {
-                        setModal("gitCenter");
-                        setGitGuideStep("push");
-                      }
-                    }
-                  } catch {}
-                }
+                await handleToggleAutoCommit(next);
               }}
               style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer", userSelect: "none" }}
             >
@@ -10897,29 +10969,7 @@ function App() {
                 checked={githubAutoCommit}
                 onChange={async (e) => {
                   const next = e.target.checked;
-                  setGithubAutoCommit(next);
-                  if (project && window.neko?.githubSetAutoCommit) {
-                    try {
-                      await window.neko.githubSetAutoCommit(project, next);
-                    } catch (err) {
-                      console.warn("[Github] Falha ao persistir preferência de Auto Commit:", err);
-                    }
-                  }
-                  if (next) {
-                    try {
-                      const git = await window.neko.githubGitStatus?.();
-                      if (git) {
-                        setGithubLinkStatus(git);
-                        if (git.dirty) {
-                          setModal("gitCenter");
-                          setGitGuideStep("commit_changes");
-                        } else if (git.ahead && git.ahead > 0) {
-                          setModal("gitCenter");
-                          setGitGuideStep("push");
-                        }
-                      }
-                    } catch {}
-                  }
+                  await handleToggleAutoCommit(next);
                 }}
                 style={{ marginTop: 2, cursor: "pointer", width: 14, height: 14, flex: "0 0 auto", flexShrink: 0, accentColor: "#a855f7" }}
               />
@@ -12068,8 +12118,8 @@ function App() {
           githubStatus.repos?.some((r: any) => r.fullName?.toLowerCase() === githubLinkStatus.linkedRepo?.toLowerCase())
         );
         const branchName = githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main");
-        const isDirty = Boolean(githubLinkStatus.dirty);
         const changedCount = (githubLinkStatus.changedFiles || []).length;
+        const isDirty = Boolean(githubLinkStatus.dirty || changedCount > 0);
         const ahead = githubLinkStatus.ahead || 0;
         const behind = isAccessible ? (githubLinkStatus.behind || 0) : 0;
         const diverged = isAccessible && Boolean(githubLinkStatus.diverged);
