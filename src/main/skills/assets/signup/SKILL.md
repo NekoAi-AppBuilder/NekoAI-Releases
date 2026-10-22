@@ -1,8 +1,8 @@
 ---
 name: signup
-description: When the user wants to optimize signup, registration, account creation, or trial activation flows. Also use when the user mentions "signup conversions," "registration friction," "signup form optimization," "free trial signup," "reduce signup dropoff," "account creation flow," "people aren't signing up," "signup abandonment," "trial conversion rate," "nobody completes registration," "too many steps to sign up," or "simplify our signup." Use this whenever the user has a signup or registration flow that isn't performing.
+description: "Otimização e implementação de fluxos de cadastro (signup), login, autenticação social (OAuth Google/GitHub), ativação de conta e onboarding sem fricção. Especialmente adaptado para Supabase Auth e Lovable Auth. Use quando o usuário disser 'cadastro complicado', 'login confuso', 'ninguém termina o cadastro', 'melhorar tela de login', 'recuperação de senha', 'adicionar login social', 'simplificar cadastro', 'signup dropoff' ou 'auth flow'."
 metadata:
-  version: 2.0.0
+  version: 2.1.0
 ---
 
 <!-- Adapted from the original open-source skill for an agent that only reads and edits project files: the steps that ask the user questions, the A/B-test ideas, the measurement section and the pointers to sibling skills were removed; the rest is unchanged. License: see LICENSE.txt in this folder. -->
@@ -240,3 +240,40 @@ Organized by:
 1. Guest checkout as default
 2. Account creation optional post-purchase
 3. OR Social auth with single click
+
+---
+
+## Boas Práticas com Supabase Auth / Lovable Auth
+
+Quando o projeto utiliza Supabase Auth:
+- **Tratamento de Erros Humanizado:** Nunca exiba mensagens cruas em inglês como `Invalid login credentials` ou `User already registered`. Mapeie para: *"E-mail ou senha incorretos"* ou *"Este e-mail já possui uma conta. Deseja fazer login?"*.
+- **OAuth Social Redirects:** Configure sempre a URL de redirecionamento (`redirectTo`) usando `window.location.origin` para funcionar corretamente em ambientes locais (localhost) e de produção/staging sem hardcode.
+- **Feedback de Carregamento:** Desabilite o botão de envio e adicione spinner durante a requisição `supabase.auth.signUp()` ou `signInWithPassword()`.
+- **Validação Antecipada:** Valide formato de e-mail e requisitos mínimos de senha antes do submit para evitar round-trips com erro de API.
+
+---
+
+## Ciclo de Execução de Engenharia
+
+Ao implementar ou otimizar o fluxo de cadastro e autenticação:
+
+1. **Inspecionar:**
+   - Analise os componentes de autenticação (`src/pages/Auth.tsx`, `src/components/auth/`, etc.).
+   - Verifique como o estado de sessão é mantido (ex: `onAuthStateChange`, contexts de autenticação).
+   - Identifique atritos: campos em excesso, ausência de botão para exibir senha, ausência de link claro de recuperação de senha.
+
+2. **Planejar:**
+   - Defina a experiência: login/cadastro em tabs ou páginas separadas, suporte a OAuth se configurado, mensagens de validação inline.
+   - Garanta que após o cadastro o usuário seja redirecionado imediatamente para o dashboard ou onboarding sem ficar preso em tela em branco.
+
+3. **Implementar:**
+   - Refatore o formulário de cadastro no código com labels acessíveis, `autocomplete="email"` / `autocomplete="new-password"`.
+   - Adicione toggle de visualização de senha ("mostrar/ocultar senha").
+   - Trate erros de forma amigável com toasts ou avisos no topo do formulário.
+
+4. **Validar:**
+   - Execute o build do projeto (`npm run build` ou `vite build`) para confirmar integridade de TypeScript e JSX.
+   - Verifique que os hooks de auth não causam re-render infinito após o redirecionamento.
+
+5. **Reportar:**
+   - Descreva as melhorias no fluxo, os campos otimizados e as proteções de UX e segurança adicionadas.

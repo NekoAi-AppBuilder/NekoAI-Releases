@@ -17,6 +17,7 @@ interface SkillsPanelProps {
   projectPath: string | null;
   skillsState: SkillsProjectState | null;
   isLoading: boolean;
+  readOnly?: boolean;
   onClose: () => void;
   onInstall: (skillId: string) => Promise<void>;
   onRemove: (skillId: string) => Promise<void>;
@@ -27,6 +28,7 @@ export function SkillsPanel({
   projectPath,
   skillsState,
   isLoading,
+  readOnly = false,
   onClose,
   onInstall,
   onRemove,
@@ -137,7 +139,7 @@ export function SkillsPanel({
   };
 
   return (
-    <div className="skills-panel-container">
+    <div className="skills-panel-container" id="conversation-panel-skills" role="tabpanel" aria-labelledby="conversation-tool-skills">
       {/* Cabeçalho do Painel */}
       <div className="skills-panel-header">
         <div className="skills-panel-title-group">
@@ -269,7 +271,7 @@ export function SkillsPanel({
                       type="button"
                       className="skill-btn-remove"
                       onClick={() => void handleRemoveClick(skill.id)}
-                      disabled={isBusy}
+                      disabled={isBusy || readOnly}
                       title="Remover skill do projeto"
                     >
                       {isBusy ? (
@@ -285,7 +287,7 @@ export function SkillsPanel({
                     type="button"
                     className="skill-btn-install"
                     onClick={() => void handleInstallClick(skill.id)}
-                    disabled={isBusy || !projectPath}
+                    disabled={isBusy || readOnly || !projectPath}
                     title={
                       projectPath
                         ? "Instalar arquivos da skill no projeto atual"

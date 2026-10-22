@@ -1,8 +1,8 @@
 ---
 name: copywriting
-description: When the user wants to write, rewrite, or improve marketing copy for any page, including homepage, landing pages, pricing pages, feature pages, about pages, or product pages. Also use when the user says "write copy for," "improve this copy," "rewrite this page," "marketing copy," "headline help," "CTA copy," "value proposition," "tagline," "subheadline," "hero section copy," "above the fold," "this copy is weak," "make this more compelling," "this sounds like AI," "AI slop," "make it sound human," or "help me describe my product." Use this whenever someone is working on website text that needs to persuade or convert. Drafts never use AI tells like "it's not X, it's Y" reveals, "no X, no Y, no Z" lists, or sentences that trail into extra comma clauses.
+description: "Redação publicitária e copywriting de alta conversão para landing pages, hero sections, páginas de vendas, CTAs e pricing. Elimina jargões genéricos, 'AI slop' e clichês robóticos. Use quando o usuário pedir 'melhorar textos', 'texto parece de robô', 'copy fraca', 'título não chama atenção', 'reescrever landing page', 'melhorar proposta de valor', 'criar textos persuasivos', 'CTA sem clique' ou 'rewrite marketing copy'."
 metadata:
-  version: 2.1.0
+  version: 2.2.0
 ---
 
 <!-- Adapted from the original open-source skill for an agent that only reads and edits project files: the step that reads a marketing-context file, the pointers to sibling skills and one English-only reference (transition phrases) were removed; the rest is unchanged. License: see LICENSE.txt in this folder. -->
@@ -42,7 +42,7 @@ Gather this context (ask if not provided):
 ### Clarity Over Cleverness
 If you have to choose between clear and creative, choose clear. Clarity also converts. Clearer positioning and copy is associated with +81% conversions, a 38% shorter sales cycle, 28% lower CAC, and 175% more referrals. When a reader has to decode your line, you've lost them.
 
-**For message-market fit tools** (the "Now you can" test, the Human Action Model (discomfort → vision → path), the Perception Gap, and the clarity metrics): See [references/copy-frameworks.md](references/copy-frameworks.md#clarity--message-market-fit)
+**For message-market fit tools** (the "Now you can" test, the Human Action Model (discomfort → vision → path), the Perception Gap, and the clarity metrics): See [.agents/skills/copywriting/references/copy-frameworks.md](.agents/skills/copywriting/references/copy-frameworks.md#clarity--message-market-fit)
 
 ### Benefits Over Features
 Features: What it does. Benefits: What that means for the customer.
@@ -102,9 +102,9 @@ Clients and buyers reject copy that reads as AI-written, and a reader who spots 
 
 ### Check before delivering
 
-Before handing over any draft, run the self-check in [references/ai-tells.md](references/ai-tells.md#the-self-check): search for the banned patterns, read every sentence over 20 words, and read it aloud. Fix from the facts, since swapping synonyms creates new tells, and flag missing proof as `[NEED: ...]` rather than inventing it.
+Before handing over any draft, run the self-check in [.agents/skills/copywriting/references/ai-tells.md](.agents/skills/copywriting/references/ai-tells.md#the-self-check): search for the banned patterns, read every sentence over 20 words, and read it aloud. Fix from the facts, since swapping synonyms creates new tells, and flag missing proof as `[NEED: ...]` rather than inventing it.
 
-**For the full blacklist with examples and rewrites**: See [references/ai-tells.md](references/ai-tells.md)
+**For the full blacklist with examples and rewrites**: See [.agents/skills/copywriting/references/ai-tells.md](.agents/skills/copywriting/references/ai-tells.md)
 
 ---
 
@@ -147,9 +147,9 @@ Puns and wit make copy memorable when they fit the brand and don't cost clarity.
 - "Never {unpleasant event} again"
 - "{Question highlighting main pain point}"
 
-**For comprehensive headline formulas**: See [references/copy-frameworks.md](references/copy-frameworks.md)
+**For comprehensive headline formulas**: See [.agents/skills/copywriting/references/copy-frameworks.md](.agents/skills/copywriting/references/copy-frameworks.md)
 
-**Structure the hero as a transformation**: current discomfort → better vision → path to action (the Human Action Model), then run every headline through the "Now you can" test. See [references/copy-frameworks.md](references/copy-frameworks.md#clarity--message-market-fit)
+**Structure the hero as a transformation**: current discomfort → better vision → path to action (the Human Action Model), then run every headline through the "Now you can" test. See [.agents/skills/copywriting/references/copy-frameworks.md](.agents/skills/copywriting/references/copy-frameworks.md#clarity--message-market-fit)
 
 **Subheadline**
 - Expands on headline
@@ -171,7 +171,7 @@ Puns and wit make copy memorable when they fit the brand and don't cost clarity.
 | Objection Handling | FAQ, comparisons, guarantees |
 | Final CTA | Recap value, repeat CTA, risk reversal |
 
-**For detailed section types and page templates**: See [references/copy-frameworks.md](references/copy-frameworks.md)
+**For detailed section types and page templates**: See [.agents/skills/copywriting/references/copy-frameworks.md](.agents/skills/copywriting/references/copy-frameworks.md)
 
 ---
 
@@ -269,3 +269,28 @@ For headlines and CTAs, provide 2-3 options:
 ### Meta Content (if relevant)
 - Page title (for SEO)
 - Meta description
+
+---
+
+## Ciclo de Execução de Engenharia
+
+Não se limite a sugerir textos teóricos em Markdown. Se o projeto contiver páginas e componentes de landing page ou UI (`src/pages/`, `src/components/`):
+
+1. **Inspecionar:**
+   - Leia os arquivos da página ou componente afetado.
+   - Identifique clichês corporativos vazios ("solução inovadora e robusta"), jargões genéricos e títulos sem proposta de valor clara.
+
+2. **Planejar:**
+   - Mapeie a transformação: desconforto atual -> visão de futuro -> ação direta.
+   - Defina o headline principal, subheadline e CTAs de ação orientados a resultado.
+
+3. **Implementar:**
+   - Atualize diretamente os textos nos componentes de código do projeto (`Hero.tsx`, `LandingPage.tsx`, etc.).
+   - Mantenha a pontuação e formatação limpas, evitando títulos que quebrem palavras órfãs e respeitando a hierarquia tipográfica.
+
+4. **Validar:**
+   - Execute o build do projeto (`npm run build` ou `vite build`) para assegurar que não houve quebra de tags JSX ou strings inválidas.
+   - Verifique que os textos cabem harmonicamente no layout sem quebras visuais indesejadas em mobile e desktop.
+
+5. **Reportar:**
+   - Apresente os novos textos implementados, a justificativa de posicionamento e as alternativas testáveis.

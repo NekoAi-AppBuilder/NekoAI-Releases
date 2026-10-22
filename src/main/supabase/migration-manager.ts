@@ -1,3 +1,4 @@
+import { WorkspaceObjects } from "../workspaces/workspace-objects";
 /**
  * Gerenciador de Migrations com Aprovação Explícita no Chat Nativo (NekoAI P1)
  * 
@@ -535,4 +536,4 @@ export class MigrationManager extends EventEmitter {
   }
 }
 
-export const migrationManager = new MigrationManager();
+export const migrationManager = new WorkspaceObjects(() => new MigrationManager(), { events: ["migration-asked", "migration-replied", "migration-executing", "migration-completed", "migration-failed", "migration-expired", "migration-cancelled"], dispose: object => object.cancelAllPendingProposals() }).proxy;

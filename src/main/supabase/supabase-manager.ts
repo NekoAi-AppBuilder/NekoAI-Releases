@@ -1,3 +1,4 @@
+import { WorkspaceObjects, serializedObject } from "../workspaces/workspace-objects";
 import { EventEmitter } from "node:events";
 import { SupabaseVaultManager, projectKey } from "./supabase-vault";
 import { SupabaseCli, parseSupabaseError } from "./supabase-cli";
@@ -27,14 +28,17 @@ export class SupabaseManager extends EventEmitter {
   public cli = new SupabaseCli();
   private activeProjectPath: string | null = null;
   private isBusy = false;
-  private currentAccessToken: string | null = null;
+  private account = { token: null as string | null };
+  private get currentAccessToken():string|null{return this.account.token;}
+  private set currentAccessToken(value:string|null){this.account.token=value;}
   private initPromise: Promise<void> | null = null;
   private activeOAuthAbortController: AbortController | null = null;
 
-  constructor(vault?: SupabaseVaultManager, cli?: SupabaseCli) {
+  constructor(vault?: SupabaseVaultManager, cli?: SupabaseCli, account?: {token:string|null}) {
     super();
     if (vault) this.vault = vault;
     if (cli) this.cli = cli;
+    if(account)this.account=account;
   }
 
   public getState(): SupabaseState {
@@ -649,4 +653,6 @@ export class SupabaseManager extends EventEmitter {
   }
 }
 
-export const supabaseManager = new SupabaseManager();
+const sharedVault = serializedObject(new SupabaseVaultManager());
+const sharedAccount = {token:null as string|null};
+export const supabaseManager = new WorkspaceObjects(() => new SupabaseManager(sharedVault,undefined,sharedAccount), { events: ["state-changed"], accountActions:["connectWithToken","disconnect"], accountRefresh: object=>object.refreshProjects(), dispose: object => object.shutdown() }).proxy;

@@ -1,3 +1,4 @@
+import { WorkspaceObjects } from "./workspaces/workspace-objects";
 // ============================================================
 // SITE CLONE — crawler/análise (main process)
 // ------------------------------------------------------------
@@ -52,7 +53,7 @@ export const SITE_CLONE_DEFAULTS = {
   crawlTimeoutMs: 90000
 };
 
-export const SITE_CLONE_ABORTS = new Map<string, AbortController>();
+export const SITE_CLONE_ABORTS = new WorkspaceObjects(() => new Map<string, AbortController>(), { dispose: map => { for (const controller of map.values()) controller.abort(); map.clear(); } }).proxy;
 
 export function cancelSiteClone(id: string): boolean {
   const ctrl = SITE_CLONE_ABORTS.get(id);

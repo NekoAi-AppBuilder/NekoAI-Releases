@@ -22,6 +22,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { tokenizeCode, tokenizePlainFallback } from "./code/highlighter";
 import type { CodeLineTokens } from "./code/types";
+import { useInterfaceTheme } from "./useInterfaceTheme";
 
 // ---------------------------------------------------------------------------
 // Code block com syntax highlighting via highlighter.ts existente
@@ -33,24 +34,25 @@ interface CodeBlockProps {
 }
 
 function CodeBlock({ language, code }: CodeBlockProps) {
+  const theme = useInterfaceTheme();
   // Fallback síncrono imediato para zero atraso visual
   const [lines, setLines] = React.useState<CodeLineTokens[]>(() =>
-    tokenizePlainFallback(code)
+    tokenizePlainFallback(code, theme)
   );
 
   React.useEffect(() => {
     let alive = true;
-    setLines(tokenizePlainFallback(code));
+    setLines(tokenizePlainFallback(code, theme));
 
     if (language) {
       const fakePath = `snippet.${language}`;
-      tokenizeCode(fakePath, code)
+      tokenizeCode(fakePath, code, theme)
         .then((tokenized) => { if (alive) setLines(tokenized); })
         .catch(() => { /* mantém fallback */ });
     }
 
     return () => { alive = false; };
-  }, [code, language]);
+  }, [code, language, theme]);
 
   return (
     <div className="md-code-block">
@@ -69,7 +71,7 @@ function CodeBlock({ language, code }: CodeBlockProps) {
                 <span
                   key={tokIdx}
                   style={{
-                    color: token.color || "#d4d4d4",
+                    color: token.color || (theme === "light" ? "#211a2d" : "#d4d4d4"),
                     fontStyle: token.fontStyle === 1 ? "italic" : undefined,
                   }}
                 >

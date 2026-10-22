@@ -1,7 +1,16 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
-import { app } from "electron";
+function getElectronApp(): any {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const electron = require("electron");
+    return electron?.app || electron?.default?.app || null;
+  } catch {
+    return null;
+  }
+}
+
 import {
   SKILLS_CATALOG,
   getSkillById,
@@ -31,9 +40,10 @@ export class SkillsManager {
       path.join(process.cwd(), "src", "main", "skills", "assets"),
     ];
 
-    if (app && typeof app.getAppPath === "function") {
+    const electronApp = getElectronApp();
+    if (electronApp && typeof electronApp.getAppPath === "function") {
       try {
-        const appPath = app.getAppPath();
+        const appPath = electronApp.getAppPath();
         candidatePaths.unshift(
           path.join(appPath, "dist", "main", "skills", "assets"),
           path.join(appPath, "src", "main", "skills", "assets")
@@ -306,6 +316,49 @@ export class SkillsManager {
 
     // Se .agents/skills ficou vazia, podemos mantê-la ou deixá-la quieta
     return { success: true, skillId, removed: true };
+  }
+
+  /**
+   * Retorna os IDs das skills que estão instaladas no projeto especificado (ou ativo).
+   */
+  public getInstalledSkillIds(targetProjectPath?: string): string[] {
+    const projectRoot = targetProjectPath ? path.resolve(targetProjectPath) : this.currentProject;
+    if (!projectRoot || !fsSync.existsSync(projectRoot)) return [];
+
+    const baseDir = path.join(projectRoot, ".agents", "skills");
+    if (!fsSync.existsSync(baseDir)) return [];
+
+    const installed: string[] = [];
+    for (const skill of SKILLS_CATALOG) {
+      const skillMd = path.join(baseDir, skill.id, "SKILL.md");
+      if (fsSync.existsSync(skillMd)) {
+        installed.push(skill.id);
+      }
+    }
+    return installed;
+  }
+
+  /**
+   * Constrói uma instrução contextual concisa das skills instaladas no projeto
+   * para informar o agente sobre as especialidades disponíveis no workspace.
+   */
+  public getInstalledSkillsContext(targetProjectPath?: string): string | null {
+    const installedIds = this.getInstalledSkillIds(targetProjectPath);
+    if (installedIds.length === 0) return null;
+
+    const skillsXml = installedIds.map(id => {
+      const def = getSkillById(id);
+      return `  <skill><name>${id}</name><description>${def?.resumo ?? id}</description></skill>`;
+    }).join("\n");
+
+    return `ESPECIALIDADES DO PROJETO (AGENT SKILLS INSTALADAS EM .agents/skills/):
+Skills provide specialized instructions, workflows and playbooks for specific tasks.
+Quando a solicitação do usuário se relacionar com qualquer um desses temas (direta ou indiretamente, em português ou inglês, incluindo intenções como "meu site parece amador", "site lento", "não converte", "proteger dados", etc.), utilize a ferramenta nativa \`skill\` ou leia as diretrizes e regras em \`.agents/skills/<id>/SKILL.md\` para orientar o plano, o código e as validações técnicas.
+
+You MUST call the native skill tool with the skill name as the very first step when a task matches:
+<available_skills>
+${skillsXml}
+</available_skills>`;
   }
 
   /**

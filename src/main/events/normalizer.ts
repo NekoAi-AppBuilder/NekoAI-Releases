@@ -4,18 +4,18 @@ import { normalizeActivity } from "./activity";
 
 const statusCache = new Map<string, string>();
 
-export function clearStatusCache() {
-  statusCache.clear();
+export function clearStatusCache(cache: Map<string, string> = statusCache) {
+  cache.clear();
 }
 
-export function clearStatusCacheForSession(sessionId: string) {
+export function clearStatusCacheForSession(sessionId: string, cache: Map<string, string> = statusCache) {
   if (sessionId) {
-    statusCache.delete(sessionId);
-    statusCache.delete("default");
+    cache.delete(sessionId);
+    cache.delete("default");
   }
 }
 
-export function normalizeOpenCodeEvent(event: any) {
+export function normalizeOpenCodeEvent(event: any, cache: Map<string, string> = statusCache) {
   const type = String(event?.type ?? "");
   const props = event?.properties ?? {};
   if (type === "session.updated" || type === "session.diff") return null;
@@ -24,8 +24,8 @@ export function normalizeOpenCodeEvent(event: any) {
     const id = String(props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? event?.sessionID ?? event?.sessionId ?? "default");
     const status = String(props?.status?.type ?? props?.status ?? "");
     const taskId = props?.taskId;
-    if (statusCache.get(id) === status) return null;
-    statusCache.set(id, status);
+    if (cache.get(id) === status) return null;
+    cache.set(id, status);
     return {
       type: "neko.status",
       properties: {

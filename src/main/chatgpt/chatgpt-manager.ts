@@ -52,6 +52,26 @@ export class ChatGptManager implements BridgeManagerDelegate {
   private activeLoginVerifier: string | null = null;
   private refreshPromise: Promise<ChatGptAccountData> | null = null;
   private currentProjectPath: string | null = null;
+  private workspaceProjects = new Map<string, { generation: number; projectPath: string; isLive: () => boolean }>();
+  private configSyncTail: Promise<void> = Promise.resolve();
+
+  /** One account/bridge, independent lifetime for each project's configuration. */
+  public attachWorkspace(workspaceId: string, generation: number, projectPath: string, isLive: () => boolean): void {
+    const existing = this.workspaceProjects.get(workspaceId);
+    const resolved = path.resolve(projectPath);
+    if (existing && (existing.generation !== generation || existing.projectPath !== resolved)) {
+      throw new Error("Identidade de configuração ChatGPT já registrada.");
+    }
+    if (existing) return;
+    this.workspaceProjects.set(workspaceId, { generation, projectPath: resolved, isLive });
+  }
+
+  public detachWorkspace(workspaceId: string, generation: number): void {
+    const existing = this.workspaceProjects.get(workspaceId);
+    if (!existing || existing.generation !== generation) return;
+    this.workspaceProjects.delete(workspaceId);
+    if (this.currentProjectPath === existing.projectPath) this.currentProjectPath = null;
+  }
 
   constructor(options?: {
     vault?: ChatGptVault;
@@ -113,7 +133,7 @@ export class ChatGptManager implements BridgeManagerDelegate {
         // Atualiza modelos e limites em segundo plano
         void this.refreshModels().catch(() => {});
         void this.refreshUsage().catch(() => {});
-        void this.syncOpenCodeConfig(this.currentProjectPath || undefined).catch(() => {});
+        void this.syncOpenCodeConfig().catch(() => {});
       } else {
         this.status = "disconnected";
       }
@@ -286,6 +306,7 @@ export class ChatGptManager implements BridgeManagerDelegate {
       this.status = "connected";
       this.lastError = null;
       this.updatedAt = new Date().toISOString();
+      await this.syncOpenCodeConfig();
       this.notifyListeners();
 
       console.log(
@@ -339,6 +360,7 @@ export class ChatGptManager implements BridgeManagerDelegate {
       console.warn("[Neko/ChatGptManager] Erro ao desconectar:", err?.message || err);
       this.status = "disconnected";
     } finally {
+      await this.syncOpenCodeConfig();
       this.notifyListeners();
     }
   }
@@ -354,7 +376,7 @@ export class ChatGptManager implements BridgeManagerDelegate {
       this.models = models;
       this.notifyListeners();
       // Atualiza imediatamente a configuração do OpenCode com o catálogo atualizado
-      void this.syncOpenCodeConfig(this.currentProjectPath || undefined).catch(() => {});
+      void this.syncOpenCodeConfig().catch(() => {});
       return models;
     } catch (err: any) {
       console.warn("[Neko/ChatGptManager] Não foi possível atualizar catálogo:", err?.message || err);
@@ -385,31 +407,48 @@ export class ChatGptManager implements BridgeManagerDelegate {
    * Injeta ou remove a configuração do provedor chatgpt-personal no arquivo opencode.json.
    * Aplica tanto no projeto local quanto na configuração global do usuário.
    */
-  public async syncOpenCodeConfig(projectPath?: string): Promise<void> {
-    const isConn = this.isConnected();
-    const targets: string[] = [];
+  public syncOpenCodeConfig(projectPath?: string): Promise<void> {
+    // Capture membership at dispatch; evaluating liveness again before each write
+    // prevents a queued update from reaching a closed/reopened workspace.
+    const entries = [...this.workspaceProjects.entries()];
+    const requested = projectPath ? path.resolve(projectPath) : null;
+    const projects: { projectPath: string; isLive: () => boolean }[] = [];
+    for (const [id, entry] of entries) {
+      if (requested && entry.projectPath !== requested) continue;
+      projects.push({ projectPath: entry.projectPath, isLive: () => this.workspaceProjects.get(id) === entry && entry.isLive() });
+    }
+    // Compatibility for startup/configuration calls outside registered workspaces.
+    const legacyPath = requested ?? (entries.length === 0 ? this.currentProjectPath : null);
+    if (legacyPath && !projects.some(entry => entry.projectPath === legacyPath)) {
+      const registered = entries.some(([, entry]) => entry.projectPath === legacyPath);
+      if (!registered) projects.push({ projectPath: legacyPath, isLive: () => true });
+    }
+    const sync = this.configSyncTail.then(() => this.writeOpenCodeConfigs(projects));
+    this.configSyncTail = sync.catch(() => {});
+    return sync;
+  }
+
+  private async writeOpenCodeConfigs(projects: { projectPath: string; isLive: () => boolean }[]): Promise<void> {
+    const targets: { filePath: string; isLive: () => boolean }[] = [];
 
     // Alvo global: ~/.config/opencode/opencode.json
     try {
       const globalConfigDir = path.join(os.homedir(), ".config", "opencode");
-      targets.push(path.join(globalConfigDir, "opencode.json"));
+      targets.push({ filePath: path.join(globalConfigDir, "opencode.json"), isLive: () => true });
     } catch {}
 
-    // Alvo do projeto se especificado
-    if (projectPath) {
-      try {
-        const projDir = path.resolve(projectPath);
-        targets.push(path.join(projDir, ".opencode", "opencode.json"));
-        // Se já existir opencode.json na raiz do projeto, sincroniza nele também para garantir prioridade
-        const rootCfg = path.join(projDir, "opencode.json");
-        if (fsSync.existsSync(rootCfg)) {
-          targets.push(rootCfg);
-        }
-      } catch {}
+    for (const project of projects) {
+      if (!project.isLive()) continue;
+      const projDir = project.projectPath;
+      targets.push({ filePath: path.join(projDir, ".opencode", "opencode.json"), isLive: project.isLive });
+      const rootCfg = path.join(projDir, "opencode.json");
+      if (fsSync.existsSync(rootCfg)) targets.push({ filePath: rootCfg, isLive: project.isLive });
     }
 
-    for (const cfgPath of targets) {
+    for (const target of targets) {
+      const cfgPath = target.filePath;
       try {
+        if (!target.isLive()) continue;
         let config: Record<string, any> = {};
         if (fsSync.existsSync(cfgPath)) {
           try {
@@ -426,6 +465,9 @@ export class ChatGptManager implements BridgeManagerDelegate {
           config.provider = {};
         }
 
+        // Read account state after awaited file I/O, so a logout cannot be
+        // overwritten by a previously queued connected-state snapshot.
+        const isConn = this.isConnected();
         if (isConn) {
           // Constrói mapa de modelos suportados
           const modelsMap: Record<string, any> = {};
@@ -475,7 +517,9 @@ export class ChatGptManager implements BridgeManagerDelegate {
         }
 
         const dir = path.dirname(cfgPath);
+        if (!target.isLive()) continue;
         await fs.mkdir(dir, { recursive: true });
+        if (!target.isLive()) continue;
         await fs.writeFile(cfgPath, JSON.stringify(config, null, 2), "utf8");
         console.log(`[Neko/ChatGptManager] Sincronizado opencode.json (${isConn ? "adicionado" : "removido"}) em: ${cfgPath}`);
       } catch (err: any) {
@@ -486,3 +530,4 @@ export class ChatGptManager implements BridgeManagerDelegate {
 }
 
 export const chatGptManager = new ChatGptManager();
+

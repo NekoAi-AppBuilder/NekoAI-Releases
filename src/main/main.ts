@@ -1,3 +1,8 @@
+import { WorkspacePorts } from "./workspaces/workspace-ports";
+import { PromptQueueGate, type QueuedPromptRequest } from "../shared/prompt-queue";
+import { ConversationStore } from "./conversations/conversation-store";
+import { ProjectConversations } from "./conversations/project-conversations";
+import type { ConversationSave } from "../shared/conversations";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, safeStorage, session, shell, WebContentsView, webFrameMain, type OpenDialogOptions } from "electron";
 import path from "node:path";
 import http from "node:http";
@@ -7,7 +12,17 @@ import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { normalizeOpenCodeEvent, clearStatusCache, clearStatusCacheForSession } from "./events/normalizer";
+import { WorkspaceRegistry, type WorkspaceLease } from "./workspaces/workspace-registry";
+import { WorkspaceServices, type WorkspaceServiceTarget } from "./workspaces/workspace-services";
+import { WorkspaceResources, type WorkspaceResourceKind } from "./workspaces/workspace-resources";
+import { stopChildProcessTree } from "./workspaces/stop-child-process";
+import { WorkspaceState, scopedCollection, scopedFields } from "./workspaces/workspace-state";
+import { WorkspaceEvents } from "./workspaces/workspace-events";
+import { WorkspaceVisibility } from "./workspaces/workspace-visibility";
+import { WorkspaceTabs } from "./workspaces/workspace-tabs";
+import { configureWorkspaceObjects, closeWorkspaceObjects } from "./workspaces/workspace-objects";
+import { WorkspaceIpc } from "./workspaces/workspace-ipc";
+import { normalizeOpenCodeEvent as normalizeSharedEvent, clearStatusCache as clearSharedStatusCache, clearStatusCacheForSession as clearSharedSessionStatusCache } from "./events/normalizer";
 import { shouldIgnoreEventPath } from "./events/filters";
 import { perfEnabled, perfTaskStart, perfMark, perfCountEvent, perfUploadBytes, perfFlushTask, perfRetryStart, perfRetryEnd } from "./perf";
 import { supabaseManager } from "./supabase/supabase-manager";
@@ -27,7 +42,7 @@ import { GithubAccountManager, type GithubAccountRecord, type GithubAccountSumma
 import { getPullRequestStatus, listPullRequests, mergePullRequest, preparePRConflictResolution, pushPRBranch, rawGithubFetch, type NekoPullRequestStatus } from "./github/pull-request-manager";
 import { getModelCapabilities, isVisionImage, buildVisionContext, VISION_FALLBACK_MODEL, VISION_FALLBACK_PROVIDER_CANDIDATES, VISION_FALLBACK_MODEL_CANDIDATES, resolveVisionFallbackTarget, type VisionFallbackTarget } from "../shared/vision";
 import { isModelEligibleForNeko, isModelIncompatibilityError } from "../shared/model-eligibility";
-import { analyzeImagesWithMiMo, cancelVisionFallbackFor, clearVisionFallbackSessions, isVisionFallbackSession, friendlyFallbackError } from "./vision-fallback";
+import { analyzeImagesWithMiMo, cancelVisionFallbackFor, isVisionFallbackSession, friendlyFallbackError } from "./vision-fallback";
 import { discoverPreviewRoutes, routeFromUrl, normalizeRoutePath, isDynamicSegment, type PreviewRoute } from "./preview-routes";
 import { analyzeSite, cancelAllSiteClones, importSiteAssets, type SiteCloneAnalysis, type SiteCloneLimits } from "./site-clone";
 import { captureSiteChromium } from "./site-capture";
@@ -35,7 +50,7 @@ import { resolveNodeRuntime, resolveGitRuntime, getEmbeddedRuntimeEnv, clearNode
 import { recentProjectsManager, detectProjectTechnology, checkProjectExistsOnDisk, normalizeProjectPath, deleteProjectToTrash } from "./recent-projects-manager";
 import { appPreferencesManager, isValidDirectory } from "./app-preferences-manager";
 import { thumbnailService } from "./thumbnail-service";
-import { sessionParentMap, registerSessionParent, resolveRootSessionId as resolveRootFromTree, clearSessionTree } from "./session-tree";
+import { resolveRootSessionId as resolveRootFromTree } from "./session-tree";
 import { runtimeManager } from "./runtime/runtime-manager";
 import { RuntimeEnvironmentBuilder } from "./runtime/runtime-environment";
 import { RuntimeRequirement } from "./runtime/runtime-types";
@@ -102,38 +117,436 @@ interface WorkspaceContext {
   status: "starting" | "ready" | "stopping" | "stopped";
 }
 
-let activeWorkspace: WorkspaceContext | null = null;
+
+const workspaceRegistry = new WorkspaceRegistry();
+const workspacePorts = new WorkspacePorts();
+const workspaceServices = new WorkspaceServices(workspaceRegistry);
+const workspaceResources = new WorkspaceResources(workspaceRegistry);
+const workspaceResourceOwners = new WeakMap<object, { lease: WorkspaceLease; kind: WorkspaceResourceKind }>();
+const watcherCleanup = new WeakMap<object, () => void>();
+
+function ownWorkspaceResource(lease: WorkspaceLease, kind: WorkspaceResourceKind, resource: object, dispose: () => void | Promise<void>) {
+  workspaceResources.track(lease, kind, resource, async () => {
+    await dispose();
+    workspaceResourceOwners.delete(resource);
+  });
+  workspaceResourceOwners.set(resource, { lease, kind });
+}
+
+function forgetWorkspaceResource(resource: object) {
+  const owner = workspaceResourceOwners.get(resource);
+  if (!owner) return;
+  workspaceResources.forget(owner.lease, owner.kind, resource);
+  workspaceResourceOwners.delete(resource);
+}
+
+async function closeWorkspacePreviewServer(server: http.Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close(error => {
+      if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+      else resolve();
+    });
+    server.closeAllConnections();
+  });
+}
+
+function ownWorkspaceContext(lease: WorkspaceLease, context: WorkspaceContext) {
+  const engine = context.opencodeProcess;
+  if (engine) ownWorkspaceResource(lease, "engine", engine, () => stopChildProcessTree(engine));
+  const stream = context.eventAbort;
+  if (stream) ownWorkspaceResource(lease, "event-stream", stream, () => stream.abort());
+  const watcher = context.watcher;
+  if (watcher) ownWorkspaceResource(lease, "watcher", watcher, () => { (watcherCleanup.get(watcher) || (() => watcher.close()))(); });
+}
+let currentWorkspaceLease: WorkspaceLease | null = null;
+
+function createWorkspaceTaskState() {
+  return {
+    activeAgentRequests: new Map<string, ActiveAgentRequest>(),
+    forwardedSessionStatus: new Map<string, string>(),
+    recentToolInputs: new Map<string, any>(),
+    engineRetryStates: new Map<string, EngineRetryState>(),
+    retryExhaustedSessions: new Set<string>(),
+    sessionModelLabels: new Map<string, string>(),
+    attemptedErrorSignatures: new Map<string, { count: number; lastAttempt: number }>(),
+    sessionTaskIds: new Map<string, string>(),
+    taskRecords: new Map<string, TaskRecord>(),
+    idleDeterminationGate: new Map<string, { running: boolean; lastAt: number }>(),
+    idleRecheckTimers: new Map<string, NodeJS.Timeout>(),
+    questionRecheckTimers: new Map<string, { timer: NodeJS.Timeout; taskId: string }>(),
+    previewErrorEmissionAt: new Map<string, number>(),
+    agentInactiveTimers: new Map<string, AgentInactiveEntry>(),
+    unknownStatusTrack: new Map<string, { enteredAt: number; persistedLogged: boolean }>(),
+    diagMessageLogCounts: new Map<string, number>(),
+    postAckDiagScheduled: new Set<string>(),
+    sessionParentMap: new Map<string, string>(),
+    statusCache: new Map<string, string>(),
+    taskQuestionCounter: 0,
+    activeWorkspace: null as WorkspaceContext | null,
+    opencodeProcess: null as ChildProcess | null,
+    opencodeUrl: "http://127.0.0.1:4097",
+    currentProject: null as string | null,
+    eventAbort: null as AbortController | null,
+    sseReconnectTimer: null as NodeJS.Timeout | null,
+    sseReconnectAttempts: 0,
+    projectWatcher: null as fs.FSWatcher | null,
+    projectWatchTimer: null as NodeJS.Timeout | null,
+    serviceReady: false,
+    serviceReadyUrl: "",
+    serviceStartPromise: null as Promise<unknown> | null,
+    serviceGeneration: 0,
+    isStoppingOpencodeIntentionally: false,
+    previewState: { status: "idle", framework: null, packageManager: null, port: null, url: null } as PreviewManagerState,
+    previewProcess: null as ChildProcess | null,
+    previewStaticServer: null as http.Server | null,
+    previewPort: null as number | null,
+    previewProjectPath: null as string | null,
+    previewStartPromise: null as Promise<PreviewManagerState> | null,
+    previewSessionCounter: 0,
+    activePreviewSessionId: 0,
+    previewRestartDebounceTimer: null as NodeJS.Timeout | null,
+    previewStaticReloadDebounceTimer: null as NodeJS.Timeout | null,
+    previewRuntimeDescriptor: null as ProjectRuntimeDescriptor | null,
+    internalPreviewView: null as WebContentsView | null,
+    internalPreviewUrl: "",
+    internalPreviewState: "idle" as InternalPreviewState,
+    internalPreviewSession: 0,
+    internalPreviewOverlayActive: false,
+    internalPreviewRequestedVisible: false,
+    previewRoutesCache: null as PreviewRoutesCache | null,
+    emptyWorkspaceWatcher: null as fs.FSWatcher | null,
+    emptyWorkspaceWatchTimer: null as NodeJS.Timeout | null,
+    emptyWorkspaceTimeoutTimer: null as NodeJS.Timeout | null
+  };
+}
+const workspaceTaskStates = new WorkspaceState(workspaceRegistry, createWorkspaceTaskState, () => currentWorkspaceLease);
+const workspaceEvents = new WorkspaceEvents(workspaceRegistry);
+const workspaceVisibility = new WorkspaceVisibility(workspaceRegistry);
+const workspaceIpc = new WorkspaceIpc<Electron.IpcMainInvokeEvent>(workspaceRegistry, () => currentWorkspaceLease);
+configureWorkspaceObjects(workspaceRegistry, () => currentWorkspaceLease);
+let workspaceTabs: WorkspaceTabs | null = null;
+const conversationTransitions = new Set<string>();
+const conversationStore = new ConversationStore(() => path.join(app.getPath("userData"), "conversations"));
+const projectConversations = new ProjectConversations(workspaceRegistry, conversationStore, async () => {
+  const client: any = await getOpencodeClient();
+  const data = (result: any) => result?.data ?? result;
+  return {
+    create: async () => data(await client.session.create({ body: { title: "NekoAI Workspace" } })),
+    get: async (id: string) => data(await client.session.get({ path: { id } })),
+    list: async () => data(await client.session.list()),
+    messages: async (id: string) => data(await client.session.messages({ path: { id } })) || []
+  };
+});
+const promptQueueGate = new PromptQueueGate();
+const promptQueueDispatching = new Set<string>();
+function pausePromptQueues(reason = "Uma tarefa encontrou um erro. Revise o problema antes de retomar as filas.") {
+  const state = promptQueueGate.pause(reason, path.basename(workspaceRuntime.currentProject || ""));
+  sendWorkspaceRenderer("prompt-queue:changed", state);
+  return state;
+}
+function traceProjectOpen(stage: string, details: Record<string, unknown> = {}) {
+  try {
+    const file = path.join(app.isPackaged ? app.getPath("userData") : app.getAppPath(), "project-open-diagnostic.jsonl");
+    if (fs.existsSync(file) && fs.statSync(file).size > 1024 * 1024) fs.writeFileSync(file, "");
+    fs.appendFileSync(file, JSON.stringify({time:new Date().toISOString(),stage,...details})+"\n");
+  } catch (error) { console.warn("[ProjectOpen diagnostic]", error); }
+}
+const rendererCaller = new AsyncLocalStorage<number>();
+const registerIpc = ipcMain.handle.bind(ipcMain);
+ipcMain.handle = (channel, listener) => registerIpc(channel, (event, ...args) => {
+ // Only known closing studios may send these harmless cleanup messages.
+ // Do not route them into the selected project or the Home bootstrap state.
+ if(workspaceTabs?.isRetired(event.sender.id) && ["preview:internalOverlay","preview:internalSync","preview:internalCapture","tabs:busy"].includes(channel))return {ok:false,closed:true,enabled:false,visible:false};
+ if(workspaceTabs&&!workspaceTabs.trusted(event.sender.id))throw new Error("Origem de IPC não autorizada.");
+ const owner=workspaceTabs?.owner(event.sender.id);
+ return rendererCaller.run(event.sender.id,()=>owner?workspaceRegistry.run(owner,()=>listener(event,...args)):workspaceRegistry.runBootstrap(()=>listener(event,...args)));
+});
+function workspaceWebContents(){const lease=getWorkspaceLease();return lease?workspaceTabs?.sender(lease)??mainWindow?.webContents:mainWindow?.webContents;}
+// Native WebContentsViews must be siblings of the studio WebContentsView.
+// Nesting the page under a WebContentsView loads it but does not composite it
+// above that studio on Windows. WorkspaceVisibility still owns tab isolation.
+function workspaceContentView(){return mainWindow?.contentView;}
+function sendWorkspaceRenderer(channel:string,...args:any[]) {
+ if(!mainWindow||mainWindow.isDestroyed())return;
+ const globalEvent=/^(chatgpt:|license:|updater:|window:|recent-projects:|runtime:|prompt-queue:)/.test(channel);
+ const lease=getWorkspaceLease();
+ if(globalEvent){for(const contents of workspaceTabs?.contents()??[mainWindow.webContents])if(!contents.isDestroyed())contents.send(channel,...args);return;}
+ if(lease){try{workspaceRegistry.assertLive(lease);}catch{return;}const target=workspaceTabs?.sender(lease);if(target&&!target.isDestroyed())target.send(channel,...args);else if(!workspaceTabs)mainWindow.webContents.send(channel,...args);return;}
+ const target=workspaceTabs?.contents().find(contents=>contents.id===rendererCaller.getStore());if(target&&!target.isDestroyed())target.send(channel,...args);else if(!workspaceTabs)mainWindow.webContents.send(channel,...args);
+}
+
+function handleWorkspaceIpc(channel: string, handler: (event: Electron.IpcMainInvokeEvent, ...args: any[]) => any) {
+  workspaceIpc.register(channel, handler);
+  ipcMain.handle(channel, (event, ...args) => workspaceIpc.current(channel, event, args));
+}
+function bindWorkspaceCallback<T extends (...args: any[]) => any>(callback: T): T {
+  const lease = getWorkspaceLease();
+  return ((...args: any[]) => {
+    if (!lease) return callback(...args);
+    try { workspaceRegistry.assertLive(lease); } catch { return; }
+    return workspaceRegistry.run(lease, () => callback(...args));
+  }) as T;
+}
+function emitWorkspacePreviewEvent(event: any) {
+  const lease = getWorkspaceLease();
+  if (!lease) { sendWorkspaceRenderer("preview:event", event); return; }
+  try { sendWorkspaceRenderer("preview:event", workspaceEvents.envelope(lease, event)); } catch {}
+}
+function runtimeGeneration(): number {
+  const lease = getWorkspaceLease();
+  if (lease) { workspaceRegistry.assertLive(lease); return workspaceRuntime.activeWorkspace?.generation ?? lease.generation; }
+  return projectTransitionGeneration;
+}
+
+type WorkspaceRuntimeFields = Pick<ReturnType<typeof createWorkspaceTaskState>, "activeWorkspace" | "opencodeProcess" | "opencodeUrl" | "currentProject" | "eventAbort" | "sseReconnectTimer" | "sseReconnectAttempts" | "projectWatcher" | "projectWatchTimer" | "serviceReady" | "serviceReadyUrl" | "serviceStartPromise" | "serviceGeneration" | "isStoppingOpencodeIntentionally" | "previewState" | "previewProcess" | "previewStaticServer" | "previewPort" | "previewProjectPath" | "previewStartPromise" | "previewSessionCounter" | "activePreviewSessionId" | "previewRestartDebounceTimer" | "previewStaticReloadDebounceTimer" | "previewRuntimeDescriptor" | "internalPreviewView" | "internalPreviewUrl" | "internalPreviewState" | "internalPreviewSession" | "internalPreviewOverlayActive" | "internalPreviewRequestedVisible" | "previewRoutesCache" | "emptyWorkspaceWatcher" | "emptyWorkspaceWatchTimer" | "emptyWorkspaceTimeoutTimer">;
+const workspaceRuntime: WorkspaceRuntimeFields = scopedFields(() => workspaceTaskStates.current());
+
+const sessionParentMap = scopedCollection(() => workspaceTaskStates.current().sessionParentMap);
+function normalizeOpenCodeEvent(event: any) { return normalizeSharedEvent(event, workspaceTaskStates.current().statusCache); }
+function clearStatusCache() { clearSharedStatusCache(workspaceTaskStates.current().statusCache); }
+function clearStatusCacheForSession(sessionId: string) { clearSharedSessionStatusCache(sessionId, workspaceTaskStates.current().statusCache); }
+function registerSessionParent(child: string, parent: string) {
+  if (!child || !parent || child === parent) return;
+  const lease = workspaceRegistry.hasContext() ? workspaceRegistry.contextLease() : currentWorkspaceLease;
+  if (lease) {
+    let parentOwner;
+    try { parentOwner = workspaceRegistry.forSession(parent); } catch {}
+    if (parentOwner && parentOwner.workspaceId !== lease.workspaceId) throw new Error("A sessão pai pertence a outro projeto.");
+    workspaceRegistry.bindSession(lease, child);
+  }
+  sessionParentMap.set(child, parent);
+}
+function emitWorkspaceEvent(event: any) {
+  const eventSessionId = String(event?.properties?.sessionID || event?.properties?.sessionId || event?.properties?.info?.sessionID || event?.properties?.part?.sessionID || event?.properties?.session?.id || "");
+  const conversationLease = workspaceRegistry.contextLease();
+  if (conversationLease && eventSessionId) {
+    const active = projectConversations.activeSession(conversationLease);
+    const root = resolveRootSessionId(eventSessionId);
+    if (active && (projectConversations.ownsRoot(conversationLease, eventSessionId) || projectConversations.ownsRoot(conversationLease, root)) && eventSessionId !== active && root !== active) return;
+  }
+  const toolFailed = event?.type === "tool.error" || (event?.properties?.part?.type === "tool" && event?.properties?.part?.state?.status === "error");
+  if ((toolFailed || ["neko.agent.retrying", "neko.process.error", "neko.connection.error"].includes(event?.type)) && taskRecords.get(eventSessionId)?.state !== "cancelled") pausePromptQueues();
+  const lease = workspaceRegistry.hasContext() ? workspaceRegistry.contextLease() : currentWorkspaceLease;
+  if (!lease) { sendWorkspaceRenderer("opencode:event", event); return; }
+  try { sendWorkspaceRenderer("opencode:event", workspaceEvents.envelope(lease, event)); } catch {}
+}
+function handleWorkspaceSessionIpc(channel: string, handler: (...args: any[]) => any) {
+  const dispatch = (event: Electron.IpcMainInvokeEvent, payload: any, ...rest: any[]) => {
+    const sessionId = typeof payload === "string" ? payload : payload?.sessionId;
+    if (!sessionId) return handler(event, payload, ...rest);
+    let lease: WorkspaceLease;
+    try { lease = workspaceRegistry.forSession(sessionId); }
+    catch (error) { if (channel === "opencode:sessionStatus") return "unknown"; throw error; }
+    const explicit = workspaceRegistry.contextLease();
+    if (explicit && (explicit.workspaceId !== lease.workspaceId || explicit.generation !== lease.generation)) throw new Error("A sessão não pertence ao workspace solicitado.");
+    return workspaceRegistry.run(lease, () => handler(event, payload, ...rest));
+  };
+  workspaceIpc.register(channel, dispatch);
+  ipcMain.handle(channel, dispatch);
+}
+
+
+ipcMain.handle("tabs:list",()=>workspaceTabs?.snapshot());
+ipcMain.handle("tabs:bootstrap",event=>workspaceTabs?.bootstrap(event.sender.id));
+ipcMain.handle("tabs:new",()=>workspaceTabs?.newHome());
+ipcMain.handle("tabs:select",(_event,id:string)=>workspaceTabs?.select(id));
+ipcMain.handle("tabs:close",(_event,id:string)=>workspaceTabs?.close(id));
+ipcMain.handle("tabs:busy",(event,busy:boolean)=>workspaceTabs?.setBusy(event.sender.id,Boolean(busy)));
+
+function conversationLease(): WorkspaceLease {
+  const lease = workspaceRegistry.contextLease();
+  if (!lease) throw new Error("Abra um projeto para acessar as conversas.");
+  workspaceRegistry.assertLive(lease);
+  return lease;
+}
+function assertConversationIdle(lease: WorkspaceLease) {
+  const project = workspaceRegistry.assertLive(lease);
+  if (project.sessionIds.some(id => promptQueueDispatching.has(id) || ["running", "waiting_for_user", "waiting_for_approval", "waiting_for_lovable_cloud"].includes(taskRecords.get(id)?.state || ""))) throw new Error("Conclua ou pare a tarefa antes de trocar de conversa.");
+}
+handleWorkspaceIpc("conversations:list", () => projectConversations.list(conversationLease()));
+handleWorkspaceIpc("conversations:save", (_event, payload: ConversationSave) => projectConversations.save(conversationLease(), payload));
+handleWorkspaceIpc("conversations:open", async (_event, payload?: { id?: string; fresh?: boolean }) => {
+  const lease = conversationLease();
+  if (conversationTransitions.has(lease.workspaceId)) throw new Error("Aguarde a abertura da conversa.");
+  assertConversationIdle(lease);
+  conversationTransitions.add(lease.workspaceId);
+  try {
+    await projectConversations.capture(lease).catch(() => {});
+    assertConversationIdle(lease);
+    const conversation = await projectConversations.open(lease, payload?.id, Boolean(payload?.fresh));
+    const result = workspaceResults.get(lease.workspaceId);
+    if (result) { result.session = { id: conversation.sessionId }; result.conversation = conversation; }
+    return conversation;
+  } finally { conversationTransitions.delete(lease.workspaceId); }
+});
+ipcMain.handle("prompt-queue:state", () => promptQueueGate.snapshot());
+ipcMain.handle("prompt-queue:pause", () => pausePromptQueues());
+ipcMain.handle("prompt-queue:resume", (_event, revision: number) => {
+  const state = promptQueueGate.resume(revision);
+  sendWorkspaceRenderer("prompt-queue:changed", state);
+  return state;
+});
+handleWorkspaceSessionIpc("prompt-queue:dispatch", async (event, payload: QueuedPromptRequest & { revision: number }) => {
+  const lease = assertCurrentSessionWorkspace(payload.sessionId);
+  if (!promptQueueGate.permits(payload.revision)) return { queueBlocked: true, gate: promptQueueGate.snapshot() };
+  const record = taskRecords.get(payload.sessionId);
+  if (conversationTransitions.has(lease.workspaceId) || projectConversations.isSwitching(lease) || promptQueueDispatching.has(payload.sessionId) || (record && !["idle", "completed", "cancelled", "failed"].includes(record.state))) {
+    return { queueBlocked: true, busy: true, gate: promptQueueGate.snapshot() };
+  }
+  promptQueueDispatching.add(payload.sessionId);
+  try {
+    await projectConversations.recordUser(lease, payload.sessionId, payload.displayText || payload.text, payload.clientRequestId, payload.attachments as any);
+    if (payload.command) {
+      const taskId = newTaskCorrelationId(payload.sessionId);
+      taskRecords.set(payload.sessionId, {
+        taskId, sessionId: payload.sessionId, state: "idle", planMode: false,
+        createdAt: Date.now(), stateAt: 0, sawBusy: false, lastActivityAt: 0,
+        lastAssistantMessageId: "", askedQuestionIds: [], lastStreamedAssistantMessageId: ""
+      });
+      setTaskState(payload.sessionId, "running", "queued-command-start");
+      await workspaceIpc.invoke(lease, "opencode:command", event, [{
+        sessionId: payload.sessionId, command: payload.command.name,
+        arguments: payload.command.args, model: payload.model
+      }]);
+      const commandRecord = taskRecords.get(payload.sessionId);
+      if (commandRecord?.taskId === taskId && commandRecord.state === "running") setTaskState(payload.sessionId, "completed", "queued-command-completed");
+      return { accepted: true, taskId };
+    }
+    return await workspaceIpc.invoke(lease, "opencode:prompt", event, [payload]);
+  } catch (error) {
+    if (taskRecords.get(payload.sessionId)?.state !== "cancelled") {
+      pausePromptQueues();
+      if (taskRecords.has(payload.sessionId)) setTaskState(payload.sessionId, "failed", "queue-dispatch-failed");
+    }
+    throw error;
+  } finally {
+    promptQueueDispatching.delete(payload.sessionId);
+  }
+});
+
+ipcMain.handle("workspaces:list", event => {
+  if (!mainWindow || !(workspaceTabs?.trusted(event.sender.id) ?? event.sender.id === mainWindow.webContents.id)) throw new Error("Origem de workspace inválida.");
+  return workspaceRegistry.list();
+});
+ipcMain.handle("workspace:invoke", (event, payload: { workspaceId: string; generation: number; channel: string; args: unknown[] }) => {
+  if (!mainWindow || !(workspaceTabs?.trusted(event.sender.id) ?? event.sender.id === mainWindow.webContents.id)) throw new Error("Origem de workspace inválida.");
+  if (!payload || typeof payload.channel !== "string" || !Array.isArray(payload.args)) throw new Error("Operação de workspace inválida.");
+  const lease = { workspaceId: payload.workspaceId, generation: payload.generation };
+  const owner=workspaceTabs?.owner(event.sender.id);
+  if(owner&&(owner.workspaceId!==lease.workspaceId||owner.generation!==lease.generation))throw new Error("A operação pertence a outra aba.");
+  return workspaceIpc.invoke(lease, payload.channel, event, payload.args);
+});
+
+function handleWorkspaceProposalIpc(channel: string, handler: (...args: any[]) => any) {
+  const dispatch = (event: Electron.IpcMainInvokeEvent, payload: { proposalId?: string }) => {
+    const proposal = payload?.proposalId ? migrationManager.getProposal(payload.proposalId) : null;
+    if (!proposal?.sessionId) throw new Error("Proposta de migração sem sessão de origem válida.");
+    const lease = workspaceRegistry.forSession(proposal.sessionId);
+    const explicit = workspaceRegistry.contextLease();
+    if (explicit && (explicit.workspaceId !== lease.workspaceId || explicit.generation !== lease.generation)) {
+      throw new Error("A proposta pertence a outro workspace.");
+    }
+    return workspaceRegistry.run(lease, () => handler(event, payload));
+  };
+  workspaceIpc.register(channel, dispatch);
+  ipcMain.handle(channel, dispatch);
+}
+
+function resolveWorkspaceProjectPath(requested?: string): string | undefined {
+  const lease = getWorkspaceLease();
+  if (!lease) return requested;
+  const owner = workspaceRegistry.assertLive(lease);
+  if (requested) {
+    const canonical = fs.realpathSync.native(path.resolve(requested));
+    const normalize = (value: string) => process.platform === "win32" ? path.normalize(value).toLowerCase() : path.normalize(value);
+    if (normalize(canonical) !== normalize(owner.projectPath)) throw new Error("A pasta solicitada pertence a outro workspace.");
+  }
+  return owner.projectPath;
+}
+
+function forwardWorkspaceMigrationEvent(eventType: string, payload: any) {
+  const proposal = payload?.proposal ?? payload;
+  if (!proposal?.sessionId) return;
+  try {
+    const owner = workspaceRegistry.forSession(proposal.sessionId);
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    workspaceRegistry.run(owner,()=>sendWorkspaceRenderer("supabase:migration-event", {
+      type: `supabase:migration:${eventType}`, payload,
+      workspaceId: owner.workspaceId, workspaceGeneration: owner.generation
+    }));
+  } catch {
+    // An event from a closed session cannot be assigned to the selected project.
+  }
+}
+
+function getWorkspaceLease(): WorkspaceLease | null { return (workspaceRegistry.hasContext() ? workspaceRegistry.contextLease() : currentWorkspaceLease) ?? null; }
+
+function assertCurrentSessionWorkspace(sessionId: string): WorkspaceLease {
+  const lease = workspaceRegistry.hasContext() ? workspaceRegistry.contextLease() : currentWorkspaceLease;
+  if (!lease) throw new Error("O projeto ainda não está pronto para receber operações.");
+  workspaceRegistry.assertSession(lease, resolveRootSessionId(sessionId) || sessionId);
+  return lease;
+}
+
+function captureSessionService(sessionId: string): WorkspaceServiceTarget {
+  return workspaceServices.capture(workspaceRegistry.forSession(resolveRootSessionId(sessionId) || sessionId));
+}
+
+async function fetchSessionService(sessionId: string, endpoint: string, timeoutMs = 4000): Promise<Response> {
+  const target = captureSessionService(sessionId);
+  return workspaceServices.request(target, endpoint,
+    { headers: workspaceServices.headers(target, opencodeAuthHeaders()) },
+    (input, init) => fetchWithTimeout(String(input), init, timeoutMs));
+}
+
+async function closeWorkspaceIdentity(lease:WorkspaceLease){
+ workspaceRegistry.assertLive(lease);
+ await workspaceRegistry.run(lease,async()=>{
+  await projectConversations.capture(lease).catch(error => console.warn("[Conversations] Fechamento:", String(error?.message || error)));
+  await conversationStore.flush();
+  cancelCurrentPublishOperation(workspaceRuntime.currentProject??undefined);
+  workspaceServices.detach(lease);resetTaskRuntime();cancelSseReconnect("workspace-closing");
+  for(const proposal of migrationManager.getPendingProposals())if(workspaceRegistry.assertLive(lease).sessionIds.includes(proposal.sessionId))migrationManager.cancelProposal(proposal.id);
+  await workspaceResources.close(lease);await stopPreview();await stopOpenCode();await closeWorkspaceObjects(lease);
+ });
+ projectConversations.release(lease);
+ chatGptManager.detachWorkspace(lease.workspaceId,lease.generation);
+ workspacePorts.releaseAll(lease);workspaceRegistry.close(lease);workspaceTaskStates.discard(lease);workspaceResources.retire(lease);
+ if(currentWorkspaceLease?.workspaceId===lease.workspaceId){currentWorkspaceLease=null;workspaceVisibility.select(null);}
+}
+async function releaseCurrentWorkspaceIdentity(){const lease=getWorkspaceLease();if(lease)await closeWorkspaceIdentity(lease);}
+
 let mainWindow: BrowserWindow | null = null;
-let opencodeProcess: ChildProcess | null = null;
-let opencodeUrl = "http://127.0.0.1:4097";
-let currentProject: string | null = null;
-let eventAbort: AbortController | null = null;
-let sseReconnectTimer: NodeJS.Timeout | null = null;
-let sseReconnectAttempts = 0;
+
+
+
+
+
+
 
 function cancelSseReconnect(reason = "cancelled") {
-  if (sseReconnectTimer) {
-    clearTimeout(sseReconnectTimer);
-    sseReconnectTimer = null;
+  if (workspaceRuntime.sseReconnectTimer) {
+    clearTimeout(workspaceRuntime.sseReconnectTimer);
+    workspaceRuntime.sseReconnectTimer = null;
     console.log(`[OpenCode/SSE] reconnect cancelled reason=${reason}`);
   }
-  sseReconnectAttempts = 0;
+  workspaceRuntime.sseReconnectAttempts = 0;
 }
-let projectWatcher: fs.FSWatcher | null = null;
-let projectWatchTimer: NodeJS.Timeout | null = null;
+
+
 
 // Service readiness gate. A server "start" spans process spawn + the first
 // successful health check. Dependent IPC handlers (providers:list, models:list,
 // ...) await this gate instead of connecting immediately, which eliminates the
 // ECONNREFUSED race that happened when the renderer asked for providers while
 // the internal service was still binding its port.
-let serviceReady = false;
-let serviceReadyUrl = "";
-let serviceStartPromise: Promise<unknown> | null = null;
-let serviceGeneration = 0;
+
+
+
+
 let projectTransitionGeneration = 0;
-let activeWorkspaceTransitionPromise: Promise<any> | null = null;
-let isStoppingOpencodeIntentionally = false;
+
+
 
 function logService(step: string, extra?: string) {
   console.log(`[Neko/Service] ${step}${extra ? ` ${extra}` : ""}`);
@@ -145,7 +558,7 @@ function logService(step: string, extra?: string) {
 // applicationRoot: where NekoAI is installed/running (its own code).
 // projectRoot: the user's open workspace. These can NEVER be the same.
 //
-// The active workspace (activeWorkspace.projectPath) is the single source
+// The active workspace (workspaceRuntime.activeWorkspace.projectPath) is the single source
 // of truth. There is NO fallback to process.cwd(), __dirname or
 // app.getAppPath() when resolving the user project: if the root cannot be
 // determined or points inside NekoAI itself, the operation is blocked.
@@ -195,7 +608,7 @@ function assertProjectRootSafe(root: string | null | undefined, operation: strin
 // Best-effort read of the current project root. Returns null instead of
 // throwing so headers/SSE streams can degrade safely without a fallback.
 function getActiveProjectRoot(): string | null {
-  const candidate = activeWorkspace?.projectPath ?? currentProject;
+  const candidate = workspaceRuntime.activeWorkspace?.projectPath ?? workspaceRuntime.currentProject;
   if (!candidate) return null;
   try {
     const resolved = path.resolve(candidate);
@@ -211,36 +624,37 @@ function logProjectWorkspace(operation: string, projectRoot: string | null) {
 }
 
 function invalidateServiceGate() {
-  serviceGeneration += 1;
-  serviceReady = false;
-  serviceReadyUrl = "";
-  serviceStartPromise = null;
+  workspaceRuntime.serviceGeneration += 1;
+  workspaceRuntime.serviceReady = false;
+  workspaceRuntime.serviceReadyUrl = "";
+  workspaceRuntime.serviceStartPromise = null;
 }
 
 async function waitForServiceReady(): Promise<void> {
-  if (serviceReady) return;
-  if (activeWorkspaceTransitionPromise) {
+  if (workspaceRuntime.serviceReady) return;
+  const ownInitialization=workspaceOpenPromises.get(getWorkspaceLease()?.workspaceId??"");
+  if (ownInitialization) {
     logService("waiting-for-transition");
     try {
-      await activeWorkspaceTransitionPromise;
+      await ownInitialization;
     } catch {}
-    if (serviceReady) return;
+    if (workspaceRuntime.serviceReady) return;
   }
-  const gate = serviceStartPromise;
+  const gate = workspaceRuntime.serviceStartPromise;
   if (gate) {
     logService("waiting-for-ready");
     try {
       await gate;
     } catch {}
-    if (serviceReady) return;
+    if (workspaceRuntime.serviceReady) return;
     throw new Error("O serviço interno não ficou pronto a tempo.");
   }
 }
 
-type ActiveAgentRequest = { requestBody: any; attempts: number; maxAttempts: number; retryTimer?: NodeJS.Timeout; isRetrying?: boolean };
-const activeAgentRequests = new Map<string, ActiveAgentRequest>();
-const forwardedSessionStatus = new Map<string, string>();
-const recentToolInputs = new Map<string, any>();
+type ActiveAgentRequest = { target: WorkspaceServiceTarget; requestBody: any; attempts: number; maxAttempts: number; retryTimer?: NodeJS.Timeout; isRetrying?: boolean; restoredContext?: boolean };
+const activeAgentRequests = scopedCollection(() => workspaceTaskStates.current().activeAgentRequests);
+const forwardedSessionStatus = scopedCollection(() => workspaceTaskStates.current().forwardedSessionStatus);
+const recentToolInputs = scopedCollection(() => workspaceTaskStates.current().recentToolInputs);
 const AGENT_RETRY_DELAYS_MS = [2000, 4000, 8000, 15000, 30000, 60000, 120000, 180000];
 
 // Engine-level retry watchdog. OpenCode can alternate session.status between
@@ -251,10 +665,10 @@ const AGENT_RETRY_DELAYS_MS = [2000, 4000, 8000, 15000, 30000, 60000, 120000, 18
 // counter, so a valid recovery returns to the working state.
 const ENGINE_MAX_RETRY_CYCLES = 3;
 type EngineRetryState = { cycles: number; phase: "retry" | "busy" | "idle"; reason: string; lastRetryAt: number };
-const engineRetryStates = new Map<string, EngineRetryState>();
-const retryExhaustedSessions = new Set<string>();
-const sessionModelLabels = new Map<string, string>();
-const attemptedErrorSignatures = new Map<string, { count: number; lastAttempt: number }>();
+const engineRetryStates = scopedCollection(() => workspaceTaskStates.current().engineRetryStates);
+const retryExhaustedSessions = scopedCollection(() => workspaceTaskStates.current().retryExhaustedSessions);
+const sessionModelLabels = scopedCollection(() => workspaceTaskStates.current().sessionModelLabels);
+const attemptedErrorSignatures = scopedCollection(() => workspaceTaskStates.current().attemptedErrorSignatures);
 
 function isNonRetryableQuotaOrLimitError(message: string): boolean {
   if (!message || typeof message !== "string") return false;
@@ -294,9 +708,9 @@ process.on("unhandledRejection", (reason: unknown) => {
 // the session.idle events of that task, so the renderer can distinguish the
 // idle of task A from the idle of task B and never conclude the wrong task.
 let promptTaskCounter = 0;
-const sessionTaskIds = new Map<string, string>();
+const sessionTaskIds = scopedCollection(() => workspaceTaskStates.current().sessionTaskIds);
 function resolveRootSessionId(sessionId: string): string {
-  return resolveRootFromTree(sessionId, (sid) => taskRecords.has(sid));
+  return resolveRootFromTree(sessionId, (sid) => taskRecords.has(sid), sessionParentMap);
 }
 
 function newTaskCorrelationId(sessionId: string): string {
@@ -342,14 +756,14 @@ type TaskRecord = {
   // exposes the very message the engine just streamed.
   lastStreamedAssistantMessageId: string;
 };
-const taskRecords = new Map<string, TaskRecord>();
-let taskQuestionCounter = 0;
-const idleDeterminationGate = new Map<string, { running: boolean; lastAt: number }>();
-const idleRecheckTimers = new Map<string, NodeJS.Timeout>();
+const taskRecords = scopedCollection(() => workspaceTaskStates.current().taskRecords);
+
+const idleDeterminationGate = scopedCollection(() => workspaceTaskStates.current().idleDeterminationGate);
+const idleRecheckTimers = scopedCollection(() => workspaceTaskStates.current().idleRecheckTimers);
 // Single short recheck for the message-commit race (see runIdleDetermination).
 // Deduplicated by task+session so only one recheck ever runs per idle cycle.
-const questionRecheckTimers = new Map<string, { timer: NodeJS.Timeout; taskId: string }>();
-const previewErrorEmissionAt = new Map<string, number>();
+const questionRecheckTimers = scopedCollection(() => workspaceTaskStates.current().questionRecheckTimers);
+const previewErrorEmissionAt = scopedCollection(() => workspaceTaskStates.current().previewErrorEmissionAt);
 // Safety net against tasks stuck in "running": OpenCode can accept a prompt and
 // then never emit activity, messages, tool calls or session.idle. Conclusion
 // only happens inside runIdleDetermination (triggered by session.idle), so such
@@ -364,12 +778,12 @@ const AGENT_INACTIVE_LIMIT_MS = Math.max(5_000, Number(process.env.NEKO_AGENT_ST
 // normal flow takes over. No loops, no periodic polling.
 const AGENT_INACTIVE_UNKNOWN_RECHECK_MS = Math.max(5_000, Number(process.env.NEKO_AGENT_STALE_UNKNOWN_RECHECK_MS) || 30_000);
 type AgentInactiveEntry = { timer: NodeJS.Timeout; taskId: string; unknownRecheck: boolean };
-const agentInactiveTimers = new Map<string, AgentInactiveEntry>();
+const agentInactiveTimers = scopedCollection(() => workspaceTaskStates.current().agentInactiveTimers);
 // Diagnostic-only trackers (never decide state): unknown-status transitions,
 // sampled SSE message logging and one-shot post-ACK probes.
-const unknownStatusTrack = new Map<string, { enteredAt: number; persistedLogged: boolean }>();
-const diagMessageLogCounts = new Map<string, number>();
-const postAckDiagScheduled = new Set<string>();
+const unknownStatusTrack = scopedCollection(() => workspaceTaskStates.current().unknownStatusTrack);
+const diagMessageLogCounts = scopedCollection(() => workspaceTaskStates.current().diagMessageLogCounts);
+const postAckDiagScheduled = scopedCollection(() => workspaceTaskStates.current().postAckDiagScheduled);
 
 // In-memory capability cache for the provider catalog, refreshed whenever
 // the renderer loads providers. Vision capability decisions never trigger
@@ -427,12 +841,19 @@ function setTaskState(sessionId: string, state: TaskState, reason: string, extra
 
   record.state = state;
   record.stateAt = Date.now();
+  if (state === "failed") pausePromptQueues();
+  if (["completed", "failed", "cancelled"].includes(state)) {
+    const conversationLease = workspaceRegistry.contextLease();
+    if (conversationLease && projectConversations.activeSession(conversationLease) === sessionId) {
+      void projectConversations.capture(conversationLease).catch(error => console.warn("[Conversations] Captura final:", String(error?.message || error)));
+    }
+  }
   if (state === "completed" || state === "cancelled" || state === "failed") {
     previewErrorEmissionAt.clear();
     attemptedErrorSignatures.clear();
   }
   logTask("state-change", record.taskId, sessionId, `state=${state} previous=${previous} reason=${logSafeText(reason)}`);
-  mainWindow?.webContents.send("opencode:event", {
+  emitWorkspaceEvent({
     type: "neko.task.state",
     properties: {
       sessionID: sessionId,
@@ -497,7 +918,7 @@ function normalizeTimestamp(value: unknown): number {
 // block or influence a new task.
 async function fetchPendingPermissions(sessionId: string, timeoutMs = 4000): Promise<any[]> {
   try {
-    const response = await fetchWithTimeout(`${opencodeUrl}/permission`, { headers: opencodeRequestHeaders() }, timeoutMs);
+    const response = await fetchSessionService(sessionId, "/permission", timeoutMs);
     if (!response.ok) return [];
     const payload = await response.json();
     const list = Array.isArray(payload) ? payload : (payload?.data ?? payload?.permissions ?? []);
@@ -521,11 +942,7 @@ async function fetchPendingPermissions(sessionId: string, timeoutMs = 4000): Pro
 
 async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000): Promise<{ id: string; text: string; created: number } | null> {
   try {
-    const response = await fetchWithTimeout(
-      `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
-      { headers: opencodeRequestHeaders() },
-      timeoutMs
-    );
+    const response = await fetchSessionService(sessionId, `/session/${encodeURIComponent(sessionId)}/message`, timeoutMs);
     if (!response.ok) return null;
     const payload: any = await response.json();
     const entries: any[] = Array.isArray(payload) ? payload : (payload?.data ?? []);
@@ -552,11 +969,7 @@ async function fetchLatestAssistantMessage(sessionId: string, timeoutMs = 4000):
 
 async function fetchLatestToolInput(sessionId: string, toolPattern: string, timeoutMs = 4000): Promise<{ input: any; name?: string; tool?: string } | null> {
   try {
-    const response = await fetchWithTimeout(
-      `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
-      { headers: opencodeRequestHeaders() },
-      timeoutMs
-    );
+    const response = await fetchSessionService(sessionId, `/session/${encodeURIComponent(sessionId)}/message`, timeoutMs);
     if (!response.ok) return null;
     const payload: any = await response.json();
     const entries: any[] = Array.isArray(payload) ? payload : (payload?.data ?? []);
@@ -679,7 +1092,7 @@ function extractQuestionOptions(text: string): string[] {
 // task that is still being processed.
 async function fetchSessionEngineStatus(sessionId: string, timeoutMs = 4000): Promise<"busy" | "retry" | "idle" | "unknown"> {
   try {
-    const response = await fetchWithTimeout(`${opencodeUrl}/session/status`, { headers: opencodeRequestHeaders() }, timeoutMs);
+    const response = await fetchSessionService(sessionId, "/session/status", timeoutMs);
     if (!response.ok) {
       trackUnknownStatus(sessionId, "unknown");
       return "unknown";
@@ -763,7 +1176,7 @@ async function runPostAckDiag(sessionId: string, taskId: string) {
   let lastMessageAgeMs = -1;
   try {
     const response = await fetchWithTimeout(
-      `${opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
+      `${workspaceRuntime.opencodeUrl}/session/${encodeURIComponent(sessionId)}/message`,
       { headers: opencodeRequestHeaders() },
       5000
     );
@@ -799,6 +1212,26 @@ function logSampledMessageEvent(eventType: string, props: any, sessionId: string
   const key = `${eventType}:${sessionId}:${messageId || "-"}`;
   const count = (diagMessageLogCounts.get(key) ?? 0) + 1;
   diagMessageLogCounts.set(key, count);
+
+  // Observabilidade segura para ferramentas e Agent Skills
+  if (partType === "tool") {
+    const part = props?.part;
+    const toolName = String(part?.tool ?? part?.name ?? part?.call?.name ?? "");
+    const toolStatus = String(part?.state?.status ?? "pending");
+    const input = part?.state?.input ?? part?.input ?? {};
+    const skillName = toolName === "skill" ? String(input?.name ?? input?.id ?? "") : "";
+    const filePath = String(input?.filePath ?? input?.path ?? input?.file ?? "");
+    const playbook = filePath.includes(".agents/skills") || filePath.includes(".agents\\skills")
+      ? filePath.replace(/.*\.agents[/\\]skills[/\\]/, ".agents/skills/").replace(/\\/g, "/")
+      : "";
+
+    const activeReq = sessionId ? activeAgentRequests.get(sessionId) : undefined;
+    const model = activeReq?.requestBody?.model ? `${activeReq.requestBody.model.providerID}/${activeReq.requestBody.model.modelID}` : "unknown";
+
+    console.log(`[Neko/OpenCode][tool] session=${sessionId} model=${model} tool=${toolName || "-"} skill=${skillName || "-"} status=${toolStatus}${playbook ? ` playbook=${playbook}` : ""}`);
+    return;
+  }
+
   if (eventType === "message.part.updated" && count > 3 && count % 25 !== 0) return;
   console.log(`[Neko/OpenCode][diag] event=${eventType} session=${sessionId} message=${messageId || "-"} role=${role || "-"} part=${partType || "-"} textLength=${textLength} seq=${count}`);
 }
@@ -921,7 +1354,7 @@ function tryDetectQuestion(record: TaskRecord, latest: { id: string; text: strin
   if (detectQuestion(latest.text)) {
     const isPlanApproval = Boolean(record.planMode);
     record.lastAssistantMessageId = latest.id;
-    const questionId = `q${(++taskQuestionCounter).toString(36)}`;
+    const questionId = `q${(++workspaceTaskStates.current().taskQuestionCounter).toString(36)}`;
     record.askedQuestionIds.push(questionId);
     setTaskState(record.sessionId, "waiting_for_user", isPlanApproval ? "plan-approval-asked" : "question-asked", {
       questionId,
@@ -1060,7 +1493,7 @@ async function runIdleDetermination(sessionId: string, taskId: string, isQuestio
         if (planText.length > 0 && record.lastAssistantMessageId !== latest.id) {
           record.lastAssistantMessageId = latest.id;
           record.planApprovalAsked = true;
-          const questionId = `q${(++taskQuestionCounter).toString(36)}`;
+          const questionId = `q${(++workspaceTaskStates.current().taskQuestionCounter).toString(36)}`;
           record.askedQuestionIds.push(questionId);
           setTaskState(sessionId, "waiting_for_user", "plan-approval-asked", {
             questionId,
@@ -1094,6 +1527,7 @@ function resetTaskRuntime() {
   for (const active of activeAgentRequests.values()) {
     if (active.retryTimer) clearTimeout(active.retryTimer);
   }
+  for (const sessionId of new Set([...activeAgentRequests.keys(), ...taskRecords.keys(), ...sessionTaskIds.keys()])) cancelVisionFallbackFor(sessionId);
   activeAgentRequests.clear();
   forwardedSessionStatus.clear();
   engineRetryStates.clear();
@@ -1101,7 +1535,7 @@ function resetTaskRuntime() {
   taskRecords.clear();
   sessionTaskIds.clear();
   sessionParentMap.clear();
-  taskQuestionCounter = 0;
+  workspaceTaskStates.current().taskQuestionCounter = 0;
   idleDeterminationGate.clear();
   for (const timer of idleRecheckTimers.values()) clearTimeout(timer);
   idleRecheckTimers.clear();
@@ -1114,8 +1548,7 @@ function resetTaskRuntime() {
   postAckDiagScheduled.clear();
   previewErrorEmissionAt.clear();
   attemptedErrorSignatures.clear();
-  clearVisionFallbackSessions();
-  cancelAllSiteClones();
+
   clearStatusCache();
 }
 
@@ -1177,7 +1610,7 @@ function isRecoverableAgentError(raw: any) {
 }
 
 function emitAgentRetry(sessionId: string, attempt: number, delayMs: number, reason: string) {
-  mainWindow?.webContents.send("opencode:event", { type: "neko.agent.retrying", properties: { sessionID: sessionId, attempt, maxAttempts: AGENT_RETRY_DELAYS_MS.length + 1, delayMs, reason } });
+  emitWorkspaceEvent({ type: "neko.agent.retrying", properties: { sessionID: sessionId, attempt, maxAttempts: AGENT_RETRY_DELAYS_MS.length + 1, delayMs, reason } });
 }
 
 function clearActiveAgentRequest(sessionId: string) {
@@ -1189,6 +1622,7 @@ function clearActiveAgentRequest(sessionId: string) {
 function scheduleAgentRetry(sessionId: string, rawError: any) {
   const active = activeAgentRequests.get(sessionId);
   if (!active || active.retryTimer) return Boolean(active);
+  try { workspaceServices.assertCurrent(active.target); } catch { return false; }
   const index = active.attempts - 1;
   if (index >= AGENT_RETRY_DELAYS_MS.length) return false;
   const delayMs = AGENT_RETRY_DELAYS_MS[index];
@@ -1199,10 +1633,10 @@ function scheduleAgentRetry(sessionId: string, rawError: any) {
   emitAgentRetry(sessionId, active.attempts - 1, delayMs, reason);
   active.retryTimer = setTimeout(async () => {
     const current = activeAgentRequests.get(sessionId);
-    if (!current) return;
+    if (!current || current !== active) return;
     current.retryTimer = undefined;
     try {
-      const response = await fetchWithTimeout(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/prompt_async`, { method: "POST", headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() }, body: JSON.stringify(current.requestBody) }, 30000);
+      const response = await workspaceServices.request(current.target, `/session/${encodeURIComponent(sessionId)}/prompt_async`, { method: "POST", headers: { "Content-Type": "application/json", ...workspaceServices.headers(current.target, opencodeAuthHeaders()) }, body: JSON.stringify(current.requestBody) }, (input, init) => fetchWithTimeout(String(input), init, 30000));
       if (!response.ok) {
         const body = await response.text().catch(() => "");
         const synthetic = { error: { data: { statusCode: response.status, message: body.slice(0, 500), isRetryable: response.status >= 500 || response.status === 429 } } };
@@ -1211,22 +1645,25 @@ function scheduleAgentRetry(sessionId: string, rawError: any) {
             setTaskState(sessionId, "failed", "retry-exhausted");
             logTask("failed", resolveTaskIdForSession(sessionId), sessionId, "reason=retry-exhausted");
           }
-          mainWindow?.webContents.send("opencode:event", { type: "session.error", properties: synthetic.error });
+          emitWorkspaceEvent({ type: "session.error", properties: { ...synthetic.error, sessionID: sessionId, workspaceId: current.target.workspaceId, generation: current.target.generation } });
           clearActiveAgentRequest(sessionId);
         }
         return;
       }
       current.isRetrying = false;
+      if (current.restoredContext) await projectConversations.contextDelivered(current.target, sessionId).catch(() => {});
       perfMark("t2", sessionId);
       console.log(`[Neko/Agent] retry aceito session=${sessionId} attempt=${current.attempts}`);
     } catch (error: any) {
+      try { workspaceServices.assertCurrent(current.target); }
+      catch { if (activeAgentRequests.get(sessionId) === current) clearActiveAgentRequest(sessionId); return; }
       const synthetic = { error: { data: { message: String(error?.message ?? error), isRetryable: true } } };
       if (!scheduleAgentRetry(sessionId, synthetic)) {
         if (taskRecords.has(sessionId)) {
           setTaskState(sessionId, "failed", "retry-exhausted");
           logTask("failed", resolveTaskIdForSession(sessionId), sessionId, "reason=retry-exhausted");
         }
-        mainWindow?.webContents.send("opencode:event", { type: "session.error", properties: synthetic.error });
+        emitWorkspaceEvent({ type: "session.error", properties: { ...synthetic.error, sessionID: sessionId, workspaceId: current.target.workspaceId, generation: current.target.generation } });
         clearActiveAgentRequest(sessionId);
       }
     }
@@ -1383,7 +1820,7 @@ async function resolveGithubAccountForProject(projectPath?: string | null, prefe
     if (acc) return acc;
   }
 
-  const proj = projectPath || currentProject;
+  const proj = projectPath || workspaceRuntime.currentProject;
   let linkedRepo: string | null = null;
   if (proj) {
     try {
@@ -1613,7 +2050,7 @@ type ActiveGitProcess = {
   child: ChildProcess;
 };
 const activeGitProcesses = new Map<number, ActiveGitProcess>();
-let activePublishAbortController: AbortController | null = null;
+const publishRuntime = new WorkspaceState(workspaceRegistry,()=>({controller:null as AbortController|null}),()=>currentWorkspaceLease);
 
 function killChildProcessTree(pid: number) {
   if (!pid) return;
@@ -1750,9 +2187,9 @@ async function cleanupStaleGitLocks(projectPath: string): Promise<void> {
 }
 
 function cancelCurrentPublishOperation(projectPath?: string) {
-  if (activePublishAbortController) {
-    try { activePublishAbortController.abort(); } catch {}
-    activePublishAbortController = null;
+  if (publishRuntime.current().controller) {
+    try { publishRuntime.current().controller!.abort(); } catch {}
+    publishRuntime.current().controller = null;
   }
   if (projectPath) {
     const norm = path.resolve(projectPath).toLowerCase();
@@ -2153,9 +2590,9 @@ async function getGitStatus(targetProject?: string): Promise<GitStatus> {
   const emptySummary: GitStatusSummary = { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 };
   let projectPath: string | null = null;
   try {
-    projectPath = targetProject ? assertProjectRootSafe(targetProject, "git-read") : currentProject;
+    projectPath = targetProject ? assertProjectRootSafe(targetProject, "git-read") : workspaceRuntime.currentProject;
   } catch {
-    projectPath = currentProject;
+    projectPath = workspaceRuntime.currentProject;
   }
   if (!projectPath) {
     return { initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, ahead: 0, behind: 0, diverged: false, canFastForward: false, changedFiles: [], summary: emptySummary };
@@ -2229,7 +2666,7 @@ async function getGithubStatus(targetProject?: string | null, preferredAccountId
     return { connected: false, activeAccount: null, accounts: [], repos: [] as GithubRepo[] };
   }
 
-  const proj = targetProject || currentProject;
+  const proj = targetProject || workspaceRuntime.currentProject;
   const activeRecord = await resolveGithubAccountForProject(proj, preferredAccountId);
   if (!activeRecord) {
     return { connected: false, activeAccount: null, accounts: githubAccountManager.getAccountsSummary(), repos: [] as GithubRepo[] };
@@ -2491,8 +2928,8 @@ async function pollGithubDevice(deviceCode: string, intervalSeconds: number, att
         console.log(`[GitHub/Accounts] saving account login=${userLogin}`);
         githubAccountManager.saveAccountRecord(newRecord);
         console.log("[GitHub/Accounts] account saved");
-        if (currentProject) {
-          githubAccountManager.setProjectAssociation(currentProject, newRecord.id);
+        if (workspaceRuntime.currentProject) {
+          githubAccountManager.setProjectAssociation(workspaceRuntime.currentProject, newRecord.id);
         }
 
         // Clean up pending session state on completion
@@ -2503,8 +2940,8 @@ async function pollGithubDevice(deviceCode: string, intervalSeconds: number, att
           githubAuthState.isStarting = false;
         }
 
-        const status = await getGithubStatus(currentProject, newRecord.id);
-        mainWindow?.webContents.send("github:event", { type: "github.connected", properties: status });
+        const status = await getGithubStatus(workspaceRuntime.currentProject, newRecord.id);
+        sendWorkspaceRenderer("github:event", { type: "github.connected", properties: status });
         return;
       }
 
@@ -2556,15 +2993,20 @@ function opencodeDirectoryHeaders(): Record<string, string> {
   return root ? { "x-opencode-directory": encodeURIComponent(root) } : {};
 }
 
-async function getOpencodeClient() {
+async function getOpencodeClient(target?: WorkspaceServiceTarget) {
+  // Capture BEFORE importing asynchronously. Selection may change while the SDK loads.
+  if (target) workspaceServices.assertCurrent(target);
+  const directory = target?.projectPath ?? getActiveProjectRoot();
+  const baseUrl = target?.engineUrl ?? workspaceRuntime.opencodeUrl;
+  const headers = opencodeAuthHeaders();
   const sdk = await import("@opencode-ai/sdk");
-  const directory = getActiveProjectRoot();
+  if (target) workspaceServices.assertCurrent(target);
   return sdk.createOpencodeClient({
-    baseUrl: opencodeUrl,
+    baseUrl,
     throwOnError: true,
     // Keep the original x-opencode-directory behavior; layer the Basic Auth
     // header when the local server requires it.
-    headers: opencodeAuthHeaders(),
+    headers,
     ...(directory ? { directory } : {})
   });
 }
@@ -2649,9 +3091,12 @@ async function waitForServer(url: string, timeout = 20000) {
 }
 
 function stopProjectWatcher() {
-  if (projectWatchTimer) { clearTimeout(projectWatchTimer); projectWatchTimer = null; }
-  try { projectWatcher?.close(); } catch {}
-  projectWatcher = null;
+  if (workspaceRuntime.projectWatchTimer) { clearTimeout(workspaceRuntime.projectWatchTimer); workspaceRuntime.projectWatchTimer = null; }
+  const watcher = workspaceRuntime.projectWatcher;
+  if (watcher) {
+    try { (watcherCleanup.get(watcher) || (() => watcher.close()))(); forgetWorkspaceResource(watcher); } catch {}
+  }
+  workspaceRuntime.projectWatcher = null;
 }
 
 const WATCHER_IGNORED_DIRS = new Set([
@@ -2672,22 +3117,23 @@ function shouldIgnoreWatcherPath(value: string) {
 
 function startProjectWatcher(projectPath: string, gen?: number) {
   stopProjectWatcher();
-  const watcherGen = typeof gen === "number" ? gen : projectTransitionGeneration;
+  let watcherTimer: NodeJS.Timeout | null = null;
+  const watcherGen = typeof gen === "number" ? gen : (workspaceRuntime.activeWorkspace?.generation ?? projectTransitionGeneration);
   try {
     const watcher = fs.watch(projectPath, { recursive: true }, (_eventType, filename) => {
       const changedPath = filename ? String(filename).replaceAll("\\", "/") : "";
       if (shouldIgnoreWatcherPath(changedPath)) return;
-      if (activeWorkspace && activeWorkspace.generation !== watcherGen) {
-        console.log(`[Watcher] stale event ignored path=${changedPath} generation=${watcherGen} activeGeneration=${activeWorkspace.generation}`);
+      if (workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation !== watcherGen) {
+        console.log(`[Watcher] stale event ignored path=${changedPath} generation=${watcherGen} activeGeneration=${workspaceRuntime.activeWorkspace.generation}`);
         return;
       }
-      if (projectWatchTimer) clearTimeout(projectWatchTimer);
-      projectWatchTimer = setTimeout(() => {
-        projectWatchTimer = null;
-        if (activeWorkspace && activeWorkspace.generation !== watcherGen) return;
+      if (watcherTimer) clearTimeout(watcherTimer);
+      watcherTimer = setTimeout(() => {
+        watcherTimer = null;
+        if (workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation !== watcherGen) return;
         console.log("[Neko/Files] alteração detectada", changedPath || "projeto");
         perfMark("t5");
-        mainWindow?.webContents.send("opencode:event", {
+        emitWorkspaceEvent({
           type: "neko.project.changed",
           properties: { path: changedPath, generation: watcherGen }
         });
@@ -2696,11 +3142,18 @@ function startProjectWatcher(projectPath: string, gen?: number) {
     });
     watcher.on("error", (err: any) => {
       console.warn("[Neko/Files] watcher error:", err?.message ?? err);
-      stopProjectWatcher();
+      if (workspaceRuntime.projectWatcher === watcher) stopProjectWatcher();
+      else { try { watcherCleanup.get(watcher)?.(); forgetWorkspaceResource(watcher); } catch {} }
     });
-    projectWatcher = watcher;
-    if (activeWorkspace && activeWorkspace.generation === watcherGen) {
-      activeWorkspace.watcher = watcher;
+    watcherCleanup.set(watcher, () => {
+      if (watcherTimer) clearTimeout(watcherTimer);
+      watcherTimer = null;
+      watcher.close();
+    });
+    workspaceRuntime.projectWatcher = watcher;
+    if (getWorkspaceLease()) ownWorkspaceResource(getWorkspaceLease()!, "watcher", watcher, () => { watcherCleanup.get(watcher)!(); });
+    if (workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation === watcherGen) {
+      workspaceRuntime.activeWorkspace.watcher = watcher;
     }
     console.log("[Neko/Files] watcher ativo", projectPath, `gen=${watcherGen}`);
   } catch (error: any) {
@@ -2716,8 +3169,10 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
 
   const executable = getOpencodePath();
   const port = await findFreePort(4097);
-  opencodeUrl = `http://127.0.0.1:${port}`;
-  currentProject = safeProjectPath;
+  workspaceRuntime.opencodeUrl = `http://127.0.0.1:${port}`;
+  const engineStartUrl = workspaceRuntime.opencodeUrl;
+  const engineStartHeaders = { ...opencodeAuthHeaders(), "x-opencode-directory": encodeURIComponent(safeProjectPath) };
+  workspaceRuntime.currentProject = safeProjectPath;
   startProjectWatcher(safeProjectPath, transitionGen);
 
   console.log("[Neko/OpenCode] starting", { executable, projectPath: safeProjectPath, port, generation: transitionGen });
@@ -2754,31 +3209,34 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     }
   );
 
-  opencodeProcess = child;
+  child.once("exit",workspacePorts.releaseCallback(port));
+  child.once("error",workspacePorts.releaseCallback(port));
+  workspaceRuntime.opencodeProcess = child;
+  if (getWorkspaceLease()) ownWorkspaceResource(getWorkspaceLease()!, "engine", child, () => stopChildProcessTree(child));
   const processRef = child;
   let exited = false;
   let exitMessage = "";
   const stderrLogs: string[] = [];
   const stdoutLogs: string[] = [];
 
-  if (activeWorkspace && (typeof transitionGen !== "number" || activeWorkspace.generation === transitionGen)) {
-    activeWorkspace.opencodeProcess = child;
-    activeWorkspace.opencodeUrl = opencodeUrl;
-    activeWorkspace.opencodePort = port;
+  if (workspaceRuntime.activeWorkspace && (typeof transitionGen !== "number" || workspaceRuntime.activeWorkspace.generation === transitionGen)) {
+    workspaceRuntime.activeWorkspace.opencodeProcess = child;
+    workspaceRuntime.activeWorkspace.opencodeUrl = workspaceRuntime.opencodeUrl;
+    workspaceRuntime.activeWorkspace.opencodePort = port;
   }
 
   processRef.stdout?.on("data", chunk => {
     const text = chunk.toString();
     console.log("[Neko/OpenCode]", text);
     if (stdoutLogs.length < 20) stdoutLogs.push(text.trim());
-    mainWindow?.webContents.send("opencode:event", { type: "opencode.output", properties: { stream: "stdout", text, source: "Neko" } });
+    emitWorkspaceEvent({ type: "opencode.output", properties: { stream: "stdout", text, source: "Neko" } });
   });
 
   processRef.stderr?.on("data", chunk => {
     const text = chunk.toString();
     console.error("[Neko/OpenCode]", text);
     if (stderrLogs.length < 20) stderrLogs.push(text.trim());
-    mainWindow?.webContents.send("opencode:event", { type: "opencode.output", properties: { stream: "stderr", text, source: "Neko" } });
+    emitWorkspaceEvent({ type: "opencode.output", properties: { stream: "stderr", text, source: "Neko" } });
     if (/ServeError|Error:|Unexpected error|EADDRINUSE|address already in use/i.test(text)) {
       exitMessage = text.trim();
     }
@@ -2788,8 +3246,8 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     exited = true;
     exitMessage = `Erro ao executar ${spawnExecutable}: ${error.message}`;
     console.error("[Neko/OpenCode] process error:", error);
-    if (!isStoppingOpencodeIntentionally) {
-      mainWindow?.webContents.send("opencode:event", {
+    if (!workspaceRuntime.isStoppingOpencodeIntentionally) {
+      emitWorkspaceEvent({
         type: "neko.process.error",
         properties: { message: exitMessage, generation: transitionGen }
       });
@@ -2797,6 +3255,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
   });
 
   processRef.on("exit", (code, signal) => {
+    forgetWorkspaceResource(processRef);
     exited = true;
     if (!exitMessage) {
       exitMessage = formatProcessExitDiagnostic({
@@ -2807,26 +3266,29 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
         stderrLogs
       });
     }
-    if (typeof transitionGen === "number" && activeWorkspace && activeWorkspace.generation !== transitionGen) {
-      console.log(`[OpenCode] stale process exit ignored { generation: ${transitionGen}, activeGeneration: ${activeWorkspace.generation} }`);
+    if (typeof transitionGen === "number" && workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation !== transitionGen) {
+      console.log(`[OpenCode] stale process exit ignored { generation: ${transitionGen}, activeGeneration: ${workspaceRuntime.activeWorkspace.generation} }`);
       return;
     }
-    if (isStoppingOpencodeIntentionally) {
+    if (workspaceRuntime.isStoppingOpencodeIntentionally) {
       console.log("[Neko/OpenCode] exited (encerramento normal)", { code, signal, generation: transitionGen });
     } else {
       console.log("[Neko/OpenCode] exited", { code, signal, generation: transitionGen });
     }
-    if (opencodeProcess === processRef) opencodeProcess = null;
-    if (activeWorkspace && (typeof transitionGen !== "number" || activeWorkspace.generation === transitionGen)) {
-      activeWorkspace.opencodeProcess = null;
-      activeWorkspace.status = "stopped";
+    if (workspaceRuntime.opencodeProcess === processRef) {
+      if (getWorkspaceLease()) workspaceServices.detach(getWorkspaceLease()!);
+      workspaceRuntime.opencodeProcess = null;
+    }
+    if (workspaceRuntime.activeWorkspace && (typeof transitionGen !== "number" || workspaceRuntime.activeWorkspace.generation === transitionGen)) {
+      workspaceRuntime.activeWorkspace.opencodeProcess = null;
+      workspaceRuntime.activeWorkspace.status = "stopped";
     }
   });
 
   // The gate promise resolves only when THIS start is confirmed healthy. A
   // later generation (stop/reopen) invalidates any readiness claim made by a
   // stale start.
-  const generation = serviceGeneration;
+  const generation = workspaceRuntime.serviceGeneration;
   const startPromise = (async () => {
     const startedAt = Date.now();
     const timeout = 20000;
@@ -2845,15 +3307,18 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
       }
 
       try {
-        const response = await fetchWithTimeout(`${opencodeUrl}/global/health`, { headers: opencodeRequestHeaders() }, 2500);
+        const response = await fetchWithTimeout(`${engineStartUrl}/global/health`, { headers: engineStartHeaders }, 2500);
         if (response.ok) {
           const health = await response.json();
-          if (generation !== serviceGeneration || (typeof transitionGen === "number" && transitionGen !== projectTransitionGeneration)) {
+          if (generation !== workspaceRuntime.serviceGeneration || (typeof transitionGen === "number" && transitionGen !== runtimeGeneration())) {
             throw new Error("Inicialização do serviço interrompida.");
           }
-          serviceReady = true;
-          serviceReadyUrl = opencodeUrl;
-          logService("ready", opencodeUrl);
+          workspaceRuntime.serviceReady = true;
+          if (getWorkspaceLease() && workspaceRuntime.currentProject === safeProjectPath && workspaceRuntime.opencodeProcess === processRef) {
+            workspaceServices.attach(getWorkspaceLease()!, engineStartUrl);
+          }
+          workspaceRuntime.serviceReadyUrl = workspaceRuntime.opencodeUrl;
+          logService("ready", workspaceRuntime.opencodeUrl);
           void subscribeEvents(transitionGen);
 
           // The renderer may ask for providers before OpenCode is ready.
@@ -2861,9 +3326,9 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
           // confirms that this project's OpenCode instance is usable.
           if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
             try {
-              mainWindow.webContents.send("opencode:event", {
+              emitWorkspaceEvent({
                 type: "neko.opencode.ready",
-                properties: { projectPath: safeProjectPath, url: opencodeUrl, port, generation: transitionGen }
+                properties: { projectPath: safeProjectPath, url: workspaceRuntime.opencodeUrl, port, generation: transitionGen }
               });
             } catch {}
           }
@@ -2893,7 +3358,7 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     const elapsedMs = Date.now() - startedAt;
     const isAlive = Boolean(processRef && !exited && !processRef.killed);
     const timeoutDiag = formatStartupTimeoutDiagnostic({
-      opencodeUrl,
+      opencodeUrl: workspaceRuntime.opencodeUrl,
       pid: processRef?.pid,
       isAlive,
       elapsedMs,
@@ -2905,11 +3370,11 @@ async function startOpenCodeInternal(projectPath: string, transitionGen?: number
     throw new Error(timeoutDiag);
   })();
 
-  serviceStartPromise = startPromise;
+  workspaceRuntime.serviceStartPromise = startPromise;
   try {
     return await startPromise;
   } finally {
-    if (serviceStartPromise === startPromise) serviceStartPromise = null;
+    if (workspaceRuntime.serviceStartPromise === startPromise) workspaceRuntime.serviceStartPromise = null;
   }
 }
 
@@ -2933,8 +3398,9 @@ async function startOpenCode(projectPath: string) {
 }
 
 async function stopOpenCode() {
+  if (getWorkspaceLease()) workspaceServices.detach(getWorkspaceLease()!);
   cancelSseReconnect("stop-opencode");
-  isStoppingOpencodeIntentionally = true;
+  workspaceRuntime.isStoppingOpencodeIntentionally = true;
   clearStatusCache();
   perfFlushTask(null, "stopped");
   engineRetryStates.clear();
@@ -2949,32 +3415,25 @@ async function stopOpenCode() {
     activeAgentRequests.delete(sessionId);
   }
   stopProjectWatcher();
-  eventAbort?.abort();
-  eventAbort = null;
+  if (workspaceRuntime.eventAbort) { workspaceRuntime.eventAbort.abort(); forgetWorkspaceResource(workspaceRuntime.eventAbort); }
+  workspaceRuntime.eventAbort = null;
 
-  const proc = opencodeProcess;
-  opencodeProcess = null;
+  const proc = workspaceRuntime.opencodeProcess;
+  workspaceRuntime.opencodeProcess = null;
 
   if (!proc) {
-    isStoppingOpencodeIntentionally = false;
+    workspaceRuntime.isStoppingOpencodeIntentionally = false;
     return;
   }
 
   try {
-    if (process.platform === "win32" && proc.pid) {
-      await new Promise<void>(resolve => {
-        const killer = spawn("taskkill.exe", ["/PID", String(proc.pid), "/T", "/F"], {
-          windowsHide: true,
-          stdio: "ignore"
-        });
-        killer.once("error", () => resolve());
-        killer.once("exit", () => resolve());
-      });
-    } else {
-      try { proc.kill("SIGTERM"); } catch {}
-    }
+    await stopChildProcessTree(proc);
+    forgetWorkspaceResource(proc);
+  } catch (error) {
+    if (!workspaceRuntime.opencodeProcess) workspaceRuntime.opencodeProcess = proc;
+    throw error;
   } finally {
-    isStoppingOpencodeIntentionally = false;
+    workspaceRuntime.isStoppingOpencodeIntentionally = false;
   }
 }
 
@@ -3012,31 +3471,36 @@ export function normalizeMigrationToolResult(output: any, isError: boolean, erro
 }
 
 async function subscribeEvents(gen?: number) {
-  const streamGen = typeof gen === "number" ? gen : (activeWorkspace?.generation ?? projectTransitionGeneration);
-  if (isStoppingOpencodeIntentionally || !opencodeProcess) {
+  const streamLease = workspaceRegistry.hasContext() ? workspaceRegistry.contextLease() : currentWorkspaceLease;
+  const streamGen = typeof gen === "number" ? gen : (workspaceRuntime.activeWorkspace?.generation ?? projectTransitionGeneration);
+  if (workspaceRuntime.isStoppingOpencodeIntentionally || !workspaceRuntime.opencodeProcess) {
     return;
   }
-  if (activeWorkspace && activeWorkspace.generation !== streamGen) {
+  if (workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation !== streamGen) {
     return;
   }
 
   // Clear any existing reconnect timer when (re)connecting
-  if (sseReconnectTimer) {
-    clearTimeout(sseReconnectTimer);
-    sseReconnectTimer = null;
+  if (workspaceRuntime.sseReconnectTimer) {
+    clearTimeout(workspaceRuntime.sseReconnectTimer);
+    workspaceRuntime.sseReconnectTimer = null;
   }
 
-  eventAbort?.abort();
-  eventAbort = new AbortController();
-  const currentSignal = eventAbort.signal;
-  if (activeWorkspace && activeWorkspace.generation === streamGen) {
-    activeWorkspace.eventAbort = eventAbort;
+  if (workspaceRuntime.eventAbort) { workspaceRuntime.eventAbort.abort(); forgetWorkspaceResource(workspaceRuntime.eventAbort); }
+  workspaceRuntime.eventAbort = new AbortController();
+  if (getWorkspaceLease()) {
+    const stream = workspaceRuntime.eventAbort;
+    ownWorkspaceResource(getWorkspaceLease()!, "event-stream", stream, () => stream.abort());
+  }
+  const currentSignal = workspaceRuntime.eventAbort.signal;
+  if (workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation === streamGen) {
+    workspaceRuntime.activeWorkspace.eventAbort = workspaceRuntime.eventAbort;
   }
 
-  const isReconnect = sseReconnectAttempts > 0;
+  const isReconnect = workspaceRuntime.sseReconnectAttempts > 0;
 
   try {
-    const response = await fetch(`${opencodeUrl}/event`, {
+    const response = await fetch(`${workspaceRuntime.opencodeUrl}/event`, {
       signal: currentSignal,
       headers: { Accept: "text/event-stream", ...opencodeRequestHeaders() }
     });
@@ -3046,14 +3510,14 @@ async function subscribeEvents(gen?: number) {
     }
 
     if (currentSignal.aborted) return;
-    if (activeWorkspace && activeWorkspace.generation !== streamGen) return;
+    if (workspaceRuntime.activeWorkspace && workspaceRuntime.activeWorkspace.generation !== streamGen) return;
 
     if (isReconnect) {
       console.log(`[OpenCode/SSE] reconnect success gen=${streamGen}`);
     } else {
       console.log(`[OpenCode/SSE] connected gen=${streamGen}`);
     }
-    sseReconnectAttempts = 0;
+    workspaceRuntime.sseReconnectAttempts = 0;
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -3073,6 +3537,7 @@ async function subscribeEvents(gen?: number) {
 
         try {
           const event = JSON.parse(dataLine.slice(5).trim());
+          if (streamLease) workspaceEvents.accept(streamLease, event);
           const eventType = String(event?.type ?? "");
           const props = event?.properties ?? {};
           perfCountEvent("received");
@@ -3280,6 +3745,7 @@ async function subscribeEvents(gen?: number) {
           }
           if (eventType === "session.error") {
             const sessionId = String(props?.sessionID ?? props?.sessionId ?? props?.session?.id ?? "");
+            if (taskRecords.get(sessionId)?.state !== "cancelled") pausePromptQueues();
             if (sessionId && isRecoverableAgentError(event) && scheduleAgentRetry(sessionId, event)) continue;
             if (sessionId) {
               clearActiveAgentRequest(sessionId);
@@ -3330,11 +3796,11 @@ async function subscribeEvents(gen?: number) {
                   logTask("failed", resolveTaskIdForSession(sessionId), sessionId, `reason=${isQuotaExceeded ? "quota-exceeded" : "retry-exhausted"}`);
                 }
                 // Ask the engine to stop its internal retry loop.
-                void fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
+                void fetch(`${workspaceRuntime.opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
                   method: "POST",
                   headers: opencodeRequestHeaders()
                 }).catch(() => {});
-                mainWindow?.webContents.send("opencode:event", {
+                emitWorkspaceEvent({
                   type: "session.error",
                   properties: {
                     sessionID: sessionId,
@@ -3428,7 +3894,7 @@ async function subscribeEvents(gen?: number) {
               return String(opt ?? "");
             }).filter(Boolean);
             const allowFreeText = firstQ?.custom !== false && props?.custom !== false;
-            const questionId = requestId || `q${(++taskQuestionCounter).toString(36)}`;
+            const questionId = requestId || `q${(++workspaceTaskStates.current().taskQuestionCounter).toString(36)}`;
 
             const record = taskRecords.get(questionSessionId);
             const header = String(firstQ?.header ?? props?.header ?? "").trim();
@@ -3452,14 +3918,14 @@ async function subscribeEvents(gen?: number) {
             // previous clarifying question which happens to be the last assistant message.
             let planFileContent: string | undefined;
             let planFilePath: string | undefined;
-            if (isPlanApproval && currentProject) {
+            if (isPlanApproval && workspaceRuntime.currentProject) {
               // Match both forward-slash and backslash paths from OpenCode
               const pathMatch = questionText.match(/plan\s+at\s+([^\s]+(?:\.md)?)/i);
               if (pathMatch?.[1]) {
                 const rawPath = pathMatch[1].replace(/^["']|["']$/g, "").replace(/\\/g, "/");
                 planFilePath = rawPath;
                 try {
-                  const absPath = resolveSafePlanFilePath(currentProject, rawPath);
+                  const absPath = resolveSafePlanFilePath(workspaceRuntime.currentProject, rawPath);
                   planFileContent = await fs.promises.readFile(absPath, "utf8");
                   console.log(`[TaskLifecycle] plan file read ok path=${rawPath} chars=${planFileContent.length}`);
                 } catch (readErr: any) {
@@ -3652,10 +4118,10 @@ async function subscribeEvents(gen?: number) {
                     try {
                       const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
                       const bodyPayload = { response: "once" };
-                      await fetch(`${opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
+                      await fetch(`${workspaceRuntime.opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
                         method: "POST", headers, body: JSON.stringify(bodyPayload)
                       }).catch(async () => {
-                        await fetch(`${opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
+                        await fetch(`${workspaceRuntime.opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
                           method: "POST", headers, body: JSON.stringify(bodyPayload)
                         }).catch(() => {});
                       });
@@ -3680,7 +4146,7 @@ async function subscribeEvents(gen?: number) {
                       sql: finalSql,
                       provider: isLovableProvider ? "lovable" : "supabase",
                       lovableProjectId: isLovableProvider ? activeRef : undefined,
-                      projectRoot: currentProject || undefined
+                      projectRoot: workspaceRuntime.currentProject || undefined
                     });
 
                     // 2. Set task state to waiting_for_approval ONLY AFTER proposeMigration succeeds without throwing
@@ -3703,10 +4169,10 @@ async function subscribeEvents(gen?: number) {
                     try {
                       const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
                       const bodyPayload = { response: "reject" };
-                      await fetch(`${opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
+                      await fetch(`${workspaceRuntime.opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
                         method: "POST", headers, body: JSON.stringify(bodyPayload)
                       }).catch(async () => {
-                        await fetch(`${opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
+                        await fetch(`${workspaceRuntime.opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
                           method: "POST", headers, body: JSON.stringify(bodyPayload)
                         }).catch(() => {});
                       });
@@ -3721,10 +4187,10 @@ async function subscribeEvents(gen?: number) {
                   try {
                     const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
                     const bodyPayload = { response: "reject" };
-                    await fetch(`${opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
+                    await fetch(`${workspaceRuntime.opencodeUrl}/session/${encodeURIComponent(targetSession)}/permissions/${encodeURIComponent(permissionId)}`, {
                       method: "POST", headers, body: JSON.stringify(bodyPayload)
                     }).catch(async () => {
-                      await fetch(`${opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
+                      await fetch(`${workspaceRuntime.opencodeUrl}/permission/${encodeURIComponent(permissionId)}/reply`, {
                         method: "POST", headers, body: JSON.stringify(bodyPayload)
                       }).catch(() => {});
                     });
@@ -3800,7 +4266,7 @@ async function subscribeEvents(gen?: number) {
           const nekoEvent = normalizeOpenCodeEvent(event);
           if (nekoEvent) {
             perfCountEvent("forwarded");
-            mainWindow?.webContents.send("opencode:event", nekoEvent);
+            emitWorkspaceEvent(nekoEvent);
           }
         } catch {
           // Ignore malformed SSE payloads.
@@ -3809,7 +4275,7 @@ async function subscribeEvents(gen?: number) {
     }
     console.log(`[OpenCode/SSE] disconnected gen=${streamGen}`);
   } catch (error: any) {
-    if (error?.name !== "AbortError" && (!activeWorkspace || activeWorkspace.generation === streamGen)) {
+    if (error?.name !== "AbortError" && (!workspaceRuntime.activeWorkspace || workspaceRuntime.activeWorkspace.generation === streamGen)) {
       console.error("[Neko/OpenCode] event stream error:", error);
     }
   }
@@ -3817,22 +4283,22 @@ async function subscribeEvents(gen?: number) {
   // Auto-reconexão progressiva caso o stream tenha caído inesperadamente
   const shouldReconnect =
     !currentSignal.aborted &&
-    !isStoppingOpencodeIntentionally &&
-    Boolean(opencodeProcess) &&
-    (!activeWorkspace || activeWorkspace.generation === streamGen);
+    !workspaceRuntime.isStoppingOpencodeIntentionally &&
+    Boolean(workspaceRuntime.opencodeProcess) &&
+    (!workspaceRuntime.activeWorkspace || workspaceRuntime.activeWorkspace.generation === streamGen);
 
   if (shouldReconnect) {
-    if (sseReconnectAttempts < 10) {
-      sseReconnectAttempts++;
-      const delayMs = Math.min(10000, Math.round(500 * Math.pow(1.8, sseReconnectAttempts - 1)));
-      console.log(`[OpenCode/SSE] reconnect scheduled attempt=${sseReconnectAttempts} delayMs=${delayMs} gen=${streamGen}`);
-      sseReconnectTimer = setTimeout(() => {
-        sseReconnectTimer = null;
+    if (workspaceRuntime.sseReconnectAttempts < 10) {
+      workspaceRuntime.sseReconnectAttempts++;
+      const delayMs = Math.min(10000, Math.round(500 * Math.pow(1.8, workspaceRuntime.sseReconnectAttempts - 1)));
+      console.log(`[OpenCode/SSE] reconnect scheduled attempt=${workspaceRuntime.sseReconnectAttempts} delayMs=${delayMs} gen=${streamGen}`);
+      workspaceRuntime.sseReconnectTimer = setTimeout(() => {
+        workspaceRuntime.sseReconnectTimer = null;
         void subscribeEvents(streamGen);
       }, delayMs);
     } else {
-      console.warn(`[OpenCode/SSE] reconnect attempts exhausted (${sseReconnectAttempts}) gen=${streamGen}`);
-      mainWindow?.webContents.send("opencode:event", {
+      console.warn(`[OpenCode/SSE] reconnect attempts exhausted (${workspaceRuntime.sseReconnectAttempts}) gen=${streamGen}`);
+      emitWorkspaceEvent({
         type: "neko.connection.error",
         properties: { message: "Conexão com o serviço de eventos interrompida após várias tentativas.", generation: streamGen }
       });
@@ -4010,9 +4476,9 @@ class StaleGenerationError extends Error {
 async function readTreeWithSettling(projectPath: string, generation: number): Promise<any[]> {
   const maxAttempts = 10;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (generation !== projectTransitionGeneration) {
-      logPreviewLifecycle("workspace scan stale", { requestedGeneration: generation, currentGeneration: projectTransitionGeneration });
-      throw new StaleGenerationError(generation, projectTransitionGeneration);
+    if (generation !== runtimeGeneration()) {
+      logPreviewLifecycle("workspace scan stale", { requestedGeneration: generation, currentGeneration: runtimeGeneration() });
+      throw new StaleGenerationError(generation, runtimeGeneration());
     }
     const tree = await readTree(projectPath);
     if (tree.length > 0) return tree;
@@ -4029,9 +4495,9 @@ async function readTreeWithSettling(projectPath: string, generation: number): Pr
       await new Promise(r => setTimeout(r, 300));
     }
   }
-  if (generation !== projectTransitionGeneration) {
-    logPreviewLifecycle("workspace scan stale", { requestedGeneration: generation, currentGeneration: projectTransitionGeneration });
-    throw new StaleGenerationError(generation, projectTransitionGeneration);
+  if (generation !== runtimeGeneration()) {
+    logPreviewLifecycle("workspace scan stale", { requestedGeneration: generation, currentGeneration: runtimeGeneration() });
+    throw new StaleGenerationError(generation, runtimeGeneration());
   }
   return await readTree(projectPath);
 }
@@ -4047,13 +4513,7 @@ type PreviewManagerState = {
   internalSession?: number;
 };
 
-let previewState: PreviewManagerState = {
-  status: "idle",
-  framework: null,
-  packageManager: null,
-  port: null,
-  url: null
-};
+
 
 export type ProjectRuntimeType = "STATIC_HTML" | "NODE_DEV_SERVER" | "UNSUPPORTED";
 
@@ -4069,49 +4529,53 @@ export interface ProjectRuntimeDescriptor {
   runtimeEntry?: string | null;
 }
 
-let previewProcess: ChildProcess | null = null;
-let previewStaticServer: http.Server | null = null;
-let previewPort: number | null = null;
-let previewProjectPath: string | null = null;
-let previewStartPromise: Promise<PreviewManagerState> | null = null;
-let previewSessionCounter = 0;
-let activePreviewSessionId = 0;
-let previewRestartDebounceTimer: NodeJS.Timeout | null = null;
-let previewStaticReloadDebounceTimer: NodeJS.Timeout | null = null;
-let previewRuntimeDescriptor: ProjectRuntimeDescriptor | null = null;
+
+
+
+
+
+
+
+
+
+
 
 // The iframe renderer remains available as a reversible fallback.  The view
 // below is the opt-in internal surface: it loads the already-running Preview
 // URL in a top-level guest WebContents, avoiding iframe-only behavior in SSR
 // applications while keeping the dev-server lifecycle unchanged.
 type InternalPreviewState = "idle" | "loading" | "ready" | "failed" | "crashed";
-let internalPreviewView: WebContentsView | null = null;
-let internalPreviewUrl = "";
-let internalPreviewState: InternalPreviewState = "idle";
-let internalPreviewSession = 0;
-let internalPreviewOverlayActive = false;
+
+
+
+
+
+
 
 function logInternalPreview(state: InternalPreviewState, extra = "") {
-  internalPreviewState = state;
-  console.log(`[Preview/Internal] session=${internalPreviewSession} url=${internalPreviewUrl || "none"} state=${state}${extra ? ` ${extra}` : ""}`);
+  workspaceRuntime.internalPreviewState = state;
+  console.log(`[Preview/Internal] session=${workspaceRuntime.internalPreviewSession} url=${workspaceRuntime.internalPreviewUrl || "none"} state=${state}${extra ? ` ${extra}` : ""}`);
   try {
     if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
-    mainWindow.webContents.send("preview:event", {
+    emitWorkspacePreviewEvent({
       type: `preview.internal.${state}`,
-      properties: { session: internalPreviewSession, url: internalPreviewUrl || null, state, message: extra || undefined }
+      properties: { session: workspaceRuntime.internalPreviewSession, url: workspaceRuntime.internalPreviewUrl || null, state, message: extra || undefined }
     });
   } catch {}
 }
 
 function detachInternalPreviewView(destroy = false) {
-  const view = internalPreviewView;
+  const view = workspaceRuntime.internalPreviewView;
   if (!view) return;
-  try { mainWindow?.contentView.removeChildView(view); } catch {}
+  try { workspaceContentView()?.removeChildView(view); } catch {}
   if (destroy) {
+    const lease = getWorkspaceLease();
+    if (lease) workspaceVisibility.forget(lease, view);
     try { if (!view.webContents.isDestroyed()) view.webContents.close(); } catch {}
-    internalPreviewView = null;
-    internalPreviewUrl = "";
-    internalPreviewOverlayActive = false;
+    forgetWorkspaceResource(view);
+    workspaceRuntime.internalPreviewView = null;
+    workspaceRuntime.internalPreviewUrl = "";
+    workspaceRuntime.internalPreviewOverlayActive = false;
     logInternalPreview("idle");
   }
 }
@@ -4125,36 +4589,49 @@ function isAllowedInternalPreviewUrl(value: string): boolean {
 
 function ensureInternalPreviewView(): WebContentsView | null {
   if (!mainWindow || mainWindow.isDestroyed()) return null;
-  if (internalPreviewView && !internalPreviewView.webContents.isDestroyed()) return internalPreviewView;
+  if (workspaceRuntime.internalPreviewView && !workspaceRuntime.internalPreviewView.webContents.isDestroyed()) return workspaceRuntime.internalPreviewView;
+  if (workspaceRuntime.internalPreviewView) detachInternalPreviewView(true);
   const view = new WebContentsView({
     webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true }
   });
-  internalPreviewView = view;
+  view.setBorderRadius(20);
+  workspaceRuntime.internalPreviewView = view;
+  const lease = getWorkspaceLease();
+  if (lease) {
+    workspaceVisibility.track(lease, view);
+    ownWorkspaceResource(lease, "preview-view", view, () => {
+      workspaceVisibility.forget(lease, view);
+      try { workspaceContentView()?.removeChildView(view); } catch {}
+      if (!view.webContents.isDestroyed()) view.webContents.close();
+    });
+  }
+  const onView = (name: string, handler: (...args: any[]) => void) => view.webContents.on(name as any, bindWorkspaceCallback(handler));
   view.webContents.setWindowOpenHandler(({ url }) => ({ action: "deny" }));
-  view.webContents.on("did-start-loading", () => logInternalPreview("loading"));
-  view.webContents.on("did-finish-load", () => {
+  onView("did-start-loading", () => logInternalPreview("loading"));
+  onView("did-finish-load", () => {
+    void injectPreviewScrollbar(view.webContents.mainFrame);
     logInternalPreview("ready");
     emitInternalPreviewRoute(view.webContents.getURL());
   });
   // SPA history routing uses pushState/replaceState (did-navigate-in-page).
   // Keep the Page Selector in sync when the user clicks an internal link.
-  view.webContents.on("did-navigate-in-page", (_event, url, _isMainFrame) => {
+  onView("did-navigate-in-page", (_event, url, _isMainFrame) => {
     if (!url || !isAllowedInternalPreviewUrl(url)) return;
     emitInternalPreviewRoute(url);
   });
-  view.webContents.on("did-navigate", (_event, url) => {
+  onView("did-navigate", (_event, url) => {
     if (!url || !isAllowedInternalPreviewUrl(url)) return;
     emitInternalPreviewRoute(url);
   });
-  view.webContents.on("did-fail-load", (_event, code, description, url, isMainFrame) => {
+  onView("did-fail-load", (_event, code, description, url, isMainFrame) => {
     if (!isMainFrame || code === -3) return;
     logInternalPreview("failed", `error=${code} description=${logSafeText(description, 160)} url=${sanitizeExternalPreviewUrl(url)}`);
   });
-  view.webContents.on("render-process-gone", (_event, details) => {
+  onView("render-process-gone", (_event, details) => {
     logInternalPreview("crashed", `reason=${details.reason} exitCode=${details.exitCode}`);
   });
-  view.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    mainWindow?.webContents.send("preview:event", {
+  onView("console-message", (_event, level, message, line, sourceId) => {
+    emitWorkspacePreviewEvent({
       type: "preview.console",
       properties: { level, message, lineNumber: line, sourceId, internal: true }
     });
@@ -4163,27 +4640,27 @@ function ensureInternalPreviewView(): WebContentsView | null {
 }
 
 function emitPreview(type: string, properties: Record<string, any> = {}) {
-  previewState = { ...previewState, ...properties };
+  workspaceRuntime.previewState = { ...workspaceRuntime.previewState, ...properties };
   if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
   try {
-    mainWindow.webContents.send("preview:event", { type, properties: previewState });
+    emitWorkspacePreviewEvent({ type, properties: workspaceRuntime.previewState });
   } catch {}
 }
 
 // Preview Page Selector: per-project route cache to avoid rescanning on every
 // call. Re-discovered on project change or explicit request; never polled.
 type PreviewRoutesCache = { projectPath: string; routes: PreviewRoute[]; at: number };
-let previewRoutesCache: PreviewRoutesCache | null = null;
+
 const PREVIEW_ROUTES_CACHE_MS = 8000;
 
 async function getPreviewRoutes(force = false): Promise<PreviewRoute[]> {
   const root = getActiveProjectRoot();
   if (!root) return [];
-  if (!force && previewRoutesCache && previewRoutesCache.projectPath === root && Date.now() - previewRoutesCache.at < PREVIEW_ROUTES_CACHE_MS) {
-    return previewRoutesCache.routes;
+  if (!force && workspaceRuntime.previewRoutesCache && workspaceRuntime.previewRoutesCache.projectPath === root && Date.now() - workspaceRuntime.previewRoutesCache.at < PREVIEW_ROUTES_CACHE_MS) {
+    return workspaceRuntime.previewRoutesCache.routes;
   }
   const routes = await discoverPreviewRoutes(root);
-  previewRoutesCache = { projectPath: root, routes, at: Date.now() };
+  workspaceRuntime.previewRoutesCache = { projectPath: root, routes, at: Date.now() };
   return routes;
 }
 
@@ -4193,7 +4670,7 @@ function emitInternalPreviewRoute(url: string) {
   try {
     if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
     const path = routeFromUrl(url);
-    mainWindow.webContents.send("preview:event", { type: "preview.route-changed", properties: { path } });
+    emitWorkspacePreviewEvent({ type: "preview.route-changed", properties: { path } });
   } catch {}
 }
 
@@ -4486,6 +4963,8 @@ async function startStaticHttpServer(projectRoot: string, port: number): Promise
       reject(err);
     });
 
+    server.once("close",workspacePorts.releaseCallback(port));
+    server.once("error",workspacePorts.releaseCallback(port));
     server.listen(port, "127.0.0.1", () => {
       console.log(`[Neko/StaticServer] servidor ativo em http://127.0.0.1:${port} (root: ${safeRoot})`);
       resolve(server);
@@ -4568,7 +5047,7 @@ async function detectProjectRuntimeWithSettling(workspacePath: string, generatio
   const root = path.resolve(workspacePath);
   await waitForClonedProjectStructure(root, generation);
   for (let attempt = 1; attempt <= 5; attempt++) {
-    if (generation !== projectTransitionGeneration) break;
+    if (generation !== runtimeGeneration()) break;
     const runtime = await detectProjectRuntime(root);
     if (runtime.type !== "UNSUPPORTED") return runtime;
 
@@ -4592,7 +5071,7 @@ async function waitForClonedProjectStructure(workspacePath: string, generation: 
   const neutralFiles = new Set([".git", ".gitkeep", "desktop.ini", "thumbs.db", ".ds_store"]);
   const maxAttempts = 10;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (generation !== projectTransitionGeneration) break;
+    if (generation !== runtimeGeneration()) break;
     try {
       const entries = await fs.promises.readdir(workspacePath);
       const realEntries = entries.filter(e => !neutralFiles.has(e.toLowerCase()));
@@ -4963,8 +5442,8 @@ async function waitForFilesystemSettling(projectPath: string, info: any): Promis
 }
 
 async function installDependenciesWithFallback(projectPath: string, preferredManager: string, info: any, targetGen?: number, sessionId?: number) {
-  if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
-  if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+  if (targetGen !== undefined && targetGen !== runtimeGeneration()) throw new Error("Troca de projeto cancelou a instalação.");
+  if (sessionId !== undefined && sessionId !== workspaceRuntime.activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
   const attemptsLog: { manager: string; command: string; status: "passed" | "failed"; error?: string }[] = [];
   let primaryPassed = false;
@@ -4985,8 +5464,8 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
       const executedCmd = await installDependencies(projectPath, preferredManager);
       attemptsLog.push({ manager: preferredManager, command: executedCmd, status: "passed" });
 
-      if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
-      if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+      if (targetGen !== undefined && targetGen !== runtimeGeneration()) throw new Error("Troca de projeto cancelou a instalação.");
+      if (sessionId !== undefined && sessionId !== workspaceRuntime.activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
       await waitForFilesystemSettling(projectPath, info);
       try {
@@ -5052,8 +5531,8 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
       }
     }
 
-    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
-    if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+    if (targetGen !== undefined && targetGen !== runtimeGeneration()) throw new Error("Troca de projeto cancelou a instalação.");
+    if (sessionId !== undefined && sessionId !== workspaceRuntime.activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
     emitPreview("preview.installing", {
       status: "installing",
@@ -5065,8 +5544,8 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
     const npmCmd = await installDependencies(projectPath, "npm");
     attemptsLog.push({ manager: "npm", command: npmCmd, status: "passed" });
 
-    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) throw new Error("Troca de projeto cancelou a instalação.");
-    if (sessionId !== undefined && sessionId !== activePreviewSessionId) throw new Error("Sessão de preview expirou.");
+    if (targetGen !== undefined && targetGen !== runtimeGeneration()) throw new Error("Troca de projeto cancelou a instalação.");
+    if (sessionId !== undefined && sessionId !== workspaceRuntime.activePreviewSessionId) throw new Error("Sessão de preview expirou.");
 
     await waitForFilesystemSettling(projectPath, info);
     try {
@@ -5120,20 +5599,7 @@ async function installDependenciesWithFallback(projectPath: string, preferredMan
   }
 }
 
-async function findFreePort(start: number, maxAttempts = 30) {
-  const net = await import("node:net");
-  for (let offset = 0; offset < maxAttempts; offset++) {
-    const port = start + offset;
-    const available = await new Promise<boolean>(resolve => {
-      const server = net.createServer();
-      server.once("error", () => resolve(false));
-      server.once("listening", () => server.close(() => resolve(true)));
-      server.listen(port, "127.0.0.1");
-    });
-    if (available) return port;
-  }
-  throw new Error(`Não encontrei uma porta livre a partir de ${start}.`);
-}
+async function findFreePort(start:number,maxAttempts=100){return workspacePorts.reserve(start,getWorkspaceLease(),maxAttempts);}
 
 async function isHttpAlive(url: string, timeoutMs = 700): Promise<boolean> {
   try {
@@ -5153,10 +5619,10 @@ async function waitForHttp(url: string, timeout = 90000, processRef?: ChildProce
   const start = Date.now();
   let lastError = "";
   while (Date.now() - start < timeout) {
-    if (sessionId !== undefined && sessionId !== activePreviewSessionId) {
+    if (sessionId !== undefined && sessionId !== workspaceRuntime.activePreviewSessionId) {
       throw new Error("Sessão de preview foi alterada.");
     }
-    if (targetGen !== undefined && targetGen !== projectTransitionGeneration) {
+    if (targetGen !== undefined && targetGen !== runtimeGeneration()) {
       throw new Error("Troca de projeto cancelou o aguardo HTTP.");
     }
     if (processRef && processRef.exitCode !== null) {
@@ -5186,24 +5652,24 @@ function previewArgs(framework: string, port: number, devScript = "dev") {
   return ["run", scriptName, "--", "--host", "127.0.0.1", "--port", String(port)];
 }
 
-let emptyWorkspaceWatcher: fs.FSWatcher | null = null;
-let emptyWorkspaceWatchTimer: NodeJS.Timeout | null = null;
-let emptyWorkspaceTimeoutTimer: NodeJS.Timeout | null = null;
+
+
+
 
 function cancelEmptyWorkspaceWatch() {
-  if (emptyWorkspaceWatchTimer) {
-    clearTimeout(emptyWorkspaceWatchTimer);
-    emptyWorkspaceWatchTimer = null;
+  if (workspaceRuntime.emptyWorkspaceWatchTimer) {
+    clearTimeout(workspaceRuntime.emptyWorkspaceWatchTimer);
+    workspaceRuntime.emptyWorkspaceWatchTimer = null;
   }
-  if (emptyWorkspaceTimeoutTimer) {
-    clearTimeout(emptyWorkspaceTimeoutTimer);
-    emptyWorkspaceTimeoutTimer = null;
+  if (workspaceRuntime.emptyWorkspaceTimeoutTimer) {
+    clearTimeout(workspaceRuntime.emptyWorkspaceTimeoutTimer);
+    workspaceRuntime.emptyWorkspaceTimeoutTimer = null;
   }
-  if (emptyWorkspaceWatcher) {
+  if (workspaceRuntime.emptyWorkspaceWatcher) {
     try {
-      emptyWorkspaceWatcher.close();
+      workspaceRuntime.emptyWorkspaceWatcher.close();
     } catch {}
-    emptyWorkspaceWatcher = null;
+    workspaceRuntime.emptyWorkspaceWatcher = null;
   }
 }
 
@@ -5215,8 +5681,8 @@ function watchEmptyWorkspace(workspacePath: string, targetGen: number, session: 
   logPreviewLifecycle("empty workspace watch started", { workspace: workspacePath, generation: targetGen });
 
   try {
-    emptyWorkspaceWatcher = fs.watch(workspacePath, { recursive: true }, (_event, filename) => {
-      if (targetGen !== projectTransitionGeneration || session !== activePreviewSessionId) {
+    workspaceRuntime.emptyWorkspaceWatcher = fs.watch(workspacePath, { recursive: true }, (_event, filename) => {
+      if (targetGen !== runtimeGeneration() || session !== workspaceRuntime.activePreviewSessionId) {
         cancelEmptyWorkspaceWatch();
         return;
       }
@@ -5224,10 +5690,10 @@ function watchEmptyWorkspace(workspacePath: string, targetGen: number, session: 
       const baseName = path.basename(filename.toString());
       if (!signalFiles.test(baseName)) return;
 
-      if (emptyWorkspaceWatchTimer) clearTimeout(emptyWorkspaceWatchTimer);
-      emptyWorkspaceWatchTimer = setTimeout(() => {
-        emptyWorkspaceWatchTimer = null;
-        if (targetGen !== projectTransitionGeneration || session !== activePreviewSessionId) {
+      if (workspaceRuntime.emptyWorkspaceWatchTimer) clearTimeout(workspaceRuntime.emptyWorkspaceWatchTimer);
+      workspaceRuntime.emptyWorkspaceWatchTimer = setTimeout(() => {
+        workspaceRuntime.emptyWorkspaceWatchTimer = null;
+        if (targetGen !== runtimeGeneration() || session !== workspaceRuntime.activePreviewSessionId) {
           cancelEmptyWorkspaceWatch();
           return;
         }
@@ -5240,9 +5706,9 @@ function watchEmptyWorkspace(workspacePath: string, targetGen: number, session: 
       }, 500);
     });
 
-    emptyWorkspaceTimeoutTimer = setTimeout(() => {
-      emptyWorkspaceTimeoutTimer = null;
-      if (targetGen !== projectTransitionGeneration || session !== activePreviewSessionId) {
+    workspaceRuntime.emptyWorkspaceTimeoutTimer = setTimeout(() => {
+      workspaceRuntime.emptyWorkspaceTimeoutTimer = null;
+      if (targetGen !== runtimeGeneration() || session !== workspaceRuntime.activePreviewSessionId) {
         cancelEmptyWorkspaceWatch();
         return;
       }
@@ -5259,80 +5725,73 @@ function watchEmptyWorkspace(workspacePath: string, targetGen: number, session: 
 
 async function stopPreviewProcessOnly(): Promise<void> {
   cancelEmptyWorkspaceWatch();
-  if (previewStaticServer) {
+  if (workspaceRuntime.previewStaticServer) {
     try {
-      const server = previewStaticServer;
-      previewStaticServer = null;
-      await new Promise<void>(resolve => {
-        server.close(() => resolve());
-        setTimeout(resolve, 300);
-      });
+      const server = workspaceRuntime.previewStaticServer;
+      workspaceRuntime.previewStaticServer = null;
+      await closeWorkspacePreviewServer(server);
+      forgetWorkspaceResource(server);
       console.log("[Preview] static HTTP server stopped");
     } catch (err) {
       console.warn("[Preview] error stopping static HTTP server:", err);
     }
   }
-  if (previewProcess) {
-    const proc = previewProcess;
-    previewProcess = null;
+  if (workspaceRuntime.previewProcess) {
+    const proc = workspaceRuntime.previewProcess;
+    workspaceRuntime.previewProcess = null;
     console.log(`[Preview] cleaning up previous preview process (PID ${proc.pid})`);
-    if (process.platform === "win32" && proc.pid) {
-      await new Promise<void>(resolve => {
-        const killer = spawn("taskkill.exe", ["/PID", String(proc.pid), "/T", "/F"], {
-          windowsHide: true,
-          stdio: "ignore"
-        });
-        killer.once("error", () => resolve());
-        killer.once("exit", () => resolve());
-      });
-    } else {
-      try { proc.kill("SIGTERM"); } catch {}
+    try {
+      await stopChildProcessTree(proc);
+      forgetWorkspaceResource(proc);
+    } catch (error) {
+      if (!workspaceRuntime.previewProcess) workspaceRuntime.previewProcess = proc;
+      throw error;
     }
   }
-  previewPort = null;
+  workspaceRuntime.previewPort = null;
 }
 
 async function stopPreview(): Promise<void> {
-  const currentSession = ++previewSessionCounter;
-  activePreviewSessionId = currentSession;
-  console.log(`[Preview] stop session=${currentSession} path=${previewProjectPath || "none"}`);
+  const currentSession = ++workspaceRuntime.previewSessionCounter;
+  workspaceRuntime.activePreviewSessionId = currentSession;
+  console.log(`[Preview] stop session=${currentSession} path=${workspaceRuntime.previewProjectPath || "none"}`);
   detachInternalPreviewView(true);
   await stopPreviewProcessOnly();
-  previewProjectPath = null;
-  if (activeWorkspace) {
-    activeWorkspace.previewProcess = null;
-    activeWorkspace.previewStaticServer = null;
-    activeWorkspace.previewPort = null;
-    activeWorkspace.previewUrl = null;
+  workspaceRuntime.previewProjectPath = null;
+  if (workspaceRuntime.activeWorkspace) {
+    workspaceRuntime.activeWorkspace.previewProcess = null;
+    workspaceRuntime.activeWorkspace.previewStaticServer = null;
+    workspaceRuntime.activeWorkspace.previewPort = null;
+    workspaceRuntime.activeWorkspace.previewUrl = null;
   }
-  previewRuntimeDescriptor = null;
-  previewState = { status: "stopped", framework: previewState.framework, packageManager: previewState.packageManager, port: null, url: null };
+  workspaceRuntime.previewRuntimeDescriptor = null;
+  workspaceRuntime.previewState = { status: "stopped", framework: workspaceRuntime.previewState.framework, packageManager: workspaceRuntime.previewState.packageManager, port: null, url: null };
   emitPreview("preview.stopped");
 }
 
 function handleProjectFileChange(projectPath: string, changedPath: string) {
-  if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
+  if (!workspaceRuntime.currentProject || path.resolve(workspaceRuntime.currentProject) !== path.resolve(projectPath)) return;
   const normalized = (changedPath || "").replaceAll("\\", "/").toLowerCase();
   if (normalized.startsWith(".neko/") || normalized.includes("/.neko/")) return;
 
   // Concurrency guard: Only ONE install/boot per projectPath and generation
-  if (previewStartPromise || ["detecting", "installing", "starting", "ready"].includes(previewState.status)) {
+  if (workspaceRuntime.previewStartPromise || ["detecting", "installing", "starting", "ready"].includes(workspaceRuntime.previewState.status)) {
     // 1. If active preview runtime is STATIC_HTML and status is ready:
-    if (previewRuntimeDescriptor?.type === "STATIC_HTML" && previewState.status === "ready") {
+    if (workspaceRuntime.previewRuntimeDescriptor?.type === "STATIC_HTML" && workspaceRuntime.previewState.status === "ready") {
       const ext = path.extname(normalized);
       const isStaticAsset = [".html", ".htm", ".css", ".js", ".mjs", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".woff", ".woff2", ".ttf"].includes(ext);
       if (isStaticAsset) {
-        if (previewStaticReloadDebounceTimer) clearTimeout(previewStaticReloadDebounceTimer);
-        previewStaticReloadDebounceTimer = setTimeout(() => {
-          previewStaticReloadDebounceTimer = null;
-          if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
+        if (workspaceRuntime.previewStaticReloadDebounceTimer) clearTimeout(workspaceRuntime.previewStaticReloadDebounceTimer);
+        workspaceRuntime.previewStaticReloadDebounceTimer = setTimeout(() => {
+          workspaceRuntime.previewStaticReloadDebounceTimer = null;
+          if (!workspaceRuntime.currentProject || path.resolve(workspaceRuntime.currentProject) !== path.resolve(projectPath)) return;
           console.log(`[Neko/PreviewWatcher] Arquivo estático modificado (${changedPath}). Recarregando preview...`);
           try {
-            if (internalPreviewView && !internalPreviewView.webContents.isDestroyed()) {
-              internalPreviewView.webContents.reload();
+            if (workspaceRuntime.internalPreviewView && !workspaceRuntime.internalPreviewView.webContents.isDestroyed()) {
+              workspaceRuntime.internalPreviewView.webContents.reload();
             }
           } catch {}
-          mainWindow?.webContents.send("preview:event", { type: "preview.frame-loading", properties: {} });
+          emitWorkspacePreviewEvent({ type: "preview.frame-loading", properties: {} });
         }, 150);
       }
       return;
@@ -5347,11 +5806,11 @@ function handleProjectFileChange(projectPath: string, changedPath: string) {
       normalized.includes("webpack.config") ||
       normalized.includes("tsconfig.json");
 
-    if (isConfigFile && previewState.status === "ready") {
-      if (previewRestartDebounceTimer) clearTimeout(previewRestartDebounceTimer);
-      previewRestartDebounceTimer = setTimeout(async () => {
-        previewRestartDebounceTimer = null;
-        if (!currentProject || path.resolve(currentProject) !== path.resolve(projectPath)) return;
+    if (isConfigFile && workspaceRuntime.previewState.status === "ready") {
+      if (workspaceRuntime.previewRestartDebounceTimer) clearTimeout(workspaceRuntime.previewRestartDebounceTimer);
+      workspaceRuntime.previewRestartDebounceTimer = setTimeout(async () => {
+        workspaceRuntime.previewRestartDebounceTimer = null;
+        if (!workspaceRuntime.currentProject || path.resolve(workspaceRuntime.currentProject) !== path.resolve(projectPath)) return;
         console.log(`[Neko/PreviewWatcher] Arquivo de configuração modificado (${changedPath}). Reiniciando dev server...`);
         void startPreview(projectPath, undefined, true).catch(err => {
           console.warn("[Neko/PreviewWatcher] Falha ao reiniciar preview:", err);
@@ -5362,11 +5821,11 @@ function handleProjectFileChange(projectPath: string, changedPath: string) {
   }
 
   // 3. If preview is idle/stopped/error and a project structure appeared (index.html or package.json):
-  if (!previewProcess && !previewStaticServer && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error")) {
+  if (!workspaceRuntime.previewProcess && !workspaceRuntime.previewStaticServer && (workspaceRuntime.previewState.status === "idle" || workspaceRuntime.previewState.status === "stopped" || workspaceRuntime.previewState.status === "error")) {
     const isStructureTrigger = normalized.endsWith("package.json") || normalized.endsWith("index.html") || normalized.endsWith(".html");
     if (isStructureTrigger) {
       void detectProjectRuntime(projectPath).then(runtime => {
-        if (runtime.type !== "UNSUPPORTED" && (!previewProcess && !previewStaticServer && (previewState.status === "idle" || previewState.status === "stopped" || previewState.status === "error"))) {
+        if (runtime.type !== "UNSUPPORTED" && (!workspaceRuntime.previewProcess && !workspaceRuntime.previewStaticServer && (workspaceRuntime.previewState.status === "idle" || workspaceRuntime.previewState.status === "stopped" || workspaceRuntime.previewState.status === "error"))) {
           console.log(`[Neko/PreviewWatcher] Estrutura de projeto (${runtime.type}) detectada em ${runtime.projectRoot}. Iniciando preview automaticamente...`);
           void startPreview(projectPath).catch(err => {
             console.warn("[Neko/PreviewWatcher] Falha na auto-inicialização do preview:", err);
@@ -5399,17 +5858,19 @@ async function launchPreviewProcess(projectPath: string, info: any, packageManag
     stdio: ["ignore", "pipe", "pipe"]
   });
 
+  processRef.once("exit",workspacePorts.releaseCallback(port));
+  processRef.once("error",workspacePorts.releaseCallback(port));
   let output = "";
   processRef.stdout?.on("data", chunk => {
     const text = chunk.toString();
     output += text;
-    mainWindow?.webContents.send("preview:event", { type: "preview.output", properties: { stream: "stdout", text, source: "Preview" } });
+    emitWorkspacePreviewEvent({ type: "preview.output", properties: { stream: "stdout", text, source: "Preview" } });
     console.log("[Neko/Preview]", text);
   });
   processRef.stderr?.on("data", chunk => {
     const text = chunk.toString();
     output += text;
-    mainWindow?.webContents.send("preview:event", { type: "preview.output", properties: { stream: "stderr", text, source: "Preview" } });
+    emitWorkspacePreviewEvent({ type: "preview.output", properties: { stream: "stderr", text, source: "Preview" } });
     console.error("[Neko/Preview]", text);
   });
 
@@ -5422,7 +5883,7 @@ async function launchPreviewProcess(projectPath: string, info: any, packageManag
 }
 
 async function startStaticPreviewInternal(projectRoot: string, info: ProjectRuntimeDescriptor, sessionId: number, targetGen: number): Promise<PreviewManagerState> {
-  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+  if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
 
   emitPreview("preview.detected", {
     status: "detecting",
@@ -5432,7 +5893,7 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
     message: "Projeto HTML/Estático detectado."
   });
 
-  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+  if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
 
   const port = await findFreePort(3000);
   emitPreview("preview.starting", {
@@ -5446,15 +5907,15 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
 
   try {
     const server = await startStaticHttpServer(projectRoot, port);
-    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
+    if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) {
       server.close();
-      return previewState;
+      return workspaceRuntime.previewState;
     }
 
     server.on("close", () => {
-      if (previewStaticServer === server) {
-        previewStaticServer = null;
-        previewPort = null;
+      if (workspaceRuntime.previewStaticServer === server) {
+        workspaceRuntime.previewStaticServer = null;
+        workspaceRuntime.previewPort = null;
         emitPreview("preview.exit", {
           status: "stopped",
           phase: "stopped",
@@ -5465,8 +5926,8 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
       }
     });
 
-    previewStaticServer = server;
-    previewPort = port;
+    workspaceRuntime.previewStaticServer = server;
+    workspaceRuntime.previewPort = port;
     const url = `http://127.0.0.1:${port}`;
     emitPreview("preview.waiting", {
       status: "starting",
@@ -5479,10 +5940,10 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
     });
     await waitForHttp(url, 5000);
 
-    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
+    if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) {
       server.close();
-      if (previewStaticServer === server) previewStaticServer = null;
-      return previewState;
+      if (workspaceRuntime.previewStaticServer === server) workspaceRuntime.previewStaticServer = null;
+      return workspaceRuntime.previewState;
     }
 
     const ready: PreviewManagerState = {
@@ -5495,23 +5956,24 @@ async function startStaticPreviewInternal(projectRoot: string, info: ProjectRunt
       message: "Preview estático pronto.",
       internalSession: sessionId
     };
-    previewState = ready;
-    previewRuntimeDescriptor = info;
-    if (activeWorkspace) {
-      activeWorkspace.previewStaticServer = server;
-      activeWorkspace.previewPort = port;
-      activeWorkspace.previewUrl = url;
+    workspaceRuntime.previewState = ready;
+    workspaceRuntime.previewRuntimeDescriptor = info;
+    if (workspaceRuntime.activeWorkspace) {
+      if (getWorkspaceLease()) ownWorkspaceResource(getWorkspaceLease()!, "preview-server", server, () => closeWorkspacePreviewServer(server));
+      workspaceRuntime.activeWorkspace.previewStaticServer = server;
+      workspaceRuntime.activeWorkspace.previewPort = port;
+      workspaceRuntime.activeWorkspace.previewUrl = url;
     }
     logPreviewLifecycle("health check passed", { url });
     logPreviewLifecycle("ready", { url, framework: "HTML / Estático" });
     console.log(`[Preview] static ready session=${sessionId} url=${url}`);
-    mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
+    emitWorkspacePreviewEvent({ type: "preview.ready", properties: ready });
     void captureProjectPreviewThumbnail(projectRoot, url);
     return ready;
   } catch (error: any) {
     await stopPreviewProcessOnly();
     emitPreview("preview.error", { status: "error", phase: "error", message: String(error?.message ?? error), port: null, url: null });
-    return previewState;
+    return workspaceRuntime.previewState;
   }
 }
 
@@ -5526,7 +5988,7 @@ function logPreviewLifecycle(phase: string, details: Record<string, any> = {}) {
 }
 
 async function startPreviewInternal(projectRoot: string, info: any, sessionId: number, targetGen: number): Promise<PreviewManagerState> {
-  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+  if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
 
   const rawPackageManager = (info as any).packageManager ?? "npm";
   const resolvedPM = resolveEffectivePackageManager(rawPackageManager);
@@ -5537,13 +5999,13 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
     logPreviewLifecycle("package-manager-fallback", { detected: rawPackageManager, effective: packageManager, reason: resolvedPM.reason });
   }
 
-  if (previewState.status === "ready" && previewPort && previewState.url && previewProjectPath === projectRoot) {
-    const alive = await isHttpAlive(previewState.url);
+  if (workspaceRuntime.previewState.status === "ready" && workspaceRuntime.previewPort && workspaceRuntime.previewState.url && workspaceRuntime.previewProjectPath === projectRoot) {
+    const alive = await isHttpAlive(workspaceRuntime.previewState.url);
     if (alive) {
-      console.log(`[Preview] Servidor já ativo e saudável em ${previewState.url}`);
-      logPreviewLifecycle("server already active and healthy", { url: previewState.url, projectPath: projectRoot });
-      mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: previewState });
-      return previewState;
+      console.log(`[Preview] Servidor já ativo e saudável em ${workspaceRuntime.previewState.url}`);
+      logPreviewLifecycle("server already active and healthy", { url: workspaceRuntime.previewState.url, projectPath: projectRoot });
+      emitWorkspacePreviewEvent({ type: "preview.ready", properties: workspaceRuntime.previewState });
+      return workspaceRuntime.previewState;
     }
   }
 
@@ -5558,14 +6020,14 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
   if (!info.devScript) {
     logPreviewLifecycle("error", { stage: "detect", message: "no dev script found in package.json" });
     emitPreview("preview.unsupported", { status: "idle", phase: "unsupported", framework: info.framework, message: "Crie ou abra um projeto que nós cuidamos das dependências e preview" });
-    return previewState;
+    return workspaceRuntime.previewState;
   }
 
   if (!isPackageManagerAvailable(packageManager)) {
     const errorMsg = `Não foi possível iniciar o Preview: o gerenciador de pacotes '${rawPackageManager}' não está disponível no sistema.`;
     logPreviewLifecycle("error", { stage: "runtime", message: errorMsg });
     emitPreview("preview.error", { status: "error", phase: "error", message: errorMsg, port: null, url: null });
-    return previewState;
+    return workspaceRuntime.previewState;
   }
 
   // 1. Initial dependency check and installation
@@ -5585,21 +6047,21 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
   }
 
   if (needsInstall) {
-    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+    if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
     logPreviewLifecycle("dependencies installing", { packageManager });
     try {
       packageManager = await installDependenciesWithFallback(projectRoot, packageManager, info, targetGen, sessionId);
       logPreviewLifecycle("dependencies ready", { packageManager });
     } catch (error: any) {
-      if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+      if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
       const errorMsg = String(error?.message ?? error);
       logPreviewLifecycle("error", { stage: "dependencies", message: errorMsg });
       emitPreview("preview.error", { status: "error", phase: "error", message: errorMsg, port: null, url: null });
-      return previewState;
+      return workspaceRuntime.previewState;
     }
   }
 
-  if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+  if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
 
   const port = await findFreePort(info.preferredPort);
   logPreviewLifecycle("server starting", { framework: info.framework, port, packageManager });
@@ -5609,7 +6071,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
   let launch: Awaited<ReturnType<typeof launchPreviewProcess>> | null = null;
   try {
     launch = await launchPreviewProcess(projectRoot, info, packageManager, port);
-    if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
+    if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) {
       try {
         if (process.platform === "win32" && launch.processRef.pid) {
           spawn("taskkill.exe", ["/PID", String(launch.processRef.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -5617,15 +6079,16 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
           launch.processRef.kill("SIGTERM");
         }
       } catch {}
-      return previewState;
+      return workspaceRuntime.previewState;
     }
-    previewProcess = launch.processRef;
-
+    workspaceRuntime.previewProcess = launch.processRef;
     const processRef = launch.processRef;
+    if (getWorkspaceLease()) ownWorkspaceResource(getWorkspaceLease()!, "preview-process", processRef, () => stopChildProcessTree(processRef));
     processRef.on("exit", (code, signal) => {
-      if (previewProcess === processRef) {
-        previewProcess = null;
-        previewPort = null;
+      forgetWorkspaceResource(processRef);
+      if (workspaceRuntime.previewProcess === processRef) {
+        workspaceRuntime.previewProcess = null;
+        workspaceRuntime.previewPort = null;
         logPreviewLifecycle("server exited", { code, signal });
         emitPreview("preview.exit", { status: code === 0 ? "stopped" : "error", phase: code === 0 ? "stopped" : "error", port: null, url: null, message: code === 0 ? "Servidor encerrado." : `Servidor encerrou inesperadamente (código ${code}, ${signal ?? "sem sinal"}).` });
       }
@@ -5637,7 +6100,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
 
     try {
       await waitForHttp(url, 90000, processRef, sessionId, targetGen);
-      if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
+      if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) {
         try {
           if (process.platform === "win32" && processRef.pid) {
             spawn("taskkill.exe", ["/PID", String(processRef.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -5645,19 +6108,20 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
             processRef.kill("SIGTERM");
           }
         } catch {}
-        return previewState;
+        return workspaceRuntime.previewState;
       }
-      previewPort = port;
+      workspaceRuntime.previewPort = port;
       const ready = { status: "ready" as const, phase: "ready", framework: info.framework, packageManager, port, url, message: "Preview pronto.", internalSession: sessionId };
-      previewState = ready;
-      previewRuntimeDescriptor = info;
-      if (activeWorkspace) {
-        activeWorkspace.previewProcess = processRef;
-        activeWorkspace.previewPort = port;
-        activeWorkspace.previewUrl = url;
+      workspaceRuntime.previewState = ready;
+      workspaceRuntime.previewRuntimeDescriptor = info;
+      if (workspaceRuntime.activeWorkspace) {
+        if (getWorkspaceLease()) ownWorkspaceResource(getWorkspaceLease()!, "preview-process", processRef, () => stopChildProcessTree(processRef));
+        workspaceRuntime.activeWorkspace.previewProcess = processRef;
+        workspaceRuntime.activeWorkspace.previewPort = port;
+        workspaceRuntime.activeWorkspace.previewUrl = url;
       }
       logPreviewLifecycle("server ready", { url, framework: info.framework });
-      mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
+      emitWorkspacePreviewEvent({ type: "preview.ready", properties: ready });
       void captureProjectPreviewThumbnail(projectRoot, url);
       return ready;
     } catch (error: any) {
@@ -5679,7 +6143,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
         });
         try {
           await removeNodeModules(projectRoot);
-          if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+          if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
 
           emitPreview("preview.installing", {
             status: "installing",
@@ -5699,7 +6163,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
           logPreviewLifecycle("server starting", { framework: info.framework, port: retryPort, packageManager: "npm" });
           emitPreview("preview.starting", { status: "starting", phase: "starting_server", packageManager: "npm", framework: info.framework, port: retryPort, message: "Iniciando o Preview..." });
           const retry = await launchPreviewProcess(projectRoot, info, "npm", retryPort);
-          if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
+          if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) {
             try {
               if (process.platform === "win32" && retry.processRef.pid) {
                 spawn("taskkill.exe", ["/PID", String(retry.processRef.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -5707,14 +6171,16 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
                 retry.processRef.kill("SIGTERM");
               }
             } catch {}
-            return previewState;
+            return workspaceRuntime.previewState;
           }
-          previewProcess = retry.processRef;
+          workspaceRuntime.previewProcess = retry.processRef;
+          if (getWorkspaceLease()) ownWorkspaceResource(getWorkspaceLease()!, "preview-process", retry.processRef, () => stopChildProcessTree(retry.processRef));
           const retryProcess = retry.processRef;
           retryProcess.on("exit", (code, signal) => {
-            if (previewProcess === retryProcess) {
-              previewProcess = null;
-              previewPort = null;
+            forgetWorkspaceResource(retryProcess);
+            if (workspaceRuntime.previewProcess === retryProcess) {
+              workspaceRuntime.previewProcess = null;
+              workspaceRuntime.previewPort = null;
               emitPreview("preview.exit", { status: code === 0 ? "stopped" : "error", phase: code === 0 ? "stopped" : "error", port: null, url: null, message: code === 0 ? "Servidor encerrado." : `Servidor encerrou (código ${code}, ${signal ?? "sem sinal"}).` });
             }
           });
@@ -5722,7 +6188,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
           emitPreview("preview.waiting", { status: "starting", phase: "waiting_for_server", framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Aguardando o servidor responder..." });
           logPreviewLifecycle("server waiting", { url: retryUrl, port: retryPort });
           await waitForHttp(retryUrl, 90000, retryProcess, sessionId, targetGen);
-          if (sessionId !== activePreviewSessionId || targetGen !== projectTransitionGeneration) {
+          if (sessionId !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) {
             try {
               if (process.platform === "win32" && retryProcess.pid) {
                 spawn("taskkill.exe", ["/PID", String(retryProcess.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
@@ -5730,14 +6196,14 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
                 retryProcess.kill("SIGTERM");
               }
             } catch {}
-            return previewState;
+            return workspaceRuntime.previewState;
           }
-          previewPort = retryPort;
+          workspaceRuntime.previewPort = retryPort;
           const ready = { status: "ready" as const, phase: "ready", framework: info.framework, packageManager: "npm", port: retryPort, url: retryUrl, message: "Preview pronto.", internalSession: sessionId };
-          previewState = ready;
-          previewRuntimeDescriptor = info;
+          workspaceRuntime.previewState = ready;
+          workspaceRuntime.previewRuntimeDescriptor = info;
           logPreviewLifecycle("server ready", { url: retryUrl, framework: info.framework });
-          mainWindow?.webContents.send("preview:event", { type: "preview.ready", properties: ready });
+          emitWorkspacePreviewEvent({ type: "preview.ready", properties: ready });
           captureProjectPreviewThumbnail(projectRoot, retryUrl);
           return ready;
         } catch (fallbackError: any) {
@@ -5751,7 +6217,7 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
             port: null,
             url: null
           });
-          return previewState;
+          return workspaceRuntime.previewState;
         }
       }
 
@@ -5767,14 +6233,14 @@ async function startPreviewInternal(projectRoot: string, info: any, sessionId: n
         port: null,
         url: null
       });
-      return previewState;
+      return workspaceRuntime.previewState;
     }
   } catch (error: any) {
     await stopPreviewProcessOnly();
     const sanitizedErrorMsg = String(error?.message ?? error);
     logPreviewLifecycle("error", { stage: "server", message: sanitizedErrorMsg });
     emitPreview("preview.error", { status: "error", phase: "error", message: sanitizedErrorMsg, port: null, url: null });
-    return previewState;
+    return workspaceRuntime.previewState;
   }
 }
 
@@ -5783,38 +6249,38 @@ async function startPreview(projectPath: string, sourceGen?: number, forceRestar
     throw new Error("Não é permitido utilizar o diretório do NekoAI como workspace do projeto.");
   }
   const workspace = path.resolve(projectPath);
-  const targetGen = sourceGen ?? projectTransitionGeneration;
+  const targetGen = sourceGen ?? runtimeGeneration();
 
   // 1. Se já está rodando e saudável no mesmo projeto, NÃO matar! Reutilizar e reemitir ready!
-  const hasActiveRunner = (previewProcess && previewProcess.exitCode === null) || Boolean(previewStaticServer);
-  if (!forceRestart && previewProjectPath === workspace && hasActiveRunner && previewState.status === "ready" && previewState.url) {
-    const alive = await isHttpAlive(previewState.url);
+  const hasActiveRunner = (workspaceRuntime.previewProcess && workspaceRuntime.previewProcess.exitCode === null) || Boolean(workspaceRuntime.previewStaticServer);
+  if (!forceRestart && workspaceRuntime.previewProjectPath === workspace && hasActiveRunner && workspaceRuntime.previewState.status === "ready" && workspaceRuntime.previewState.url) {
+    const alive = await isHttpAlive(workspaceRuntime.previewState.url);
     if (alive) {
-      console.log(`[Preview] Servidor já ativo e saudável em ${previewState.url} (mantido sem interrupção).`);
-      emitPreview("preview.ready", previewState);
-      if (previewState.url) {
-        captureProjectPreviewThumbnail(workspace, previewState.url);
+      console.log(`[Preview] Servidor já ativo e saudável em ${workspaceRuntime.previewState.url} (mantido sem interrupção).`);
+      emitPreview("preview.ready", workspaceRuntime.previewState);
+      if (workspaceRuntime.previewState.url) {
+        captureProjectPreviewThumbnail(workspace, workspaceRuntime.previewState.url);
       }
-      return previewState;
+      return workspaceRuntime.previewState;
     }
   }
 
   // 2. Concurrency guard: Se já existe uma inicialização em andamento para este mesmo projeto, aguarda a mesma
-  if (!forceRestart && previewProjectPath === workspace && previewStartPromise) {
-    return previewStartPromise;
+  if (!forceRestart && workspaceRuntime.previewProjectPath === workspace && workspaceRuntime.previewStartPromise) {
+    return workspaceRuntime.previewStartPromise;
   }
 
-  const session = ++previewSessionCounter;
-  activePreviewSessionId = session;
+  const session = ++workspaceRuntime.previewSessionCounter;
+  workspaceRuntime.activePreviewSessionId = session;
   console.log(`[Preview] start session=${session} path=${workspace} gen=${targetGen}${forceRestart ? " (forceRestart)" : ""}`);
 
-  previewProjectPath = workspace;
-  previewStartPromise = (async () => {
+  workspaceRuntime.previewProjectPath = workspace;
+  workspaceRuntime.previewStartPromise = (async () => {
     logPreviewLifecycle("settling filesystem", { workspace, generation: targetGen });
     emitPreview("preview.detecting", { status: "detecting", phase: "analyzing", message: "Analisando estrutura do projeto...", framework: null, packageManager: null });
     
     const runtime = await detectProjectRuntimeWithSettling(workspace, targetGen);
-    if (session !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+    if (session !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
 
     logPreviewLifecycle("runtime detected", { type: runtime.type, framework: runtime.framework, projectRoot: runtime.projectRoot });
 
@@ -5822,11 +6288,11 @@ async function startPreview(projectPath: string, sourceGen?: number, forceRestar
       logPreviewLifecycle("runtime unresolved - entering transient watch", { workspace, generation: targetGen });
       emitPreview("preview.detecting", { status: "detecting", phase: "analyzing", message: "Aguardando estrutura do projeto...", framework: null, packageManager: null });
       watchEmptyWorkspace(workspace, targetGen, session);
-      return previewState;
+      return workspaceRuntime.previewState;
     }
 
     await stopPreviewProcessOnly();
-    if (session !== activePreviewSessionId || targetGen !== projectTransitionGeneration) return previewState;
+    if (session !== workspaceRuntime.activePreviewSessionId || targetGen !== runtimeGeneration()) return workspaceRuntime.previewState;
     console.log("[Neko/Preview] project runtime resolved", { workspace, runtimeType: runtime.type, projectRoot: runtime.projectRoot, session });
 
     if (runtime.type === "STATIC_HTML") {
@@ -5835,10 +6301,10 @@ async function startPreview(projectPath: string, sourceGen?: number, forceRestar
 
     return startPreviewInternal(runtime.projectRoot, runtime, session, targetGen);
   })().finally(() => {
-    previewStartPromise = null;
+    workspaceRuntime.previewStartPromise = null;
   });
 
-  return previewStartPromise;
+  return workspaceRuntime.previewStartPromise;
 }
 
 
@@ -5881,9 +6347,9 @@ async function saveModelSettings(settings: ModelSettingMap) {
 }
 
 async function getProviders() {
-  console.log(`[Providers] request generation=${activeWorkspace?.generation ?? 0} projectPath=${activeWorkspace?.projectPath ?? "none"} currentProject=${currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} transitionState=${activeWorkspace?.status ?? "none"}`);
+  console.log(`[Providers] request generation=${workspaceRuntime.activeWorkspace?.generation ?? 0} projectPath=${workspaceRuntime.activeWorkspace?.projectPath ?? "none"} currentProject=${workspaceRuntime.currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} transitionState=${workspaceRuntime.activeWorkspace?.status ?? "none"}`);
 
-  if (!serviceReady) logService("providers:list queued");
+  if (!workspaceRuntime.serviceReady) logService("providers:list queued");
   await waitForServiceReady();
   logService("providers:list started");
 
@@ -5891,9 +6357,9 @@ async function getProviders() {
   // empty catalog avoids connection-refused noise from the renderer during
   // the initial Home/empty-project state. The real catalog is loaded again
   // from the `neko.opencode.ready` event after OpenCode becomes healthy.
-  if (!currentProject || !opencodeProcess) {
+  if (!workspaceRuntime.currentProject || !workspaceRuntime.opencodeProcess) {
     logService("providers:list completed", "sem projeto ativo");
-    console.log(`[Providers] response generation=${activeWorkspace?.generation ?? 0} projectPath=${activeWorkspace?.projectPath ?? "none"} currentProject=${currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} count=0 (sem projeto ativo)`);
+    console.log(`[Providers] response generation=${workspaceRuntime.activeWorkspace?.generation ?? 0} projectPath=${workspaceRuntime.activeWorkspace?.projectPath ?? "none"} currentProject=${workspaceRuntime.currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} count=0 (sem projeto ativo)`);
     return { providers: [], models: [], managedModels: [] };
   }
 
@@ -6038,12 +6504,12 @@ async function getProviders() {
     const activeModels = managedModels.filter(m => m.enabled);
 
     logService("providers:list completed");
-    console.log(`[Providers] response generation=${activeWorkspace?.generation ?? 0} projectPath=${activeWorkspace?.projectPath ?? "none"} currentProject=${currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} count=${providers.length}`);
+    console.log(`[Providers] response generation=${workspaceRuntime.activeWorkspace?.generation ?? 0} projectPath=${workspaceRuntime.activeWorkspace?.projectPath ?? "none"} currentProject=${workspaceRuntime.currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} count=${providers.length}`);
     return { providers, models: activeModels, managedModels, defaults };
   } catch (error: any) {
-    if (!currentProject || !opencodeProcess || !serviceReady) {
+    if (!workspaceRuntime.currentProject || !workspaceRuntime.opencodeProcess || !workspaceRuntime.serviceReady) {
       logService("providers:list completed", "cancelado durante encerramento");
-      console.log(`[Providers] response generation=${activeWorkspace?.generation ?? 0} projectPath=${activeWorkspace?.projectPath ?? "none"} currentProject=${currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} count=0 (cancelado)`);
+      console.log(`[Providers] response generation=${workspaceRuntime.activeWorkspace?.generation ?? 0} projectPath=${workspaceRuntime.activeWorkspace?.projectPath ?? "none"} currentProject=${workspaceRuntime.currentProject ?? "none"} transitionGeneration=${projectTransitionGeneration} count=0 (cancelado)`);
       return { providers: [], models: [], managedModels: [] };
     }
     logService("providers:list ERROR", `msg=${logSafeText(error?.message ?? error)}`);
@@ -6199,27 +6665,29 @@ async function searchProjectFiles(query: string, projectRoot: string) {
 
 ipcMain.handle("project:search", async (_event, query: string) => {
   licenseManager.assertAccess("pesquisa de arquivos");
-  const projectRoot = assertProjectRootSafe(currentProject, "search");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "search");
   return searchProjectFiles(query, projectRoot);
 });
 
 ipcMain.handle("commands:list", async () => {
   try {
-    const response = await fetch(`${opencodeUrl}/command`, { headers: opencodeRequestHeaders() });
+    const response = await fetch(`${workspaceRuntime.opencodeUrl}/command`, { headers: opencodeRequestHeaders() });
     if (!response.ok) return [];
     const data = await response.json();
     return Array.isArray(data) ? data : (data?.commands ?? data?.data ?? []);
   } catch { return []; }
 });
 
-ipcMain.handle("opencode:command", async (_event, payload: { sessionId: string; command: string; arguments?: string; model?: { providerID: string; modelID: string } }) => {
+handleWorkspaceSessionIpc("opencode:command", async (_event, payload: { sessionId: string; command: string; arguments?: string; model?: { providerID: string; modelID: string } }) => {
   licenseManager.assertAccess("comandos do assistente");
-  const projectRoot = assertProjectRootSafe(currentProject, "command");
+  const lease = assertCurrentSessionWorkspace(payload.sessionId);
+  const target = workspaceServices.capture(lease);
+  const projectRoot = assertProjectRootSafe(target.projectPath, "command");
   logProjectWorkspace("command", projectRoot);
   if (!payload.sessionId) throw new Error("Sessão do Neko não encontrada.");
-  const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/command`, {
+  const response = await workspaceServices.request(target, `/session/${encodeURIComponent(payload.sessionId)}/command`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
+    headers: { "Content-Type": "application/json", ...workspaceServices.headers(target, opencodeAuthHeaders()) },
     body: JSON.stringify({
       command: payload.command.replace(/^\//, ""),
       arguments: payload.arguments ?? "",
@@ -6235,15 +6703,20 @@ ipcMain.handle("opencode:command", async (_event, payload: { sessionId: string; 
 });
 
 
-ipcMain.handle("github:status", async (_event, refresh: boolean = false) => {
-  const status = await getGithubStatus(currentProject);
-  if (status.error && refresh) throw new Error(status.error);
+ipcMain.handle("github:status", async (_event, refreshOrOptions?: boolean | { refresh?: boolean; projectPath?: string }) => {
+  const isRefresh = typeof refreshOrOptions === "boolean" ? refreshOrOptions : Boolean(refreshOrOptions?.refresh);
+  const targetProj = (typeof refreshOrOptions === "object" && refreshOrOptions?.projectPath) ? refreshOrOptions.projectPath : workspaceRuntime.currentProject;
+  const status = await getGithubStatus(targetProj);
+  if (status.error && isRefresh) throw new Error(status.error);
+
+
+
   return status;
 });
 
 ipcMain.handle("github:selectAccount", async (_event, payload: { accountId: string; projectPath?: string }) => {
   const accountId = String(payload?.accountId || "").trim();
-  const proj = payload?.projectPath || currentProject;
+  const proj = payload?.projectPath || workspaceRuntime.currentProject;
   if (accountId) {
     if (proj) {
       githubAccountManager.setProjectAssociation(proj, accountId);
@@ -6256,7 +6729,7 @@ ipcMain.handle("github:selectAccount", async (_event, payload: { accountId: stri
     }
   }
   const status = await getGithubStatus(proj, accountId);
-  mainWindow?.webContents.send("github:event", { type: "github.accountSelected", properties: status });
+  sendWorkspaceRenderer("github:event", { type: "github.accountSelected", properties: status });
   return status;
 });
 
@@ -6265,8 +6738,8 @@ ipcMain.handle("github:disconnectAccount", async (_event, payload: { accountId: 
   if (accountId) {
     githubAccountManager.removeAccountRecord(accountId);
   }
-  const status = await getGithubStatus(currentProject);
-  mainWindow?.webContents.send("github:event", { type: "github.disconnected", properties: status });
+
+  sendWorkspaceRenderer("github:event", { type: "github.disconnected", properties: status });
   return status;
 });
 
@@ -6344,7 +6817,7 @@ ipcMain.handle("github:start", async (_event, forceReauthorize: boolean = false)
       .catch(error => {
         if (abortController.signal.aborted || githubAuthState.attemptId !== attemptId) return;
         console.error("[Neko/GitHub] Device Flow error:", error);
-        mainWindow?.webContents.send("github:event", { type: "github.error", properties: { message: error instanceof Error ? error.message : String(error) } });
+        sendWorkspaceRenderer("github:event", { type: "github.error", properties: { message: error instanceof Error ? error.message : String(error) } });
       })
       .finally(() => {
         if (githubAuthState.attemptId === attemptId) {
@@ -6371,21 +6844,21 @@ ipcMain.handle("github:start", async (_event, forceReauthorize: boolean = false)
 
 ipcMain.handle("github:cancel", async () => {
   cancelGithubAuthorization("renderer_requested");
-  mainWindow?.webContents.send("github:event", { type: "github.cancelled" });
+  sendWorkspaceRenderer("github:event", { type: "github.cancelled" });
   return { ok: true };
 });
 
 ipcMain.handle("github:disconnect", async () => {
   cancelGithubAuthorization("disconnect");
   clearGithubAuth();
-  mainWindow?.webContents.send("github:event", { type: "github.disconnected", properties: { connected: false, repos: [] } });
+  sendWorkspaceRenderer("github:event", { type: "github.disconnected", properties: { connected: false, repos: [] } });
   return true;
 });
 
 ipcMain.handle("github:unlinkProject", async () => {
   licenseManager.assertAccess("desvinculação de repositórios no GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de desvinculá-lo do GitHub.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-unlink");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de desvinculá-lo do GitHub.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-unlink");
 
   return withProjectGitLock(projectPath, async () => {
     const gitStatus = await getGitStatus();
@@ -6393,7 +6866,7 @@ ipcMain.handle("github:unlinkProject", async () => {
       await runGit(projectPath, ["remote", "remove", "origin"], {}, 15000);
     }
     invalidateProjectCheckpoints(projectPath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: projectPath, reason: "git.unlink" }
     });
@@ -6405,8 +6878,8 @@ ipcMain.handle("github:unlinkProject", async () => {
 
 
 ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
-  if (!currentProject) return [];
-  const projectPath = assertProjectRootSafe(currentProject, "git-list");
+  if (!workspaceRuntime.currentProject) return [];
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-list");
 
   return withProjectGitLock(projectPath, async () => {
     const status = await getGitStatus();
@@ -6422,7 +6895,7 @@ ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
       const auth = readGithubAuth();
       if (auth?.token) {
         try {
-          const token = await getGithubAccessToken();
+          const token = await getGithubAccessToken(projectPath);
           const fetched = await runGitWithGithubAuth(projectPath, ["fetch", "--prune", "origin"], token, 20000);
           if (fetched.code === 0) {
             remoteSyncSuccess = true;
@@ -6464,8 +6937,8 @@ ipcMain.handle("github:listBranches", async (_event, _repoFullName: string) => {
 });
 
 ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
-  if (!currentProject) throw new Error("Abra um projeto antes de trocar de branch.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de trocar de branch.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   if (activeAgentRequests.size > 0) {
     throw new Error("Uma tarefa do assistente está em execução no momento. Aguarde a conclusão da tarefa antes de trocar de branch.");
@@ -6487,7 +6960,7 @@ ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
       const checkout = await runGit(projectPath, ["checkout", name], {}, 20000);
       if (checkout.code !== 0) throw new Error(formatGitHubGitError(checkout, `trocar para a branch "${name}"`));
       invalidateProjectCheckpoints(projectPath);
-      mainWindow?.webContents.send("opencode:event", {
+      emitWorkspaceEvent({
         type: "neko.project.changed",
         properties: { path: "", reason: "branch.checkout", branch: name }
       });
@@ -6539,7 +7012,7 @@ ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
     }
 
     invalidateProjectCheckpoints(projectPath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: "", reason: "branch.checkout", branch: name }
     });
@@ -6550,8 +7023,8 @@ ipcMain.handle("github:checkoutBranch", async (_event, branchName: string) => {
 
 ipcMain.handle("github:createBranch", async (_event, payload: { name: string; baseBranch?: string }) => {
   licenseManager.assertAccess("criação de branches no Git");
-  if (!currentProject) throw new Error("Abra um projeto antes de criar uma nova branch.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de criar uma nova branch.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   if (activeAgentRequests.size > 0) {
     throw new Error("Uma tarefa do assistente está em execução no momento. Aguarde a conclusão da tarefa antes de criar uma branch.");
@@ -6577,7 +7050,7 @@ ipcMain.handle("github:createBranch", async (_event, payload: { name: string; ba
     if (checkout.code !== 0) throw new Error(formatGitHubGitError(checkout, `criar a branch "${name}"`));
 
     invalidateProjectCheckpoints(projectPath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: "", reason: "branch.create", branch: name }
     });
@@ -6587,9 +7060,9 @@ ipcMain.handle("github:createBranch", async (_event, payload: { name: string; ba
 });
 
 ipcMain.handle("github:getDefaultBranch", async () => {
-  if (!currentProject) return "main";
+  if (!workspaceRuntime.currentProject) return "main";
   try {
-    const projectPath = assertProjectRootSafe(currentProject, "git-read");
+    const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-read");
     const status = await getGitStatus(projectPath);
     if (!status.initialized) return "main";
 
@@ -6961,8 +7434,8 @@ async function performGithubPush(projectPath: string): Promise<{ ok: boolean; pu
 
 ipcMain.handle("github:commit", async (_event, payload: { message: string; files?: string[] }) => {
   licenseManager.assertAccess("criação de commits no Git");
-  if (!currentProject) throw new Error("Abra um projeto antes de salvar alterações.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de salvar alterações.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
   const message = String(payload?.message || "").trim();
   const rawFiles = Array.isArray(payload?.files) ? payload.files.map(f => String(f).trim()).filter(Boolean) : undefined;
   let files: string[] | undefined = undefined;
@@ -6979,15 +7452,24 @@ ipcMain.handle("github:commit", async (_event, payload: { message: string; files
 
 ipcMain.handle("github:push", async () => {
   licenseManager.assertAccess("envio de commits para o GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
   return await performGithubPush(projectPath);
 });
 
-ipcMain.handle("github:commitPush", async (_event, payload: { message: string; files?: string[]; push?: boolean }) => {
+ipcMain.handle("github:commitPush", async (_event, payload: { message: string; files?: string[]; push?: boolean; projectPath?: string; directPublish?: boolean }) => {
   licenseManager.assertAccess("envio de commits para o GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de enviar alterações.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  let targetProject = workspaceRuntime.currentProject;
+  if (payload?.directPublish) {
+    if (!payload?.projectPath || typeof payload.projectPath !== "string" || !payload.projectPath.trim()) {
+      throw new Error("O caminho do projeto é obrigatório para a publicação direta.");
+    }
+    targetProject = payload.projectPath;
+  } else if (payload?.projectPath) {
+    targetProject = payload.projectPath;
+  }
+  if (!targetProject) throw new Error("Abra um projeto antes de enviar alterações.");
+  const projectPath = assertProjectRootSafe(targetProject, "git-write");
   const message = String(payload?.message || "").trim();
   const rawFiles = Array.isArray(payload?.files) ? payload.files.map(f => String(f).trim()).filter(Boolean) : undefined;
   let files: string[] | undefined = undefined;
@@ -7005,7 +7487,7 @@ ipcMain.handle("github:commitPush", async (_event, payload: { message: string; f
 
 ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: string; taskId?: string; message?: string }) => {
   licenseManager.assertAccess("envio de commits para o GitHub");
-  const targetPath = payload?.projectPath || currentProject;
+  const targetPath = payload?.projectPath || workspaceRuntime.currentProject;
   if (!targetPath) {
     return { ok: false, skipped: true, reason: "no-project", message: "Nenhum projeto ativo para o Auto Commit." };
   }
@@ -7096,7 +7578,7 @@ ipcMain.handle("github:autoCommitTask", async (_event, payload: { projectPath?: 
 });
 
 ipcMain.handle("github:getAutoCommit", async (_event, projectPath?: string) => {
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) return false;
   try {
     const safe = assertProjectRootSafe(target, "preference-read");
@@ -7107,7 +7589,7 @@ ipcMain.handle("github:getAutoCommit", async (_event, projectPath?: string) => {
 });
 
 ipcMain.handle("github:setAutoCommit", async (_event, payload: { projectPath?: string; enabled: boolean }) => {
-  const target = payload?.projectPath || currentProject;
+  const target = payload?.projectPath || workspaceRuntime.currentProject;
   if (!target) return { ok: false, enabled: false };
   try {
     const safe = assertProjectRootSafe(target, "preference-write");
@@ -7121,7 +7603,7 @@ ipcMain.handle("github:setAutoCommit", async (_event, payload: { projectPath?: s
 async function getGithubDefaultBranch(repoFullName: string): Promise<string> {
   if (!repoFullName) return "main";
   try {
-    const token = await getGithubAccessToken(currentProject || undefined).catch(() => "");
+    const token = await getGithubAccessToken(workspaceRuntime.currentProject || undefined).catch(() => "");
     if (token) {
       const res = await rawGithubFetch(`/repos/${repoFullName}`, { token }).then((r: Response) => r.json()).catch(() => null);
       if (res?.default_branch) return String(res.default_branch);
@@ -7132,7 +7614,7 @@ async function getGithubDefaultBranch(repoFullName: string): Promise<string> {
 
 ipcMain.handle("github:getPullRequestStatus", async (_event, payload: { repoFullName?: string; head?: string; base?: string; prNumber?: number }) => {
   licenseManager.assertAccess("consulta de Pull Requests no GitHub");
-  const projectPath = currentProject;
+  const projectPath = workspaceRuntime.currentProject;
   const status = await getGitStatus(projectPath || undefined);
   const repoFullName = String(payload?.repoFullName || status.linkedRepo || "").trim();
   const headBranch = String(payload?.head || status.branch || "").trim();
@@ -7175,7 +7657,7 @@ ipcMain.handle("github:getPullRequestStatus", async (_event, payload: { repoFull
 
 ipcMain.handle("github:listPullRequests", async (_event, payload: { repoFullName?: string; page?: number; perPage?: number; state?: "all" | "open" | "closed" }) => {
   licenseManager.assertAccess("consulta de Pull Requests no GitHub");
-  const projectPath = currentProject;
+  const projectPath = workspaceRuntime.currentProject;
   const status = await getGitStatus(projectPath || undefined);
   const repoFullName = String(payload?.repoFullName || status.linkedRepo || "").trim();
   if (!repoFullName) {
@@ -7224,8 +7706,8 @@ ipcMain.handle("github:mergePullRequest", async (_event, payload: { repoFullName
     commitMessage: payload?.commitMessage
   });
 
-  if (result.ok && currentProject) {
-    void getGitStatus(currentProject);
+  if (result.ok && workspaceRuntime.currentProject) {
+    void getGitStatus(workspaceRuntime.currentProject);
   }
 
   return result;
@@ -7233,8 +7715,8 @@ ipcMain.handle("github:mergePullRequest", async (_event, payload: { repoFullName
 
 ipcMain.handle("github:preparePRConflictResolution", async (_event, payload: { repoFullName: string; headBranch: string; baseBranch: string; prNumber?: number }) => {
   licenseManager.assertAccess("resolução de conflitos de Pull Request no GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de resolver conflitos.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de resolver conflitos.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   let token = "";
   try {
@@ -7259,8 +7741,8 @@ ipcMain.handle("github:preparePRConflictResolution", async (_event, payload: { r
 
 ipcMain.handle("github:pushPRBranch", async (_event, payload: { headBranch: string }) => {
   licenseManager.assertAccess("envio de branch de Pull Request no GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de enviar a branch.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de enviar a branch.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   let token = "";
   try {
@@ -7282,8 +7764,8 @@ ipcMain.handle("github:pushPRBranch", async (_event, payload: { headBranch: stri
 
 ipcMain.handle("github:abortMerge", async () => {
   licenseManager.assertAccess("cancelamento de merge no Git");
-  if (!currentProject) throw new Error("Abra um projeto antes de abortar o merge.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de abortar o merge.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   return withProjectGitLock(projectPath, async () => {
     const res = await runGit(projectPath, ["merge", "--abort"], {}, 15000).catch((err) => ({ code: 1, stdout: "", stderr: String(err?.message || err) }));
@@ -7392,22 +7874,30 @@ ipcMain.handle("github:createPullRequest", async (_event, payload: { repoFullNam
   };
 });
 
-ipcMain.handle("github:checkRepoAccess", async (_event, repoFullName: string) => {
-  const name = String(repoFullName || "").trim();
+ipcMain.handle("github:checkRepoAccess", async (_event, payloadOrName: string | { repoFullName: string; projectPath?: string; accountId?: string }) => {
+  const name = typeof payloadOrName === "string" ? payloadOrName.trim() : String(payloadOrName?.repoFullName || "").trim();
+  const projectPath = typeof payloadOrName === "object" ? payloadOrName?.projectPath : undefined;
+  const accountId = typeof payloadOrName === "object" ? payloadOrName?.accountId : undefined;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name)) {
-    return { accessible: false, status: 400, reason: "invalid-repo" };
+    return { accessible: false, canWrite: false, status: 400, reason: "invalid-repo" };
   }
 
-  const auth = readGithubAuth();
-  if (!auth?.token) {
-    return { accessible: false, status: 401, reason: "not-connected" };
+  let token = "";
+  try {
+    token = await getGithubAccessToken(projectPath, accountId);
+  } catch {
+    const auth = readGithubAuth();
+    token = auth?.token || "";
+  }
+  if (!token) {
+    return { accessible: false, canWrite: false, status: 401, reason: "not-connected" };
   }
 
   try {
     const response = await fetchWithTimeout(`https://api.github.com/repos/${name}`, {
       headers: {
         Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${auth.token}`,
+        Authorization: `Bearer ${token}`,
         "X-GitHub-Api-Version": "2022-11-28"
       }
     }, 15000);
@@ -7416,6 +7906,7 @@ ipcMain.handle("github:checkRepoAccess", async (_event, repoFullName: string) =>
       const json: any = await response.json().catch(() => ({}));
       return {
         accessible: true,
+        canWrite: Boolean(json.permissions?.push || json.permissions?.admin || json.permissions?.maintain),
         status: 200,
         private: Boolean(json.private),
         permissions: json.permissions || null
@@ -7423,18 +7914,18 @@ ipcMain.handle("github:checkRepoAccess", async (_event, repoFullName: string) =>
     }
 
     if (response.status === 404) {
-      return { accessible: false, status: 404, reason: "not-found" };
+      return { accessible: false, canWrite: false, status: 404, reason: "not-found" };
     }
     if (response.status === 403) {
       const bodyText = await response.text().catch(() => "");
       const isPermissionUpdate = bodyText.toLowerCase().includes("resource not accessible by integration");
-      return { accessible: false, status: 403, reason: isPermissionUpdate ? "permission-update-needed" : "forbidden" };
+      return { accessible: false, canWrite: false, status: 403, reason: isPermissionUpdate ? "permission-update-needed" : "forbidden" };
     }
     if (response.status === 401) {
-      return { accessible: false, status: 401, reason: "unauthorized" };
+      return { accessible: false, canWrite: false, status: 401, reason: "unauthorized" };
     }
 
-    return { accessible: false, status: response.status, reason: `http-${response.status}` };
+    return { accessible: false, canWrite: false, status: response.status, reason: `http-${response.status}` };
   } catch (error: any) {
     if (error?.name === "AbortError" || error?.message?.includes("timed out")) {
       throw new Error("Tempo limite excedido ao verificar acesso ao repositório no GitHub.");
@@ -7443,10 +7934,19 @@ ipcMain.handle("github:checkRepoAccess", async (_event, repoFullName: string) =>
   }
 });
 
-ipcMain.handle("github:publishProject", async (_event, payload: { repoName: string; private?: boolean }) => {
+ipcMain.handle("github:publishProject", async (_event, payload: { repoName: string; private?: boolean; projectPath?: string; directPublish?: boolean; accountId?: string }) => {
   licenseManager.assertAccess("publicação de repositórios no GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de publicá-lo no GitHub.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  let targetProject = workspaceRuntime.currentProject;
+  if (payload?.directPublish) {
+    if (!payload?.projectPath || typeof payload.projectPath !== "string" || !payload.projectPath.trim()) {
+      throw new Error("O caminho do projeto é obrigatório para a publicação direta.");
+    }
+    targetProject = payload.projectPath;
+  } else if (payload?.projectPath) {
+    targetProject = payload.projectPath;
+  }
+  if (!targetProject) throw new Error("Abra um projeto antes de publicá-lo no GitHub.");
+  const projectPath = assertProjectRootSafe(targetProject, "git-write");
 
   const repoName = String(payload?.repoName || "").trim();
   const isPrivate = Boolean(payload?.private);
@@ -7457,12 +7957,12 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
   // Cancel any existing publish operation on this project before starting
   cancelCurrentPublishOperation(projectPath);
   const abortController = new AbortController();
-  activePublishAbortController = abortController;
+  publishRuntime.current().controller = abortController;
   const signal = abortController.signal;
 
   return withProjectGitLock(projectPath, async () => {
     try {
-      const token = await getGithubAccessToken();
+      const token = await getGithubAccessToken(projectPath, payload?.accountId);
 
       let createdRepo: any = null;
       let cloneUrl = "";
@@ -7494,6 +7994,9 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
         } catch {}
 
         if (isAlreadyExists || createResponse.status === 422) {
+          if (payload?.directPublish) {
+            throw new Error(`COLLISION_422: Já existe um repositório com o nome "${repoName}" no seu GitHub. Selecione o repositório correto no Git Center ou defina outro nome para vincular.`);
+          }
           // Check if repo exists on authenticated user's account and reuse it
           const userAuth = await githubApi("/user").then(r => r.json()).catch(() => null);
           if (userAuth?.login) {
@@ -7588,8 +8091,13 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
         throw new Error(formatGitHubGitError(push, `publicar os arquivos na branch "${defaultBranch}"`));
       }
 
-      const updatedGithubStatus = await getGithubStatus();
-      mainWindow?.webContents.send("github:event", { type: "github.connected", properties: updatedGithubStatus });
+      const updatedGithubStatus = await getGithubStatus(projectPath, payload?.accountId);
+      sendWorkspaceRenderer("github:event", { type: "github.connected", properties: updatedGithubStatus });
+      const activeRecord = await resolveGithubAccountForProject(projectPath, payload?.accountId);
+      if (activeRecord) {
+        githubAccountManager.setProjectAssociation(projectPath, activeRecord.id);
+        githubAccountManager.setProjectAssociation(createdRepo.full_name, activeRecord.id);
+      }
 
       const publishResult = {
         ok: true,
@@ -7601,22 +8109,22 @@ ipcMain.handle("github:publishProject", async (_event, payload: { repoName: stri
           htmlUrl: createdRepo.html_url,
           defaultBranch
         },
-        status: await getGitStatus(),
+        status: await getGitStatus(projectPath),
         githubStatus: updatedGithubStatus
       };
       void vercelManager.detectLinkedProject();
       return publishResult;
     } finally {
-      if (activePublishAbortController === abortController) {
-        activePublishAbortController = null;
+      if (publishRuntime.current().controller === abortController) {
+        publishRuntime.current().controller = null;
       }
     }
   });
 });
 
 ipcMain.handle("github:cancelPublish", async () => {
-  if (currentProject) {
-    cancelCurrentPublishOperation(currentProject);
+  if (workspaceRuntime.currentProject) {
+    cancelCurrentPublishOperation(workspaceRuntime.currentProject);
   } else {
     cancelCurrentPublishOperation();
   }
@@ -7626,7 +8134,7 @@ ipcMain.handle("github:cancelPublish", async () => {
 ipcMain.handle("github:gitStatus", async (_event, projectPath?: string) => getGitStatus(projectPath));
 
 ipcMain.handle("github:checkSync", async (_event, projectPath?: string) => {
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) {
     return {
       initialized: false,
@@ -7663,7 +8171,7 @@ ipcMain.handle("github:checkSync", async (_event, projectPath?: string) => {
 
 ipcMain.handle("github:pullChanges", async (_event, projectPath?: string) => {
   licenseManager.assertAccess("sincronização de alterações do GitHub");
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) throw new Error("Abra um projeto antes de sincronizar alterações.");
   const safePath = assertProjectRootSafe(target, "git-write");
 
@@ -7680,7 +8188,7 @@ ipcMain.handle("github:pullChanges", async (_event, projectPath?: string) => {
     });
 
     invalidateProjectCheckpoints(safePath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: safePath, reason: "git.pull" }
     });
@@ -7693,7 +8201,7 @@ ipcMain.handle("github:pullChanges", async (_event, projectPath?: string) => {
 });
 
 ipcMain.handle("github:getSyncDetails", async (_event, projectPath?: string) => {
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) return null;
   const safePath = assertProjectRootSafe(target, "git-read");
   let token: string | undefined = undefined;
@@ -7711,7 +8219,7 @@ ipcMain.handle("github:getSyncDetails", async (_event, projectPath?: string) => 
 
 ipcMain.handle("github:syncAndCombine", async (_event, projectPath?: string) => {
   licenseManager.assertAccess("sincronização de alterações do GitHub");
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) throw new Error("Abra um projeto antes de sincronizar e combinar alterações.");
   const safePath = assertProjectRootSafe(target, "git-write");
 
@@ -7728,7 +8236,7 @@ ipcMain.handle("github:syncAndCombine", async (_event, projectPath?: string) => 
     });
 
     invalidateProjectCheckpoints(safePath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: safePath, reason: "git.sync-combine" }
     });
@@ -7742,7 +8250,7 @@ ipcMain.handle("github:syncAndCombine", async (_event, projectPath?: string) => 
 
 ipcMain.handle("github:resolveConflict", async (_event, payload: { projectPath?: string; filePath: string; resolution: "local" | "github" | "both"; customContent?: string }) => {
   licenseManager.assertAccess("resolução de conflitos no Git");
-  const target = payload?.projectPath || currentProject;
+  const target = payload?.projectPath || workspaceRuntime.currentProject;
   if (!target) throw new Error("Abra um projeto antes de resolver conflitos.");
   if (!payload?.filePath) throw new Error("Arquivo para resolução de conflito não informado.");
   if (!["local", "github", "both"].includes(payload?.resolution)) {
@@ -7760,7 +8268,7 @@ ipcMain.handle("github:resolveConflict", async (_event, payload: { projectPath?:
     );
 
     invalidateProjectCheckpoints(safePath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: safePath, reason: "git.resolve-conflict", file: payload.filePath }
     });
@@ -7771,7 +8279,7 @@ ipcMain.handle("github:resolveConflict", async (_event, payload: { projectPath?:
 
 ipcMain.handle("github:finalizeSync", async (_event, payload?: { projectPath?: string; message?: string }) => {
   licenseManager.assertAccess("finalização de sincronização no Git");
-  const target = payload?.projectPath || currentProject;
+  const target = payload?.projectPath || workspaceRuntime.currentProject;
   if (!target) throw new Error("Abra um projeto antes de finalizar a sincronização.");
   const safePath = assertProjectRootSafe(target, "git-write");
 
@@ -7782,7 +8290,7 @@ ipcMain.handle("github:finalizeSync", async (_event, payload?: { projectPath?: s
     });
 
     invalidateProjectCheckpoints(safePath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: safePath, reason: "git.finalize-sync" }
     });
@@ -7795,7 +8303,7 @@ ipcMain.handle("github:finalizeSync", async (_event, payload?: { projectPath?: s
 });
 
 ipcMain.handle("github:getConflictDetails", async (_event, projectPath?: string) => {
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) return [];
   const safePath = assertProjectRootSafe(target, "git-read");
 
@@ -7805,7 +8313,7 @@ ipcMain.handle("github:getConflictDetails", async (_event, projectPath?: string)
 });
 
 ipcMain.handle("github:checkAndRefreshConflicts", async (_event, projectPath?: string) => {
-  const target = projectPath || currentProject;
+  const target = projectPath || workspaceRuntime.currentProject;
   if (!target) return { ok: false, hasConflicts: false, conflictFiles: [], remoteUpdated: false };
   const safePath = assertProjectRootSafe(target, "git-write");
 
@@ -7826,8 +8334,8 @@ ipcMain.handle("github:checkAndRefreshConflicts", async (_event, projectPath?: s
 
 ipcMain.handle("github:discardChanges", async () => {
   licenseManager.assertAccess("descarte de alterações no Git");
-  if (!currentProject) throw new Error("Abra um projeto antes de descartar alterações.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de descartar alterações.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   return withProjectGitLock(projectPath, async () => {
     const status = await getGitStatus();
@@ -7876,7 +8384,7 @@ ipcMain.handle("github:discardChanges", async () => {
     }
 
     invalidateProjectCheckpoints(projectPath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: "", reason: "git.discard" }
     });
@@ -7926,8 +8434,8 @@ async function cleanFolderForClone(folderPath: string): Promise<void> {
 
 ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: string; replaceRemote?: boolean; overwriteLocalContent?: boolean }) => {
   licenseManager.assertAccess("vinculação de repositórios no GitHub");
-  if (!currentProject) throw new Error("Abra um projeto antes de conectá-lo ao GitHub.");
-  const projectPath = assertProjectRootSafe(currentProject, "git-write");
+  if (!workspaceRuntime.currentProject) throw new Error("Abra um projeto antes de conectá-lo ao GitHub.");
+  const projectPath = assertProjectRootSafe(workspaceRuntime.currentProject, "git-write");
 
   const repoFullName = String(payload?.repoFullName || "").trim();
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoFullName)) {
@@ -8046,14 +8554,14 @@ ipcMain.handle("github:linkProject", async (_event, payload: { repoFullName: str
 
     // Invalidate checkpoints, reload trees and notify workspace
     invalidateProjectCheckpoints(projectPath);
-    mainWindow?.webContents.send("opencode:event", {
+    emitWorkspaceEvent({
       type: "neko.project.changed",
       properties: { path: projectPath, reason: "git.clone" }
     });
 
     const finalStatus = await getGitStatus();
     const updatedGithubStatus = await getGithubStatus();
-    mainWindow?.webContents.send("github:event", { type: "github.connected", properties: updatedGithubStatus });
+    sendWorkspaceRenderer("github:event", { type: "github.connected", properties: updatedGithubStatus });
     void vercelManager.detectLinkedProject();
 
     return {
@@ -8079,34 +8587,34 @@ ipcMain.handle("projects:getRecent", async () => {
 ipcMain.handle("projects:touchRecent", async (_event, projectPath: string) => {
   await recentProjectsManager.touchRecentProject(projectPath);
   const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
-  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  sendWorkspaceRenderer("recent-projects:updated", enriched);
   return enriched;
 });
 
 ipcMain.handle("projects:removeRecent", async (_event, projectPath: string) => {
   await recentProjectsManager.removeRecentProject(projectPath);
   const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
-  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  sendWorkspaceRenderer("recent-projects:updated", enriched);
   return enriched;
 });
 
 ipcMain.handle("projects:toggleFavorite", async (_event, projectPath: string) => {
   await recentProjectsManager.toggleFavoriteProject(projectPath);
   const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
-  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  sendWorkspaceRenderer("recent-projects:updated", enriched);
   return enriched;
 });
 
 ipcMain.handle("projects:saveRecent", async (_event, projects: any[]) => {
   await recentProjectsManager.saveRecentProjects(projects);
   const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
-  mainWindow?.webContents.send("recent-projects:updated", enriched);
+  sendWorkspaceRenderer("recent-projects:updated", enriched);
   return enriched;
 });
 
 ipcMain.handle("projects:delete", async (_event, projectPath: string) => {
   const result = await deleteProjectToTrash(projectPath);
-  mainWindow?.webContents.send("recent-projects:updated", result.updatedList);
+  sendWorkspaceRenderer("recent-projects:updated", result.updatedList);
   return result;
 });
 
@@ -8174,7 +8682,7 @@ ipcMain.handle("project:saveThumbnail", async (_event, payload: { projectPath: s
     }).then(async () => {
       try {
         const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
-        mainWindow?.webContents.send("recent-projects:updated", enriched);
+        sendWorkspaceRenderer("recent-projects:updated", enriched);
       } catch {}
     }).catch(() => {});
     return { ok: true };
@@ -8205,7 +8713,12 @@ ipcMain.handle("project:lastEdited", async (_event, projectPath: string) => {
   }
 });
 
-ipcMain.handle("project:choose", async (_event, options?: { defaultPath?: string }) => {
+let projectChooserPromise: Promise<string | null> | null = null;
+ipcMain.handle("project:choose", async (event, options?: { defaultPath?: string }) => {
+  if (projectChooserPromise) return projectChooserPromise;
+  const senderId = event.sender.id;
+  const choose = async () => {
+  traceProjectOpen("chooser-start", {sender:senderId});
   let defaultPath: string | undefined = undefined;
 
   if (options?.defaultPath && isValidDirectory(options.defaultPath)) {
@@ -8226,80 +8739,58 @@ ipcMain.handle("project:choose", async (_event, options?: { defaultPath?: string
     dialogOptions.defaultPath = defaultPath;
   }
 
-  const result = mainWindow
+  // On Windows use the independent native dialog. Attaching it to the host
+  // window disables the host and its nested studio/Preview views while the
+  // shell picker is running on Electron's dialog thread.
+  const result = mainWindow && process.platform !== "win32"
     ? await dialog.showOpenDialog(mainWindow, dialogOptions)
     : await dialog.showOpenDialog(dialogOptions);
 
+  traceProjectOpen("chooser-result", {sender:senderId,canceled:result.canceled,count:result.filePaths.length});
   if (result.canceled || !result.filePaths[0]) return null;
   return result.filePaths[0];
+  };
+  const pending = choose();
+  projectChooserPromise = pending;
+  try { return await pending; }
+  finally {
+    if (projectChooserPromise === pending) projectChooserPromise = null;
+    const owner = workspaceTabs?.owner(senderId);
+    if (owner) workspaceTabs?.select(owner.workspaceId);
+    else if (mainWindow && !mainWindow.isDestroyed()) mainWindow.focus();
+  }
 });
 
-async function switchWorkspaceInternal(targetInput: string | { projectPath: string; source?: string }, defaultSource = "unknown") {
-  console.log("[BLACKSCREEN] switchWorkspace:start", { targetInput: typeof targetInput === "string" ? targetInput : targetInput?.projectPath, source: defaultSource, currentProject, hasActiveWorkspace: !!activeWorkspace, activeWorkspaceStatus: activeWorkspace?.status });
-  licenseManager.assertAccess("o workspace do NekoAI");
-  const projectPath = typeof targetInput === "string" ? targetInput : targetInput?.projectPath;
-  const source = (typeof targetInput === "object" && targetInput?.source) ? targetInput.source : defaultSource;
-
-  if (!projectPath) throw new Error("Pasta do projeto não informada.");
-
-  const targetPath = assertProjectRootSafe(projectPath, "switch");
-
-  const isCreatingNew = source === "NewProject" || source === "create";
-  if (!isCreatingNew) {
-    const exists = await fs.promises.stat(targetPath).then(s => s.isDirectory()).catch(() => false);
-    if (!exists) {
-      throw new Error(`Pasta não encontrada no disco: ${targetPath}`);
-    }
-  }
-
-  const transitionGen = ++projectTransitionGeneration;
-  logProjectWorkspace("switch", targetPath);
-  console.log(`[ProjectSwitch] REQUEST source=${source} target=${targetPath} generation=${transitionGen}`);
-  console.log("[BLACKSCREEN] switchWorkspace:before-work", { targetPath, transitionGen, licenseState: licenseManager.getState().state });
-  logService("transition-start", `target=${targetPath} gen=${transitionGen}`);
-
-  // A new workspace gets a completely fresh task runtime: no old task,
-  // permission, question, retry or listener state can leak across projects.
-  resetTaskRuntime();
-  migrationManager.cancelAllPendingProposals();
-  logTask("runtime-reset", "-", "-", `target=${path.basename(targetPath)} generation=${transitionGen}`);
-
-  // Create WorkspaceContext immediately
-  const newWorkspace: WorkspaceContext = {
-    generation: transitionGen,
-    projectPath: targetPath,
-    opencodeProcess: null,
-    opencodeUrl: "http://127.0.0.1:4097",
-    opencodePort: null,
-    previewProcess: null,
-    previewStaticServer: null,
-    previewPort: null,
-    previewUrl: null,
-    watcher: null,
-    eventAbort: null,
-    status: "starting"
-  };
-  activeWorkspace = newWorkspace;
-  currentProject = targetPath;
-
-  const transitionPromise = (async () => {
-    // 1. Ensure project directory exists only if explicitly creating a new project
-    if (isCreatingNew) {
-      await fs.promises.mkdir(targetPath, { recursive: true });
-    }
-
-    // 2. Terminate prior services cleanly
-    await stopPreview();
-    await stopOpenCode();
-
-    if (transitionGen !== projectTransitionGeneration) {
-      throw new Error("Troca de projeto interrompida por nova seleção.");
-    }
-
+const workspaceResults=new Map<string,any>();
+const workspaceOpenPromises=new Map<string,Promise<any>>();
+let workspaceStartupTail:Promise<any>=Promise.resolve();
+async function switchWorkspaceInternal(targetInput:string|{projectPath:string;source?:string},defaultSource="unknown"){
+ licenseManager.assertAccess("o workspace do NekoAI");
+ const raw=typeof targetInput==="string"?targetInput:targetInput?.projectPath;
+ const source=typeof targetInput==="object"?targetInput.source??defaultSource:defaultSource;
+ if(!raw)throw new Error("Pasta do projeto não informada.");let targetPath=assertProjectRootSafe(raw,"workspace-open");
+ if(source==="create"||source==="NewProject")await fs.promises.mkdir(targetPath,{recursive:true});
+ const workspaceLease=workspaceRegistry.open(targetPath);targetPath=workspaceLease.projectPath;const existing=workspaceResults.get(workspaceLease.workspaceId);if(existing){const conversation=await projectConversations.current(workspaceLease);return {...existing,conversation,session:{...existing.session,id:conversation.sessionId}};}
+ const inProgress=workspaceOpenPromises.get(workspaceLease.workspaceId);
+ if(inProgress)return inProgress;
+ const initialize=()=>workspaceRegistry.run(workspaceLease,async()=>{
+ const already=workspaceResults.get(workspaceLease.workspaceId);if(already){const conversation=await projectConversations.current(workspaceLease);return {...already,conversation,session:{...already.session,id:conversation.sessionId}};}
+ const transitionGen=++projectTransitionGeneration;
+ const newWorkspace:WorkspaceContext={generation:transitionGen,projectPath:targetPath,opencodeProcess:null,opencodeUrl:"http://127.0.0.1:4097",opencodePort:null,previewProcess:null,previewStaticServer:null,previewPort:null,previewUrl:null,watcher:null,eventAbort:null,status:"starting"};
+ workspaceRuntime.activeWorkspace=newWorkspace;workspaceRuntime.currentProject=targetPath;
+ chatGptManager.attachWorkspace(workspaceLease.workspaceId,workspaceLease.generation,targetPath,()=>{try{workspaceRegistry.assertLive(workspaceLease);return true;}catch{return false;}});
+ try{
     // 3. Set current project and update Supabase & Vercel & Lovable
-    currentProject = targetPath;
+    workspaceRuntime.currentProject = targetPath;
+    traceProjectOpen("supabase-initialize",{workspaceId:workspaceLease.workspaceId});
+    await supabaseManager.initialize();
+    traceProjectOpen("supabase-project",{workspaceId:workspaceLease.workspaceId});
     await supabaseManager.setProject(targetPath);
-    void vercelManager.setProject(targetPath);
+    traceProjectOpen("vercel-initialize",{workspaceId:workspaceLease.workspaceId});
+    await vercelManager.initialize();
+    traceProjectOpen("vercel-project",{workspaceId:workspaceLease.workspaceId});
+    await vercelManager.setProject(targetPath);
+    traceProjectOpen("lovable-project",{workspaceId:workspaceLease.workspaceId});
     const lovableState = await lovableCloudManager.setProject(targetPath);
     if (lovableState.isLovableProject && (lovableState.projectId || lovableState.detectedProjectId)) {
       await lovableMcpServer.start().catch(err => console.warn("[Neko/LovableMCP] Erro ao iniciar MCP:", err));
@@ -8309,26 +8800,24 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
     }
 
     // 4. Start OpenCode on new project
+    traceProjectOpen("engine",{workspaceId:workspaceLease.workspaceId});
     const health = await startOpenCodeInternal(targetPath, transitionGen);
-    if (transitionGen !== projectTransitionGeneration) {
-      throw new Error("Troca de projeto interrompida por nova seleção.");
-    }
+    workspaceRegistry.assertLive(workspaceLease);
 
-    // 5. Create fresh session
-    const client = await getOpencodeClient();
-    const session = await Promise.race([
-      client.session.create({ body: { title: "NekoAI Workspace" } }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Tempo esgotado ao criar a sessão do Neko.")), 10000))
-    ]);
-
-    if (transitionGen !== projectTransitionGeneration) {
-      throw new Error("Troca de projeto interrompida por nova seleção.");
-    }
+    // Restore the project conversation independently of the transient tab id.
+    traceProjectOpen("session",{workspaceId:workspaceLease.workspaceId});
+    const conversation = await projectConversations.initialize(workspaceLease);
+    const session = { data: { id: conversation.sessionId } };
+    workspaceRegistry.assertLive(workspaceLease);
+    workspaceServices.attach(workspaceLease, workspaceRuntime.opencodeUrl);
+    ownWorkspaceContext(workspaceLease, newWorkspace);
 
     // 6. Read tree, git status, supabase and vercel state
     logPreviewLifecycle("workspace scan started", { targetPath, generation: transitionGen });
+    traceProjectOpen("tree",{workspaceId:workspaceLease.workspaceId});
     const tree = await readTreeWithSettling(targetPath, transitionGen);
     logPreviewLifecycle("workspace scan completed", { nodes: tree.length, generation: transitionGen });
+    traceProjectOpen("git",{workspaceId:workspaceLease.workspaceId});
     const gitStatus = await getGitStatus();
     const supabaseState = supabaseManager.getState();
     const vercelState = vercelManager.getState();
@@ -8340,13 +8829,13 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
 
     newWorkspace.status = "ready";
     logService("transition-ready", `target=${targetPath} gen=${transitionGen}`);
-    console.log("[BLACKSCREEN] switchWorkspace:transition-ready", { targetPath, sessionData: !!(session as any).data, treeNodes: tree.length, supabaseStatus: supabaseState?.status, vercelStatus: vercelState?.connection, previewStatus: previewState?.status });
+    console.log("[BLACKSCREEN] switchWorkspace:transition-ready", { targetPath, sessionData: !!(session as any).data, treeNodes: tree.length, supabaseStatus: supabaseState?.status, vercelStatus: vercelState?.connection, previewStatus: workspaceRuntime.previewState?.status });
 
     // Registra projeto recente universalmente na conclusão do workspace
     void recentProjectsManager.touchRecentProject(targetPath).then(async () => {
       try {
         const enriched = await recentProjectsManager.getRecentProjectsWithStatus();
-        mainWindow?.webContents.send("recent-projects:updated", enriched);
+        sendWorkspaceRenderer("recent-projects:updated", enriched);
       } catch {}
     }).catch(err => {
       console.warn("[Neko/RecentProjects] Erro ao registrar projeto recente:", err);
@@ -8360,12 +8849,15 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
     const autoCommit = await appPreferencesManager.getProjectAutoCommit(targetPath);
 
     const result = {
+      workspaceId: workspaceLease.workspaceId,
+      workspaceGeneration: workspaceLease.generation,
       path: targetPath,
-      opencodeUrl,
+      opencodeUrl: workspaceRuntime.opencodeUrl,
       health,
       session: (session as any).data,
+      conversation,
       tree,
-      preview: previewState,
+      preview: workspaceRuntime.previewState,
       gitStatus,
       autoCommit,
       supabaseState,
@@ -8373,27 +8865,43 @@ async function switchWorkspaceInternal(targetInput: string | { projectPath: stri
       lovableState: lovableCloudManager.getState()
     };
     console.log("[BLACKSCREEN] switchWorkspace:returning-result", { path: result.path, hasSession: !!result.session, hasTree: !!result.tree, hasSupabase: !!result.supabaseState, hasVercel: !!result.vercelState, supabaseKeys: result.supabaseState ? Object.keys(result.supabaseState) : null });
+    workspaceResults.set(workspaceLease.workspaceId,result);
     return result;
-  })();
 
-  activeWorkspaceTransitionPromise = transitionPromise;
-  try {
-    console.log("[BLACKSCREEN] switchWorkspace:before-await");
-    const result = await transitionPromise;
-    console.log("[BLACKSCREEN] switchWorkspace:after-await", { path: result?.path });
-    return result;
-  } finally {
-    if (activeWorkspaceTransitionPromise === transitionPromise) {
-      activeWorkspaceTransitionPromise = null;
-    }
-  }
+ }catch(error){newWorkspace.status="stopped";await stopPreview().catch(()=>{});await stopOpenCode().catch(()=>{});throw error;}
+ });const pending=workspaceStartupTail.then(initialize);workspaceStartupTail=pending.catch(()=>{});workspaceOpenPromises.set(workspaceLease.workspaceId,pending);try{return await pending;}finally{if(workspaceOpenPromises.get(workspaceLease.workspaceId)===pending)workspaceOpenPromises.delete(workspaceLease.workspaceId);}
 }
 
-ipcMain.handle("project:create", async (_event, payload: string | { projectPath: string; source?: string }) => {
-  console.log("[BLACKSCREEN] IPC:project:create", { payload: typeof payload === "string" ? payload : payload?.projectPath });
-  const result = await switchWorkspaceInternal(payload, "ipc");
-  console.log("[BLACKSCREEN] IPC:project:create:complete", { path: result?.path });
-  return result;
+ipcMain.handle("project:create", async (event, payload: string | { projectPath: string; source?: string }) => {
+  licenseManager.assertAccess("abrir projetos no NekoAI");
+  const requested=typeof payload==="string"?payload:payload?.projectPath;
+  const source=typeof payload==="object"?payload.source||"ipc":"ipc";
+  traceProjectOpen("request", {sender:event.sender.id,source,project:requested ? path.basename(requested) : null});
+  const origin=workspaceTabs?.owner(event.sender.id);
+  let initializeHere=true;
+  let targetId:string|undefined;
+  if(requested&&workspaceTabs){
+    const safe=assertProjectRootSafe(requested,"workspace-tab-open");
+    if(source==="create"||source==="NewProject")await fs.promises.mkdir(safe,{recursive:true});
+    initializeHere=workspaceTabs.routeOpen(event.sender.id,safe,source);
+    targetId=workspaceRegistry.open(safe).workspaceId;
+    traceProjectOpen("tab-routed",{sender:event.sender.id,targetId,initializeHere});
+  }
+  try {
+    // A sibling studio must load and its runtime must initialize before the
+    // initiating call reports success. Never leave startup to a one-shot effect.
+    if(targetId)await workspaceTabs?.whenReady(targetId);
+    traceProjectOpen("studio-loaded",{targetId});
+    const result=await switchWorkspaceInternal(payload,"ipc");
+    traceProjectOpen("result",{targetId,initializeHere});
+    if(!initializeHere)return {openedInTab:true,workspaceId:result.workspaceId,path:result.path};
+    workspaceTabs?.finishBootstrap(event.sender.id);
+    return result;
+  } catch(error) {
+    traceProjectOpen("failed",{targetId,message:error instanceof Error ? error.message : String(error)});
+    if(!initializeHere&&origin)workspaceTabs?.select(origin.workspaceId);
+    throw error;
+  }
 });
 
 
@@ -8464,7 +8972,7 @@ async function removeCurrentSourceFiles(projectPath: string, relative = "") {
 async function undoTaskCheckpoint(taskId: string) {
   const checkpoint = taskCheckpoints.get(String(taskId || ""));
   if (!checkpoint) throw new Error("O histórico desta tarefa não está mais disponível para Undo.");
-  if (!currentProject || path.resolve(currentProject) !== checkpoint.projectPath) {
+  if (!workspaceRuntime.currentProject || path.resolve(workspaceRuntime.currentProject) !== checkpoint.projectPath) {
     throw new Error("Abra o mesmo projeto para desfazer esta tarefa.");
   }
   await removeCurrentSourceFiles(checkpoint.projectPath);
@@ -8478,35 +8986,35 @@ async function undoTaskCheckpoint(taskId: string) {
   }
   await stopPreview();
   void startPreview(checkpoint.projectPath).catch(error => console.warn("[Neko/Preview] Undo preview restart failed:", error));
-  mainWindow?.webContents.send("opencode:event", { type: "neko.project.changed", properties: { path: checkpoint.projectPath, reason: "undo" } });
+  emitWorkspaceEvent({ type: "neko.project.changed", properties: { path: checkpoint.projectPath, reason: "undo" } });
   taskCheckpoints.delete(taskId);
   return { ok: true, restoredFiles: checkpoint.files.length };
 }
 
 ipcMain.handle("project:checkpointTask", async () => {
   licenseManager.assertAccess("checkpoints do projeto");
-  const projectRoot = assertProjectRootSafe(currentProject, "checkpoint");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "checkpoint");
   logProjectWorkspace("checkpoint", projectRoot);
   return createTaskCheckpoint(projectRoot);
 });
 
 ipcMain.handle("project:undoTask", async (_event, taskId: string) => {
   licenseManager.assertAccess("restauração de checkpoint");
-  const projectRoot = assertProjectRootSafe(currentProject, "undo");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "undo");
   logProjectWorkspace("undo", projectRoot);
   return undoTaskCheckpoint(taskId);
 });
 
 ipcMain.handle("project:tree", async () => {
   licenseManager.assertAccess("árvore de arquivos do projeto");
-  const projectRoot = assertProjectRootSafe(currentProject, "tree");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "tree");
   logProjectWorkspace("tree", projectRoot);
   return readTree(projectRoot);
 });
 
 ipcMain.handle("project:file", async (_event, relativePath: string) => {
   licenseManager.assertAccess("leitura de arquivos");
-  const projectRoot = assertProjectRootSafe(currentProject, "read");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "read");
   logProjectWorkspace("read", projectRoot);
   const filePath = safePathWithinProject(projectRoot, relativePath);
   const stat = await fs.promises.stat(filePath);
@@ -8518,10 +9026,10 @@ ipcMain.handle("project:file", async (_event, relativePath: string) => {
 ipcMain.handle("project:refresh", async () => {
   licenseManager.assertAccess("atualização do workspace");
   if (!getActiveProjectRoot()) return { tree: [], preview: null };
-  const projectRoot = assertProjectRootSafe(currentProject, "refresh");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "refresh");
   logProjectWorkspace("refresh", projectRoot);
   const tree = await readTree(projectRoot);
-  return { tree, preview: previewState };
+  return { tree, preview: workspaceRuntime.previewState };
 });
 
 ipcMain.handle("models:list", async () => getModels());
@@ -8566,7 +9074,7 @@ async function readConnectedProviderIDs(): Promise<Set<string>> {
 async function disposeOpenCodeInstance() {
   // Provider state is cached by OpenCode. Disposing the instance forces the
   // next /provider request to rebuild its state from auth.json.
-  await fetchWithTimeout(`${opencodeUrl}/instance/dispose`, { method: "POST", headers: opencodeRequestHeaders() }, 10000).catch(() => {});
+  await fetchWithTimeout(`${workspaceRuntime.opencodeUrl}/instance/dispose`, { method: "POST", headers: opencodeRequestHeaders() }, 10000).catch(() => {});
 }
 
 ipcMain.handle("provider:connect", async (_event, payload: { providerID: string; key: string }) => {
@@ -8591,7 +9099,7 @@ ipcMain.handle("provider:connect", async (_event, payload: { providerID: string;
   // In newer OpenCode SDKs `auth.remove`/`auth.set` names overlap with the MCP
   // auth API, which caused the old disconnect implementation to call
   // DELETE /mcp/{name}/auth and return "MCP server not found".
-  const response = await fetchWithTimeout(`${opencodeUrl}/auth/${encodeURIComponent(id)}`, {
+  const response = await fetchWithTimeout(`${workspaceRuntime.opencodeUrl}/auth/${encodeURIComponent(id)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
     body: JSON.stringify({ type: "api", key })
@@ -8627,7 +9135,7 @@ ipcMain.handle("provider:disconnect", async (_event, providerID: string) => {
   // client.auth.remove(), because in the installed SDK that method maps to
   // MCP OAuth removal (/mcp/{name}/auth), producing the exact 404 seen in the
   // NekoAI terminal. OpenCode's provider credentials use DELETE /auth/:id.
-  const response = await fetchWithTimeout(`${opencodeUrl}/auth/${encodeURIComponent(id)}`, {
+  const response = await fetchWithTimeout(`${workspaceRuntime.opencodeUrl}/auth/${encodeURIComponent(id)}`, {
     method: "DELETE",
     headers: opencodeRequestHeaders()
   }, 10000);
@@ -8679,8 +9187,8 @@ async function runValidationBuild(projectPath: string) {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "", stderr = "";
-    child.stdout?.on("data", chunk => { const text = chunk.toString(); stdout += text; mainWindow?.webContents.send("preview:event", { type: "preview.output", properties: { stream: "stdout", text, source: "Build" } }); });
-    child.stderr?.on("data", chunk => { const text = chunk.toString(); stderr += text; mainWindow?.webContents.send("preview:event", { type: "preview.output", properties: { stream: "stderr", text, source: "Build" } }); });
+    child.stdout?.on("data", chunk => { const text = chunk.toString(); stdout += text; emitWorkspacePreviewEvent({ type: "preview.output", properties: { stream: "stdout", text, source: "Build" } }); });
+    child.stderr?.on("data", chunk => { const text = chunk.toString(); stderr += text; emitWorkspacePreviewEvent({ type: "preview.output", properties: { stream: "stderr", text, source: "Build" } }); });
     child.on("error", reject);
     child.on("exit", code => resolve({ code: typeof code === "number" ? code : 1, stdout, stderr }));
   });
@@ -8690,19 +9198,19 @@ async function runValidationBuild(projectPath: string) {
 
 ipcMain.handle("project:validateBuild", async () => {
   licenseManager.assertAccess("validação de build");
-  const projectRoot = assertProjectRootSafe(currentProject, "validateBuild");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "validateBuild");
   logProjectWorkspace("validateBuild", projectRoot);
   return runValidationBuild(projectRoot);
 });
 
-ipcMain.handle("preview:start", async () => {
+handleWorkspaceIpc("preview:start", async () => {
   licenseManager.assertAccess("servidor de preview");
-  const projectRoot = assertProjectRootSafe(currentProject, "preview");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "preview");
   logProjectWorkspace("preview", projectRoot);
   return startPreview(projectRoot);
 });
 
-ipcMain.handle("preview:stop", async () => {
+handleWorkspaceIpc("preview:stop", async () => {
   await stopPreview();
   return true;
 });
@@ -8710,7 +9218,7 @@ ipcMain.handle("preview:stop", async () => {
 ipcMain.handle("opencode:status", async () => {
   const projectRoot = getActiveProjectRoot();
   try {
-    const response = await fetch(`${opencodeUrl}/global/health`, { headers: opencodeRequestHeaders() });
+    const response = await fetch(`${workspaceRuntime.opencodeUrl}/global/health`, { headers: opencodeRequestHeaders() });
     if (!response.ok) throw new Error("offline");
 
     return {
@@ -8723,17 +9231,21 @@ ipcMain.handle("opencode:status", async () => {
   }
 });
 
-ipcMain.handle("opencode:sessionStatus", async (_event, sessionId: string) => {
+handleWorkspaceSessionIpc("opencode:sessionStatus", async (_event, sessionId: string) => {
   if (!sessionId) return "idle";
+  let target: WorkspaceServiceTarget;
+  try { target = workspaceServices.capture(workspaceRegistry.forSession(resolveRootSessionId(sessionId) || sessionId)); }
+  catch { return "unknown"; }
   const active = activeAgentRequests.get(sessionId);
   if (active?.retryTimer || active?.isRetrying) {
     return "retry";
   }
   try {
-    const response = await fetch(`${opencodeUrl}/session/status`, { headers: opencodeRequestHeaders() });
+    const response = await fetch(`${target.engineUrl}/session/status`, { headers: workspaceServices.headers(target, opencodeAuthHeaders()) });
     if (!response.ok) return (active?.retryTimer || active?.isRetrying) ? "retry" : "unknown";
     const payload: any = await response.json();
     const statuses = payload?.data ?? payload ?? {};
+    workspaceServices.assertCurrent(target);
     const status = statuses?.[sessionId];
     const engineStatus = status?.type ?? status ?? "idle";
     if (active?.retryTimer || active?.isRetrying) {
@@ -8745,15 +9257,18 @@ ipcMain.handle("opencode:sessionStatus", async (_event, sessionId: string) => {
   }
 });
 
-ipcMain.handle("opencode:messages", async (_event, sessionId: string) => {
-  if (!sessionId) throw new Error("Sessão do Neko não encontrada.");
-  const client: any = await getOpencodeClient();
-  const result = await client.session.messages({ path: { id: sessionId } });
-  return result?.data ?? result ?? [];
+handleWorkspaceSessionIpc("opencode:messages", async (_event, sessionId: string) => {
+  const lease = workspaceRegistry.forSession(resolveRootSessionId(sessionId) || sessionId);
+  return workspaceServices.use(lease, async target => {
+    const client: any = await getOpencodeClient(target);
+    const result = await client.session.messages({ path: { id: sessionId } });
+    return result?.data ?? result ?? [];
+  });
 });
 
-ipcMain.handle("opencode:prompt", async (_event, payload: {
+handleWorkspaceSessionIpc("opencode:prompt", async (_event, payload: {
   sessionId: string;
+  clientRequestId?: string;
   text: string;
   model?: { providerID: string; modelID: string; variant?: string };
   attachments?: { path: string; name: string; mime: string; size?: number }[];
@@ -8763,7 +9278,10 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   perf?: { t0?: number; prepMs?: number };
 }) => {
   licenseManager.assertAccess("assistente de IA");
-  const projectRoot = assertProjectRootSafe(currentProject, "analyze");
+  const requestWorkspaceLease = assertCurrentSessionWorkspace(payload.sessionId);
+  if (conversationTransitions.has(requestWorkspaceLease.workspaceId)) throw new Error("Aguarde a abertura da conversa.");
+  const recoveryContext = await projectConversations.restoredContext(requestWorkspaceLease, payload.sessionId, payload.clientRequestId);
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "analyze");
   logProjectWorkspace("analyze", projectRoot);
   if (!payload.sessionId) throw new Error("Sessão do Neko não encontrada.");
 
@@ -8777,8 +9295,8 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
       payload.model.modelID = payload.model.modelID.trim().toLowerCase();
     }
     await chatGptManager.ensureBridgeRunning();
-    if (currentProject) {
-      await chatGptManager.syncOpenCodeConfig(currentProject);
+    if (workspaceRuntime.currentProject) {
+      await chatGptManager.syncOpenCodeConfig(workspaceRuntime.currentProject);
       try {
         const client: any = await getOpencodeClient();
         const provList = await client.provider.list().catch(() => null);
@@ -8786,7 +9304,7 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
         const hasProvider = allProviders.some((p: any) => p.id === CHATGPT_PROVIDER_ID);
         if (!hasProvider) {
           console.log("[Neko/ChatGpt] Provedor chatgpt-personal ainda não registrado no OpenCode. Reiniciando OpenCode...");
-          await startOpenCode(currentProject);
+          await startOpenCode(workspaceRuntime.currentProject);
           await waitForServiceReady();
         }
       } catch (checkErr: any) {
@@ -8943,7 +9461,7 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
       console.log(`[VisionFallback] primaryModel=${modelId || "default"} primaryProvider=${providerId || "default"} fallbackProvider=${fallbackTarget.providerID} fallbackModel=${fallbackTarget.modelID} reason=unsupported-image-input status=starting`);
       const fallback = await analyzeImagesWithMiMo({
         mainSessionId: payload.sessionId,
-        opencodeUrl,
+        opencodeUrl: workspaceRuntime.opencodeUrl,
         headers: opencodeRequestHeaders(),
         images: imageAttachments,
         userPrompt: payload.text || "Analise a imagem anexada.",
@@ -8970,6 +9488,8 @@ ipcMain.handle("opencode:prompt", async (_event, payload: {
   const languageInstruction = `IDIOMA OBRIGATÓRIO DA INTERFACE: Português do Brasil (pt-BR).
 Todas as respostas destinadas ao usuário devem ser escritas em português do Brasil, incluindo resumo, conclusão, explicações, nomes de etapas e qualquer texto final. Não responda em inglês, espanhol ou outro idioma. Preserve nomes técnicos inevitáveis (por exemplo, nomes de arquivos, APIs, bibliotecas, comandos, variáveis e URLs) somente quando forem necessários, mas explique o restante em português. Nunca copie ou reproduza logs, mensagens ou respostas internas de ferramentas como se fossem uma resposta ao usuário. Gere uma única resposta final, exclusivamente em português do Brasil. Não inclua uma versão em inglês antes ou depois da resposta em português.`;
 
+  const installedSkillsContext = skillsManager.getInstalledSkillsContext(projectRoot);
+
   // [plan_exit-fix B] Para Plan mode: NÃO enviar o campo `system`.
   // O campo `system` no prompt_async SUBSTITUI o system prompt nativo do agente "plan" do OpenCode.
   // Esse system prompt nativo contém as instruções obrigatórias de usar plan_exit (Phase 5).
@@ -8981,7 +9501,7 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
     ...(payload.planMode
       ? {}  // Plan: sem system — usa o system prompt nativo do agente plan integralmente
       : {
-          system: `You are the NekoAI software development agent. You have received an APPROVED PLAN from the user. Execute it now by modifying the project files directly in the current workspace. Do not merely describe the changes and do not ask for another approval. Do not run long-lived development servers such as npm run dev in the foreground and wait for them. The NekoAI Preview Manager handles dev servers separately. Focus on implementing the requested application, creating or editing files, installing dependencies when needed, and validating with short-lived commands. After implementation, verify that the requested changes actually exist in the files and report which files were changed. If you encounter critical ambiguity between multiple valid implementations or need the user's architectural choice, use the native question tool to ask the user.\n\n${languageInstruction}`
+          system: `You are the NekoAI software development agent. You have received an APPROVED PLAN from the user. Execute it now by modifying the project files directly in the current workspace. Do not merely describe the changes and do not ask for another approval. Do not run long-lived development servers such as npm run dev in the foreground and wait for them. The NekoAI Preview Manager handles dev servers separately. Focus on implementing the requested application, creating or editing files, installing dependencies when needed, and validating with short-lived commands. After implementation, verify that the requested changes actually exist in the files and report which files were changed. If you encounter critical ambiguity between multiple valid implementations or need the user's architectural choice, use the native question tool to ask the user.\n\n${languageInstruction}${installedSkillsContext ? `\n\n${installedSkillsContext}` : ""}`
         }
     ),
     ...(payload.model ? { model: payload.model } : {}),
@@ -8989,21 +9509,25 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
       // Para Plan mode: inclui instrução de idioma como primeiro part contextual.
       // Fica fora do system para não sobrepor o system prompt nativo do plan agent.
       ...(payload.planMode ? [{ type: "text", text: languageInstruction }] : []),
+      ...(payload.planMode && installedSkillsContext ? [{ type: "text", text: installedSkillsContext }] : []),
+      ...(recoveryContext ? [{ type: "text", text: recoveryContext }] : []),
       { type: "text", text: userRequestText },
       ...contextParts
     ]
   };
 
+  workspaceRegistry.assertSession(requestWorkspaceLease, payload.sessionId);
+  const promptTarget = workspaceServices.capture(requestWorkspaceLease);
   const promptStartedAt = Date.now();
   console.log(`[Neko/Agent] enviando tarefa session=${payload.sessionId} model=${payload.model?.providerID ?? "default"}/${payload.model?.modelID ?? "default"} effort=${payload.effort ?? "default"}`);
   clearActiveAgentRequest(payload.sessionId);
-  activeAgentRequests.set(payload.sessionId, { requestBody, attempts: 1, maxAttempts: AGENT_RETRY_DELAYS_MS.length + 1, isRetrying: false });
+  activeAgentRequests.set(payload.sessionId, { target: promptTarget, requestBody, attempts: 1, maxAttempts: AGENT_RETRY_DELAYS_MS.length + 1, isRetrying: false, restoredContext: Boolean(recoveryContext) });
   perfMark("taskSend", payload.sessionId);
-  const response = await fetchWithTimeout(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/prompt_async`, {
+  const response = await workspaceServices.request(promptTarget, `/session/${encodeURIComponent(payload.sessionId)}/prompt_async`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...opencodeRequestHeaders() },
+    headers: { "Content-Type": "application/json", ...workspaceServices.headers(promptTarget, opencodeAuthHeaders()) },
     body: JSON.stringify(requestBody)
-  });
+  }, fetchWithTimeout);
   const promptAckDurationMs = Date.now() - promptStartedAt;
   const promptModelLabel = `${payload.model?.providerID ?? "default"}/${payload.model?.modelID ?? "default"}`;
 
@@ -9029,6 +9553,7 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
     logTask("failed", taskCorrelationId, payload.sessionId, `status=${response.status}`);
     throw new Error(`Falha ao enviar tarefa ao agente (HTTP ${response.status}).${body ? ` ${body.slice(0, 240)}` : ""}`);
   }
+  if (recoveryContext) await projectConversations.contextDelivered(requestWorkspaceLease, payload.sessionId).catch(error => console.warn("[Conversations] Contexto entregue; marcador local pendente:", error));
   perfMark("t2", payload.sessionId);
   setTaskState(payload.sessionId, "running", "prompt-accepted");
   logTask("started", taskCorrelationId, payload.sessionId);
@@ -9038,10 +9563,12 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
 
   // BUILD diagnostics only: one-shot post-ACK probe (~5s) to distinguish
   // "accepted but never ran" from slow/stale SSE. Deduplicated, never repeated.
+  const postAckLease = workspaceRegistry.contextLease();
   const postAckKey = `${taskCorrelationId}:${payload.sessionId}`;
   if (!postAckDiagScheduled.has(postAckKey)) {
     postAckDiagScheduled.add(postAckKey);
     setTimeout(() => {
+      if (postAckLease) { try { workspaceRegistry.assertLive(postAckLease); } catch { return; } }
       postAckDiagScheduled.delete(postAckKey);
       void runPostAckDiag(payload.sessionId, taskCorrelationId);
     }, 5000);
@@ -9049,10 +9576,10 @@ Todas as respostas destinadas ao usuário devem ser escritas em português do Br
   return { accepted: true, acceptedInMs: promptAckDurationMs, taskId: taskCorrelationId };
 });
 
-ipcMain.handle("opencode:permissions", async (_event, sessionId: string) => {
+handleWorkspaceSessionIpc("opencode:permissions", async (_event, sessionId: string) => {
   if (!sessionId) return [];
   try {
-    const response = await fetch(`${opencodeUrl}/permission`, { headers: opencodeRequestHeaders() });
+    const response = await fetchSessionService(sessionId, "/permission");
     if (!response.ok) return [];
     const payload = await response.json();
     const list = Array.isArray(payload) ? payload : (payload?.data ?? payload?.permissions ?? []);
@@ -9063,12 +9590,12 @@ ipcMain.handle("opencode:permissions", async (_event, sessionId: string) => {
 });
 
 // Fetch pending permissions for a task, including child sessions
-ipcMain.handle("opencode:fetchPendingPermissions", async (_event, sessionId: string) => {
+handleWorkspaceSessionIpc("opencode:fetchPendingPermissions", async (_event, sessionId: string) => {
   if (!sessionId) return [];
   return fetchPendingPermissions(sessionId);
 });
 
-ipcMain.handle("opencode:permissionReply", async (_event, payload: {
+handleWorkspaceSessionIpc("opencode:permissionReply", async (_event, payload: {
   sessionId: string;
   permissionId: string;
   response: "once" | "always" | "reject";
@@ -9077,8 +9604,9 @@ ipcMain.handle("opencode:permissionReply", async (_event, payload: {
   licenseManager.assertAccess("permissões de execução");
   if (!payload?.sessionId || !payload?.permissionId) throw new Error("Pedido de permissão inválido.");
   const bodyPayload = { response: payload.response, ...(payload.remember ? { remember: true } : {}) };
-  const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
-  let response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/permissions/${encodeURIComponent(payload.permissionId)}`, {
+  const target = captureSessionService(payload.sessionId);
+  const headers = { "Content-Type": "application/json", ...workspaceServices.headers(target, opencodeAuthHeaders()) };
+  let response = await workspaceServices.request(target, `/session/${encodeURIComponent(payload.sessionId)}/permissions/${encodeURIComponent(payload.permissionId)}`, {
     method: "POST", headers, body: JSON.stringify(bodyPayload)
   });
 
@@ -9086,7 +9614,7 @@ ipcMain.handle("opencode:permissionReply", async (_event, payload: {
   // the session-scoped route. Retry the same request against that endpoint,
   // still pinned to the active project instance.
   if (!response.ok && (response.status === 404 || response.status === 405)) {
-    response = await fetch(`${opencodeUrl}/permission/${encodeURIComponent(payload.permissionId)}/reply`, {
+    response = await workspaceServices.request(target, `/permission/${encodeURIComponent(payload.permissionId)}/reply`, {
       method: "POST", headers, body: JSON.stringify(bodyPayload)
     });
   }
@@ -9098,7 +9626,7 @@ ipcMain.handle("opencode:permissionReply", async (_event, payload: {
   return true;
 });
 
-ipcMain.handle("opencode:questionReply", async (_event, payload: {
+handleWorkspaceSessionIpc("opencode:questionReply", async (_event, payload: {
   sessionId: string;
   requestId: string;
   answers: string[];
@@ -9108,23 +9636,24 @@ ipcMain.handle("opencode:questionReply", async (_event, payload: {
   const answersFormatted = (Array.isArray(payload.answers) ? payload.answers : [String(payload.answers || "")])
     .map(a => Array.isArray(a) ? a : [String(a)]);
   const bodyPayload = { answers: answersFormatted };
-  const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+  const target = captureSessionService(payload.sessionId);
+  const headers = { "Content-Type": "application/json", ...workspaceServices.headers(target, opencodeAuthHeaders()) };
 
   // 1. Primary OpenCode endpoint: POST /question/{id}/reply
-  let response = await fetch(`${opencodeUrl}/question/${encodeURIComponent(payload.requestId)}/reply`, {
+  let response = await workspaceServices.request(target, `/question/${encodeURIComponent(payload.requestId)}/reply`, {
     method: "POST", headers, body: JSON.stringify(bodyPayload)
   });
 
   // 2. Fallback route: POST /session/{sessionId}/question/{requestId}/reply
   if (!response.ok && (response.status === 404 || response.status === 405)) {
-    response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reply`, {
+    response = await workspaceServices.request(target, `/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reply`, {
       method: "POST", headers, body: JSON.stringify(bodyPayload)
     });
   }
 
   // 3. Fallback route 2: POST /api/session/{sessionId}/question/{requestId}/reply
   if (!response.ok && (response.status === 404 || response.status === 405)) {
-    response = await fetch(`${opencodeUrl}/api/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reply`, {
+    response = await workspaceServices.request(target, `/api/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reply`, {
       method: "POST", headers, body: JSON.stringify(bodyPayload)
     });
   }
@@ -9146,22 +9675,23 @@ ipcMain.handle("opencode:questionReply", async (_event, payload: {
   return true;
 });
 
-ipcMain.handle("opencode:questionReject", async (_event, payload: {
+handleWorkspaceSessionIpc("opencode:questionReject", async (_event, payload: {
   sessionId: string;
   requestId: string;
 }) => {
   licenseManager.assertAccess("respostas de interação");
   if (!payload?.sessionId || !payload?.requestId) throw new Error("Pedido de rejeição inválido.");
-  const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
+  const target = captureSessionService(payload.sessionId);
+  const headers = { "Content-Type": "application/json", ...workspaceServices.headers(target, opencodeAuthHeaders()) };
 
   // 1. Primary OpenCode endpoint: POST /question/{id}/reject
-  let response = await fetch(`${opencodeUrl}/question/${encodeURIComponent(payload.requestId)}/reject`, {
+  let response = await workspaceServices.request(target, `/question/${encodeURIComponent(payload.requestId)}/reject`, {
     method: "POST", headers, body: JSON.stringify({})
   });
 
   // 2. Fallback route: POST /session/{sessionId}/question/{requestId}/reject
   if (!response.ok && (response.status === 404 || response.status === 405)) {
-    response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reject`, {
+    response = await workspaceServices.request(target, `/session/${encodeURIComponent(payload.sessionId)}/question/${encodeURIComponent(payload.requestId)}/reject`, {
       method: "POST", headers, body: JSON.stringify({})
     });
   }
@@ -9183,7 +9713,8 @@ ipcMain.handle("opencode:questionReject", async (_event, payload: {
   return true;
 });
 
-ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
+handleWorkspaceSessionIpc("opencode:abort", async (_event, sessionId: string) => {
+  assertCurrentSessionWorkspace(sessionId);
   if (!sessionId) throw new Error("Sessão do Neko não encontrada.");
   clearActiveAgentRequest(sessionId);
   engineRetryStates.delete(sessionId);
@@ -9215,10 +9746,10 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
   cancelVisionFallbackFor(sessionId);
   perfFlushTask(sessionId, "aborted");
 
-  if (!opencodeUrl) return true;
+  if (!workspaceRuntime.opencodeUrl) return true;
 
   try {
-    const response = await fetch(`${opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
+    const response = await fetch(`${workspaceRuntime.opencodeUrl}/session/${encodeURIComponent(sessionId)}/abort`, {
       method: "POST",
       headers: opencodeRequestHeaders()
     });
@@ -9233,9 +9764,9 @@ ipcMain.handle("opencode:abort", async (_event, sessionId: string) => {
   }
 });
 
-ipcMain.handle("preview:styleFrame", async () => {
+handleWorkspaceIpc("preview:styleFrame", async () => {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
-  const frames = ((mainWindow.webContents.mainFrame as any)?.framesInSubtree ?? []) as any[];
+  const frames = ((workspaceWebContents()?.mainFrame as any)?.framesInSubtree ?? []) as any[];
   let styled = false;
   for (const frame of frames) {
     const frameUrl = String(frame?.url || "");
@@ -9248,26 +9779,29 @@ ipcMain.handle("preview:styleFrame", async () => {
   }
   if (styled) perfMark("t6");
   // ALWAYS emit frame-ready — scrollbar theming is cosmetic, visibility is mandatory
-  mainWindow.webContents.send("preview:event", { type: "preview.frame-ready", properties: {} });
+  emitWorkspacePreviewEvent({ type: "preview.frame-ready", properties: {} });
   return true;
 });
 
-ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
-  const visible = Boolean(payload?.visible) && !internalPreviewOverlayActive;
+handleWorkspaceIpc("preview:internalSync", async (_event, payload: any) => {
+  workspaceRuntime.internalPreviewRequestedVisible = Boolean(payload?.visible);
+  const visible = Boolean(payload?.visible);
   const url = typeof payload?.url === "string" ? payload.url : "";
   const session = Number(payload?.session);
   const rawBounds = payload?.bounds;
   if (!visible) {
+    const lease = getWorkspaceLease();
+    if (lease) workspaceVisibility.request(lease, false);
     detachInternalPreviewView(false);
-    return { enabled: false, state: internalPreviewState };
+    return { enabled: false, state: workspaceRuntime.internalPreviewState };
   }
-  if (!Number.isInteger(session) || session !== activePreviewSessionId || !isAllowedInternalPreviewUrl(url)) {
+  if (!Number.isInteger(session) || session !== workspaceRuntime.activePreviewSessionId || !isAllowedInternalPreviewUrl(url)) {
     throw new Error("Preview interno recusou uma sessão ou URL inválida.");
   }
   // The URL must point to the ACTIVE Preview server. Only the origin matters:
   // the route (pathname/search/hash) is the current page and never a server
   // change, so legitimate route/query URLs must be accepted.
-  if (!previewState.url || !previewServerOriginMatches(url, previewState.url)) {
+  if (!workspaceRuntime.previewState.url || !previewServerOriginMatches(url, workspaceRuntime.previewState.url)) {
     throw new Error("A URL do Preview interno não corresponde ao servidor ativo.");
   }
   const x = Math.max(0, Math.round(Number(rawBounds?.x)) || 0);
@@ -9277,26 +9811,32 @@ ipcMain.handle("preview:internalSync", async (_event, payload: any) => {
   const view = ensureInternalPreviewView();
   if (!view) return { enabled: false, state: "idle" as const };
   try {
-    mainWindow?.contentView.addChildView(view);
-    view.setVisible(true);
+    if (mainWindow && !workspaceContentView()!.children.includes(view)) workspaceContentView()!.addChildView(view);
+    const lease = getWorkspaceLease();
+    if (lease) {
+      workspaceVisibility.request(lease, workspaceRuntime.internalPreviewRequestedVisible);
+      workspaceVisibility.overlay(lease, workspaceRuntime.internalPreviewOverlayActive);
+    } else view.setVisible(!workspaceRuntime.internalPreviewOverlayActive);
   } catch {}
-  view.setBounds({ x, y, width, height });
-  internalPreviewSession = session;
-  if (!previewUrlsMatch(internalPreviewUrl, url)) {
-    internalPreviewUrl = url;
+  const zoomFactor = workspaceWebContents()?.getZoomFactor() || 1;
+  view.setBounds({ x: Math.round(x * zoomFactor), y: Math.round(y * zoomFactor), width: Math.round(width * zoomFactor), height: Math.round(height * zoomFactor) });
+  view.setBorderRadius(20 * zoomFactor);
+  workspaceRuntime.internalPreviewSession = session;
+  if (!previewUrlsMatch(workspaceRuntime.internalPreviewUrl, url)) {
+    workspaceRuntime.internalPreviewUrl = url;
     logInternalPreview("loading", "navigation=requested");
     await view.webContents.loadURL(url);
   }
-  return { enabled: true, state: internalPreviewState };
+  return { enabled: true, state: workspaceRuntime.internalPreviewState };
 });
 
 // "Atualizar Preview": reloads the current page NATIVELY, without changing
 // the URL. The internal WebContents keeps its current route (pathname,
 // search and hash are all preserved by a reload). This never adds artificial
 // query parameters such as "?t=timestamp".
-ipcMain.handle("preview:refresh", async () => {
-  const view = internalPreviewView;
-  if (!view || view.webContents.isDestroyed()) {
+handleWorkspaceIpc("preview:refresh", async () => {
+  const view = workspaceRuntime.internalPreviewView;
+  if (!view || !view.webContents || view.webContents.isDestroyed()) {
     return { ok: false, reason: "no-internal-view" };
   }
   try {
@@ -9319,38 +9859,61 @@ ipcMain.handle("preview:refresh", async () => {
 // Page Selector & Overlay support. The internal Preview is a native
 // WebContentsView, which Electron always paints ABOVE the renderer DOM — no
 // CSS z-index can raise a DOM dropdown over it. While a DOM overlay (modal,
-// page selector, dropdown) is open we hide and detach the native view so the DOM
-// overlay paints fully on top; it is restored as soon as the overlay closes.
-ipcMain.handle("preview:internalOverlay", async (_event, overlay: boolean) => {
-  internalPreviewOverlayActive = Boolean(overlay);
-  const view = internalPreviewView;
-  if (!view || view.webContents.isDestroyed()) {
-    return { ok: false, visible: !internalPreviewOverlayActive };
+// page selector, dropdown) is open we hide the attached native view after its
+// captured pixels are committed. Keeping its parent and bounds avoids reflow.
+handleWorkspaceIpc("preview:internalCapture", async () => {
+  const view = workspaceRuntime.internalPreviewView;
+  if (!view || !view.webContents || view.webContents.isDestroyed()) return null;
+  try {
+    // Capture the same styled document that is visible, never the fallback iframe.
+    await injectPreviewScrollbar(view.webContents.mainFrame);
+    const image = await view.webContents.capturePage();
+    if (image.isEmpty()) return null;
+    const scaleFactor = Math.max(1, ...image.getScaleFactors());
+    return { dataUrl: image.toDataURL({ scaleFactor }), bounds: view.getBounds(), zoomFactor: workspaceWebContents()?.getZoomFactor() || 1 };
+  } catch { return null; }
+});
+
+handleWorkspaceIpc("preview:internalOverlay", async (_event, overlay: boolean) => {
+  workspaceRuntime.internalPreviewOverlayActive = Boolean(overlay);
+  const view = workspaceRuntime.internalPreviewView;
+  if (!view || !view.webContents || view.webContents.isDestroyed()) {
+    return { ok: false, visible: !workspaceRuntime.internalPreviewOverlayActive };
+  }
+  const lease = getWorkspaceLease();
+  if (lease) {
+    workspaceVisibility.request(lease, workspaceRuntime.internalPreviewRequestedVisible);
+    workspaceVisibility.overlay(lease, workspaceRuntime.internalPreviewOverlayActive);
+    const visible = currentWorkspaceLease?.workspaceId === lease.workspaceId && workspaceRuntime.internalPreviewRequestedVisible && !workspaceRuntime.internalPreviewOverlayActive;
+    if (visible && !overlay) {
+      // Wait for a native compositor frame before the renderer removes its cover.
+      try { await view.webContents.capturePage(); } catch {}
+    }
+    return { ok: true, visible };
   }
   try {
-    if (internalPreviewOverlayActive) {
-      mainWindow?.contentView.removeChildView(view);
+    if (workspaceRuntime.internalPreviewOverlayActive) {
       view.setVisible(false);
-    } else {
+    } else if (workspaceRuntime.internalPreviewRequestedVisible) {
       view.setVisible(true);
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.contentView.addChildView(view);
+        if (!workspaceContentView()!.children.includes(view)) workspaceContentView()!.addChildView(view);
       }
     }
   } catch {}
-  return { ok: true, visible: !internalPreviewOverlayActive };
+  return { ok: true, visible: !workspaceRuntime.internalPreviewOverlayActive };
 });
 
 // Page Selector: returns the discovered routes of the active project.
-ipcMain.handle("preview:routes", async (_event, payload?: { force?: boolean }) => {
-  const projectRoot = assertProjectRootSafe(currentProject, "preview-routes");
+handleWorkspaceIpc("preview:routes", async (_event, payload?: { force?: boolean }) => {
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "preview-routes");
   const routes = await getPreviewRoutes(Boolean(payload?.force));
   return { routes, projectPath: projectRoot };
 });
 
 // Page Selector: navigate the internal preview to a discovered route,
 // preserving the origin and never adding artificial query parameters.
-ipcMain.handle("preview:navigate", async (_event, routePath: string) => {
+handleWorkspaceIpc("preview:navigate", async (_event, routePath: string) => {
   const normalized = normalizeRoutePath(routePath);
   if (!normalized) throw new Error("Rota de Preview inválida.");
   // Dynamic detail routes (/equipamentos/:id) cannot be opened without real
@@ -9362,25 +9925,25 @@ ipcMain.handle("preview:navigate", async (_event, routePath: string) => {
     openable = parts.join("/") || "/";
     openable = normalizeRoutePath(openable);
   }
-  const originSource = internalPreviewUrl || previewState.url || "";
+  const originSource = workspaceRuntime.internalPreviewUrl || workspaceRuntime.previewState.url || "";
   let origin = "";
   try { origin = new URL(originSource).origin; } catch {}
   if (!origin) throw new Error("Nenhum servidor de Preview ativo no momento.");
   const target = new URL(openable, origin).toString();
   console.log(`[Preview Routes] navigate origin=${origin} route=${normalized} openable=${openable}`);
-  const view = internalPreviewView;
-  if (!view || view.webContents.isDestroyed()) {
+  const view = workspaceRuntime.internalPreviewView;
+  if (!view || !view.webContents || view.webContents.isDestroyed()) {
     // No internal surface yet: just reflect intent on the state URL.
-    if (!previewUrlsMatch(internalPreviewUrl, target)) {
-      internalPreviewUrl = target;
+    if (!previewUrlsMatch(workspaceRuntime.internalPreviewUrl, target)) {
+      workspaceRuntime.internalPreviewUrl = target;
       emitInternalPreviewRoute(target);
     }
     return { ok: true, target, method: "state" };
   }
   // Only a real navigation if the route actually changed; otherwise reload is
   // handled by "Atualizar Preview" (native reload, route preserved).
-  if (!previewUrlsMatch(internalPreviewUrl, target)) {
-    internalPreviewUrl = target;
+  if (!previewUrlsMatch(workspaceRuntime.internalPreviewUrl, target)) {
+    workspaceRuntime.internalPreviewUrl = target;
     logInternalPreview("loading", "navigation=route");
     await view.webContents.loadURL(target);
     emitInternalPreviewRoute(view.webContents.getURL());
@@ -9394,7 +9957,7 @@ ipcMain.handle("siteClone:analyze", async (_event, payload: { url: string; limit
   licenseManager.assertAccess("clonagem de sites");
   const send = (type: string, properties: Record<string, any>) => {
     try {
-      mainWindow?.webContents.send("siteclone:event", { type, properties });
+      sendWorkspaceRenderer("siteclone:event", { type, properties });
     } catch {}
   };
   send("start", { url: String(payload?.url ?? "") });
@@ -9426,7 +9989,7 @@ ipcMain.handle("siteClone:capture", async (_event, payload: { url?: string }) =>
 // so the reconstruction uses real local files instead of placeholders/hotlinks.
 ipcMain.handle("siteClone:importAssets", async (_event, payload: { assets?: { url: string; kind: string }[] }) => {
   licenseManager.assertAccess("importação de recursos de sites");
-  const projectRoot = assertProjectRootSafe(currentProject, "site-clone-assets");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "site-clone-assets");
   const assets = Array.isArray(payload?.assets) ? payload.assets : [];
   console.log(`[SiteClone] import-assets project=${projectRoot} count=${assets.length}`);
   const result = await importSiteAssets(projectRoot, assets);
@@ -9603,9 +10166,9 @@ function isLocalhostPreviewUrl(raw: string): boolean {
   }
 }
 
-ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
-  console.log(`[Preview] external open requested rawUrl=${sanitizeExternalPreviewUrl(rawUrl)} previewState.url=${sanitizeExternalPreviewUrl(previewState.url || "")} previewState.status=${previewState.status}`);
-  const currentPreviewUrl = typeof previewState.url === "string" ? previewState.url : "";
+handleWorkspaceIpc("preview:openExternal", async (_event, rawUrl: string) => {
+  console.log(`[Preview] external open requested rawUrl=${sanitizeExternalPreviewUrl(rawUrl)} workspaceRuntime.previewState.url=${sanitizeExternalPreviewUrl(workspaceRuntime.previewState.url || "")} workspaceRuntime.previewState.status=${workspaceRuntime.previewState.status}`);
+  const currentPreviewUrl = typeof workspaceRuntime.previewState.url === "string" ? workspaceRuntime.previewState.url : "";
   let value = "";
   const requested = String(rawUrl || "").trim();
   if (requested && currentPreviewUrl && previewServerOriginMatches(requested, currentPreviewUrl)) {
@@ -9619,7 +10182,7 @@ ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
 
   if (!value) {
     try {
-      const internal = internalPreviewView;
+      const internal = workspaceRuntime.internalPreviewView;
       if (internal && !internal.webContents.isDestroyed()) {
         const internalCurrent = internal.webContents.getURL();
         if (internalCurrent && isLocalhostPreviewUrl(internalCurrent) && currentPreviewUrl && previewServerOriginMatches(internalCurrent, currentPreviewUrl)) {
@@ -9632,7 +10195,7 @@ ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
   if (!value) {
     if (requested && currentPreviewUrl && previewServerOriginMatches(requested, currentPreviewUrl)) {
       value = requested;
-    } else if (currentPreviewUrl && previewState.status === "ready") {
+    } else if (currentPreviewUrl && workspaceRuntime.previewState.status === "ready") {
       value = currentPreviewUrl;
     } else if (requested) {
       value = requested;
@@ -9658,7 +10221,7 @@ ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
 
   try {
     const target = url.toString();
-    console.log(`[Preview] external open url=${target} session=${activePreviewSessionId}`);
+    console.log(`[Preview] external open url=${target} session=${workspaceRuntime.activePreviewSessionId}`);
     const win = await getExternalPreviewWindow();
     externalPreviewTargetUrl = target;
     await loadExternalPreviewUrl(win, target);
@@ -9674,24 +10237,8 @@ ipcMain.handle("preview:openExternal", async (_event, rawUrl: string) => {
   }
 });
 
-ipcMain.handle("project:stop", async (_event, payload?: { source?: string }) => {
-  const source = payload?.source || "renderer";
-  console.log(`[ProjectSwitch] REQUEST source=${source} target=null (stop)`);
-  if (activeWorkspace) {
-    activeWorkspace.status = "stopping";
-  }
-  currentProject = null;
-  activeWorkspace = null;
-  migrationManager.cancelAllPendingProposals();
-  void supabaseManager.setProject(null);
-  void vercelManager.setProject(null);
-  void lovableCloudManager.setProject(null);
-  void chatGptManager.setProject(null);
-  skillsManager.setProject(null);
-  await stopOpenCode();
-  await stopPreview();
-  return true;
-});
+ipcMain.handle("project:stop",async()=>{const owner=getWorkspaceLease();if(owner&&workspaceTabs)return workspaceTabs.close(owner.workspaceId);return true;});
+
 
 ipcMain.handle("supabase:get-state", async () => {
   return supabaseManager.getState();
@@ -9773,7 +10320,7 @@ ipcMain.handle("supabase:cancel-auth", async () => {
 });
 
 ipcMain.handle("supabase:unlink", async () => {
-  const projectRoot = assertProjectRootSafe(currentProject, "supabase-unlink");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "supabase-unlink");
   return await supabaseManager.unlinkProject(projectRoot);
 });
 
@@ -9787,12 +10334,13 @@ ipcMain.handle("supabase:open-dashboard", async () => {
   return { success: true };
 });
 
-ipcMain.handle("supabase:reply-migration", async (_event, payload: { proposalId: string; approved: boolean }) => {
+handleWorkspaceProposalIpc("supabase:reply-migration", async (_event, payload: { proposalId: string; approved: boolean }) => {
   licenseManager.assertAccess("execução de migração do Supabase");
   if (!payload?.proposalId) {
     throw new Error("Identificador de proposta de migração inválido.");
   }
   const proposal = migrationManager.getProposal(payload.proposalId);
+  const permissionTarget = proposal?.permissionId && proposal.sessionId ? captureSessionService(proposal.sessionId) : null;
   const result = await migrationManager.replyProposal(payload.proposalId, payload.approved);
 
   // If approved, update task state to running so backend task state mirrors approval immediately
@@ -9808,15 +10356,17 @@ ipcMain.handle("supabase:reply-migration", async (_event, payload: { proposalId:
     try {
       const response = payload.approved ? "once" : "reject";
       console.log(`[Neko/Migration] ${payload.approved ? "approved" : "rejected"} proposal=${proposal.id} permission=${proposal.permissionId} releasing original permission response=${response}`);
-      const headers = { "Content-Type": "application/json", ...opencodeRequestHeaders() };
-      const bodyPayload = { response };
-      await fetch(`${opencodeUrl}/session/${encodeURIComponent(proposal.sessionId)}/permissions/${encodeURIComponent(proposal.permissionId)}`, {
-        method: "POST", headers, body: JSON.stringify(bodyPayload)
-      }).catch(async () => {
-        await fetch(`${opencodeUrl}/permission/${encodeURIComponent(proposal.permissionId!)}/reply`, {
-          method: "POST", headers, body: JSON.stringify(bodyPayload)
-        }).catch(() => {});
-      });
+      if (!permissionTarget) throw new Error("Motor da sessão de migração indisponível.");
+      const headers = { "Content-Type": "application/json", ...workspaceServices.headers(permissionTarget, opencodeAuthHeaders()) };
+      const body = JSON.stringify({ response });
+      const send = (endpoint: string) => workspaceServices.request(permissionTarget!, endpoint, { method: "POST", headers, body });
+      const primary = await send(`/session/${encodeURIComponent(proposal.sessionId)}/permissions/${encodeURIComponent(proposal.permissionId)}`);
+      // Compatibility fallback is for an unavailable route, never a transport failure
+      // or stale engine: retrying approval after an unknown outcome can duplicate it.
+      if (primary.status === 404 || primary.status === 405) {
+        const fallback = await send(`/permission/${encodeURIComponent(proposal.permissionId!)}/reply`);
+        if (!fallback.ok) throw new Error(`Falha na resposta de permissão: HTTP ${fallback.status}`);
+      } else if (!primary.ok) throw new Error(`Falha na resposta de permissão: HTTP ${primary.status}`);
     } catch (permErr) {
       console.warn("[MigrationManager] Error unlocking OpenCode permission after migration reply:", permErr);
     }
@@ -9825,12 +10375,12 @@ ipcMain.handle("supabase:reply-migration", async (_event, payload: { proposalId:
   return result;
 });
 
-ipcMain.handle("supabase:get-pending-migration", async (_event, sessionId: string) => {
+handleWorkspaceSessionIpc("supabase:get-pending-migration", async (_event, sessionId: string) => {
   if (!sessionId) return null;
   return migrationManager.getPendingProposalForSession(sessionId);
 });
 
-let vercelPublishInProgress = false;
+const vercelPublishing = new WorkspaceState(workspaceRegistry,()=>({active:false}),()=>currentWorkspaceLease);
 
 ipcMain.handle("vercel:get-state", async () => {
   return vercelManager.getState();
@@ -9853,13 +10403,13 @@ ipcMain.handle("vercel:disconnect", async () => {
 });
 
 ipcMain.handle("vercel:unlink", async () => {
-  const projectRoot = assertProjectRootSafe(currentProject, "vercel-unlink");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "vercel-unlink");
   return await vercelManager.unlinkProject(projectRoot);
 });
 
 ipcMain.handle("vercel:request-link-intent", async (_event, detectedProjectId?: string) => {
   licenseManager.assertAccess("vínculo de projeto na Vercel");
-  const projectRoot = assertProjectRootSafe(currentProject, "vercel-request-link-intent");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "vercel-request-link-intent");
   const vercelUser = vercelManager.getState().username;
   if (!vercelUser) {
     throw new Error("Conecte sua conta da Vercel antes de vincular.");
@@ -9879,7 +10429,7 @@ ipcMain.handle("vercel:request-link-intent", async (_event, detectedProjectId?: 
     projectId: detectedProject.id,
     projectName: detectedProject.name,
     gitRepo: detectedProject.gitRepo,
-    projectGeneration: projectTransitionGeneration,
+    projectGeneration: runtimeGeneration(),
     username: vercelUser,
   });
 
@@ -9899,7 +10449,7 @@ ipcMain.handle("vercel:use-detected-project", async (_event, payload: { intentId
   }
 
   licenseManager.assertAccess("vínculo de projeto na Vercel");
-  const projectRoot = assertProjectRootSafe(currentProject, "vercel-use-detected-project");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "vercel-use-detected-project");
   logProjectWorkspace("vercel-use-detected-project", projectRoot);
 
   const currentVercelUser = vercelManager.getState().username;
@@ -9908,7 +10458,7 @@ ipcMain.handle("vercel:use-detected-project", async (_event, payload: { intentId
   const validation = vercelLinkIntentManager.validateAndConsume(
     intentId,
     projectRoot,
-    projectTransitionGeneration,
+    runtimeGeneration(),
     currentVercelUser
   );
 
@@ -9930,7 +10480,7 @@ ipcMain.handle("vercel:use-detected-project", async (_event, payload: { intentId
 
 ipcMain.handle("vercel:request-publish-intent", async (_event, customProjectName?: string) => {
   licenseManager.assertAccess("publicação na Vercel");
-  const projectRoot = assertProjectRootSafe(currentProject, "vercel-request-publish-intent");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "vercel-request-publish-intent");
   const vercelUser = vercelManager.getState().username;
   if (!vercelUser) {
     throw new Error("Conecte sua conta da Vercel antes de publicar.");
@@ -9952,7 +10502,7 @@ ipcMain.handle("vercel:request-publish-intent", async (_event, customProjectName
   const intent = vercelIntentManager.createIntent({
     projectPath: projectRoot,
     projectName: customProjectName,
-    projectGeneration: projectTransitionGeneration,
+    projectGeneration: runtimeGeneration(),
     username: vercelUser,
   });
 
@@ -9973,10 +10523,10 @@ ipcMain.handle("vercel:publish", async (_event, payload?: { intentId?: string; c
   }
 
   licenseManager.assertAccess("publicação na Vercel");
-  if (vercelPublishInProgress) {
+  if (vercelPublishing.current().active) {
     throw new Error("Já existe uma publicação na Vercel em andamento.");
   }
-  const projectRoot = assertProjectRootSafe(currentProject, "vercel-publish");
+  const projectRoot = assertProjectRootSafe(workspaceRuntime.currentProject, "vercel-publish");
   logProjectWorkspace("vercel-publish", projectRoot);
 
   const currentVercelUser = vercelManager.getState().username;
@@ -9985,7 +10535,7 @@ ipcMain.handle("vercel:publish", async (_event, payload?: { intentId?: string; c
   const validation = vercelIntentManager.validateAndConsume(
     intentId,
     projectRoot,
-    projectTransitionGeneration,
+    runtimeGeneration(),
     currentVercelUser
   );
 
@@ -10010,7 +10560,7 @@ ipcMain.handle("vercel:publish", async (_event, payload?: { intentId?: string; c
     validatedProjectName = rawName;
   }
 
-  vercelPublishInProgress = true;
+  vercelPublishing.current().active = true;
   try {
     const environment: Record<string, string> = {};
     const info = await detectProject(projectRoot).catch(() => null);
@@ -10022,7 +10572,7 @@ ipcMain.handle("vercel:publish", async (_event, payload?: { intentId?: string; c
     }
     return await vercelManager.deploy(projectRoot, environment, validatedProjectName);
   } finally {
-    vercelPublishInProgress = false;
+    vercelPublishing.current().active = false;
   }
 });
 
@@ -10047,32 +10597,32 @@ ipcMain.handle("vercel:open-dashboard", async () => {
 // ============================================================
 // AGENT SKILLS IPC HANDLERS
 // ============================================================
-ipcMain.handle("skills:get-status", async (_event, payload?: any) => {
+handleWorkspaceIpc("skills:get-status", async (_event, payload?: any) => {
   try {
     const projectPath = typeof payload === "string" ? payload : payload?.projectPath;
-    const state = await skillsManager.getStatus(projectPath);
+    const state = await skillsManager.getStatus(resolveWorkspaceProjectPath(projectPath));
     return { success: true, state, ...state };
   } catch (err: any) {
     return { success: false, error: err?.message || String(err) };
   }
 });
 
-ipcMain.handle("skills:install", async (_event, payload: any) => {
+handleWorkspaceIpc("skills:install", async (_event, payload: any) => {
   try {
     const skillId = typeof payload === "string" ? payload : payload?.skillId;
     const projectPath = typeof payload === "object" ? payload?.projectPath : undefined;
-    const res = await skillsManager.installSkill(skillId, projectPath);
+    const res = await skillsManager.installSkill(skillId, resolveWorkspaceProjectPath(projectPath));
     return res;
   } catch (err: any) {
     return { success: false, error: err?.message || String(err) };
   }
 });
 
-ipcMain.handle("skills:remove", async (_event, payload: any) => {
+handleWorkspaceIpc("skills:remove", async (_event, payload: any) => {
   try {
     const skillId = typeof payload === "string" ? payload : payload?.skillId;
     const projectPath = typeof payload === "object" ? payload?.projectPath : undefined;
-    const res = await skillsManager.removeSkill(skillId, projectPath);
+    const res = await skillsManager.removeSkill(skillId, resolveWorkspaceProjectPath(projectPath));
     return res;
   } catch (err: any) {
     return { success: false, error: err?.message || String(err) };
@@ -10203,141 +10753,29 @@ export function closeMainWindow(): void {
   }
 }
 
-function createWindow() {
-  const windowIconPath = process.platform === "win32"
-    ? path.join(__dirname, "../assets/icon.ico")
-    : path.join(__dirname, "../assets/icon.png");
-
-  mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 900,
-    minWidth: 1100,
-    minHeight: 700,
-    show: false,
-    frame: false,
-    icon: fs.existsSync(windowIconPath) ? windowIconPath : undefined,
-    backgroundColor: "#070510",
-    webPreferences: {
-      preload: path.join(__dirname, "../preload/preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
+function wireStudioContents(raw:Electron.WebContents){
+ const contents=new Proxy(raw,{get(target,key){
+  if(key==="on")return (name:string,handler:(...args:any[])=>void)=>target.on(name as any,(...args:any[])=>{
+   const owner=workspaceTabs?.owner(target.id);try{
+    if(owner)workspaceRegistry.run(owner,()=>handler(...args));else workspaceRegistry.runBootstrap(()=>handler(...args));
+   }catch(error){console.warn("[Workspace renderer event]",name,error);}
   });
-
-  Menu.setApplicationMenu(null);
-
-  mainWindow.on("maximize", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("window:maximized-change", true);
-    }
-  });
-  mainWindow.on("unmaximize", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("window:maximized-change", false);
-    }
-  });
-  mainWindow.on("restore", () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("window:maximized-change", false);
-    }
-  });
-
-  mainWindow.once("ready-to-show", () => {
-    // Start maximized like a normal Windows desktop app.
-    mainWindow?.maximize();
-    mainWindow?.show();
-  });
-
-  thumbnailService.setMainWindowGetter(() => mainWindow);
-  thumbnailService.setInternalPreviewViewGetter(() => internalPreviewView);
-  thumbnailService.setIsInsideAppRootChecker((p: string) => isInsideNekoApplication(p));
-
-  supabaseManager.on("state-changed", (state) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("supabase:state-changed", state);
-    }
-  });
-
-  const forwardMigrationEvent = (eventType: string, payload: any) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("supabase:migration-event", { type: `supabase:migration:${eventType}`, payload });
-    }
-  };
-
-  migrationManager.on("migration-asked", (proposal) => forwardMigrationEvent("asked", proposal));
-  migrationManager.on("migration-replied", (data) => forwardMigrationEvent("replied", data));
-  migrationManager.on("migration-executing", (proposal) => forwardMigrationEvent("executing", proposal));
-  migrationManager.on("migration-completed", (data) => forwardMigrationEvent("completed", data));
-  migrationManager.on("migration-failed", (data) => forwardMigrationEvent("failed", data));
-  migrationManager.on("migration-expired", (proposal) => forwardMigrationEvent("expired", proposal));
-  migrationManager.on("migration-cancelled", (proposal) => forwardMigrationEvent("cancelled", proposal));
-
-  vercelManager.on("state-changed", (state) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("vercel:state-changed", state);
-    }
-  });
-
-  vercelManager.on("log", (message) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("vercel:log", message);
-    }
-  });
-
-  lovableMcpServer.setActiveSessionGetter(() => getActiveSessionId());
-
-  lovableMcpServer.setOnJitRequired(({ sessionId, toolName, projectId, jitId }) => {
-    const rootSessionId = resolveRootSessionId(sessionId) || sessionId;
-    console.log(`[Lovable Guard] Layer 2 MCP JIT required for tool=${toolName} session=${rootSessionId} jitId=${jitId}`);
-
-    setTaskState(rootSessionId, "waiting_for_lovable_cloud", "lovable-mcp-cloud-required", {
-      projectId,
-      toolName,
-      jitId,
-      source: "mcp_tool"
-    });
-
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("lovable:jit-required", {
-        sessionId: rootSessionId,
-        toolName,
-        projectId,
-        jitId,
-        source: "mcp_tool"
-      });
-    }
-  });
-
-  lovableCloudManager.on("state-changed", async (state) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("lovable:state-changed", state);
-    }
-    const currentPath = lovableCloudManager.getActiveProjectPath();
-    if (currentPath) {
-      if (state.isLovableProject && (state.projectId || state.detectedProjectId)) {
-        await lovableMcpServer.start().catch(() => {});
-        await writeLovableOpenCodeConfig(currentPath, lovableMcpServer.getUrl(), lovableMcpServer.getSecretToken()).catch(() => {});
-      } else if (!state.isLovableProject) {
-        await removeLovableOpenCodeConfig(currentPath).catch(() => {});
-      }
-    }
-  });
-
-  const devUrl = process.env.VITE_DEV_SERVER_URL;
-
-  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+  const value=Reflect.get(target,key,target);return typeof value==="function"?value.bind(target):value;
+ }});
+  contents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
     console.error("[Neko/Renderer] did-fail-load", { errorCode, errorDescription, validatedURL, isMainFrame });
     // Detect preview subframe load failures and notify the renderer
     if (!isMainFrame && (validatedURL.includes("127.0.0.1") || validatedURL.includes("localhost"))) {
-      mainWindow?.webContents.send("preview:event", {
+      emitWorkspacePreviewEvent({
         type: "preview.frame-error",
         properties: { errorCode, errorDescription, url: validatedURL }
       });
     }
   });
 
-  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+  contents.on("render-process-gone", (_event, details) => {
     console.error("[Neko/Renderer] render-process-gone", details);
+    traceProjectOpen("renderer-gone",{sender:raw.id,reason:details.reason,exitCode:details.exitCode});
     console.error("[BLACKSCREEN-RENDERER] render-process-gone", { reason: details.reason, exitCode: details.exitCode });
   });
 
@@ -10432,7 +10870,7 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
   // 2) Positional with event: (event, level, message, lineNumber, sourceId)
   // 3) Positional details: (event, { level, message, lineNumber, sourceId })
   // 4) Legacy positional without event: (level, message, lineNumber, sourceId)
-  mainWindow.webContents.on("console-message", ((arg0: any, arg1: any, arg2?: any, arg3?: any, arg4?: any) => {
+  contents.on("console-message", ((arg0: any, arg1: any, arg2?: any, arg3?: any, arg4?: any) => {
     let rawLevel: unknown = 0;
     let message = "";
     let lineNumber = 0;
@@ -10463,12 +10901,13 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
     const level = typeof rawLevel === "string"
       ? ({ verbose: 0, info: 1, warning: 2, warn: 2, error: 3 } as Record<string, number>)[rawLevel.toLowerCase()] ?? 1
       : Number(rawLevel ?? 0);
+    if (message.includes("[BLACKSCREEN] openRecentProject") || message.includes("[App] openOtherProject")) traceProjectOpen("renderer",{sender:raw.id,message:message.slice(0,1200)});
     const payload = { level, message, line: lineNumber, sourceId };
     const source = String(sourceId || "");
     // Preview frames can report a source URL with a different local hostname
     // representation. Do not require an exact port match for diagnostics.
-    const isPreviewConsole = Boolean(previewPort && (source.includes("127.0.0.1") || source.includes("localhost"))) ||
-      (Boolean(previewPort) && source.includes(`:${previewPort}`));
+    const isPreviewConsole = Boolean(workspaceRuntime.previewPort && (source.includes("127.0.0.1") || source.includes("localhost"))) ||
+      (Boolean(workspaceRuntime.previewPort) && source.includes(`:${workspaceRuntime.previewPort}`));
 
     // [BLACKSCREEN-RENDERER] Capture renderer errors (not preview) from console-message
     if (!isPreviewConsole && level >= 3 && message.trim()) {
@@ -10518,7 +10957,7 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
         if (attemptCount < 3 && nowEmission - lastEmission >= 3000) {
           previewErrorEmissionAt.set(diagnosticInfo.signature, nowEmission);
           attemptedErrorSignatures.set(diagnosticInfo.signature, { count: attemptCount + 1, lastAttempt: nowEmission });
-          mainWindow?.webContents.send("preview:event", { 
+          emitWorkspacePreviewEvent({ 
             type: "preview.error-detected", 
             properties: { 
               ...diagnosticInfo,
@@ -10527,40 +10966,40 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
               sessionId: activeSessionId,
               taskId: activeTaskId,
               taskRunning: isTaskRunning,
-              projectPath: currentProject || activeWorkspace?.projectPath || ""
+              projectPath: workspaceRuntime.currentProject || workspaceRuntime.activeWorkspace?.projectPath || ""
             } 
           });
         }
       }
       
       if (message.includes("[vite]")) perfMark("t6");
-      mainWindow?.webContents.send("preview:event", { type: "preview.console", properties: payload });
+      emitWorkspacePreviewEvent({ type: "preview.console", properties: payload });
     }
   }) as any);
 
   // The Preview runs inside an iframe, so the Neko scrollbar theme must be
   // injected into that frame itself. This also covers HMR and route changes.
-  mainWindow.webContents.on("did-frame-finish-load", (_event, isMainFrame, frameProcessId, frameRoutingId) => {
+  contents.on("did-frame-finish-load", (_event, isMainFrame, frameProcessId, frameRoutingId) => {
     if (isMainFrame) return;
     try {
       const frame = (webFrameMain as any).fromId(frameProcessId, frameRoutingId);
       const frameUrl = String(frame?.url || "");
-      const previewPortText = previewPort ? `:${previewPort}` : "";
+      const previewPortText = workspaceRuntime.previewPort ? `:${workspaceRuntime.previewPort}` : "";
       if (frameUrl.includes("127.0.0.1") || frameUrl.includes("localhost") || (previewPortText && frameUrl.includes(previewPortText))) {
         void injectPreviewScrollbar(frame).then(ok => {
           if (ok) {
             perfMark("t6");
-            mainWindow?.webContents.send("preview:event", { type: "preview.frame-ready", properties: {} });
+            emitWorkspacePreviewEvent({ type: "preview.frame-ready", properties: {} });
           }
         });
       }
     } catch {}
   });
 
-  mainWindow.webContents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
+  contents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
     if (isMainFrame) return;
     try {
-      const frames = (mainWindow?.webContents.mainFrame as any)?.framesInSubtree ?? [];
+      const frames = (contents.mainFrame as any)?.framesInSubtree ?? [];
       const target = frames.find((frame: any) => String(frame?.url || "") === String(url));
       if (target) {
         perfMark("t6");
@@ -10572,13 +11011,13 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
   // Prepare a document-start hook for local Preview frames. The hook is a
   // fallback/first-paint guarantee; the renderer still keeps the iframe hidden
   // until the frame has received the final theme.
-  void installPreviewDocumentStartTheme(mainWindow.webContents);
+  void installPreviewDocumentStartTheme(contents);
 
-  mainWindow.webContents.on("did-start-navigation", (_event, url, isInPlace, isMainFrame, frameProcessId, frameRoutingId) => {
+  contents.on("did-start-navigation", (_event, url, isInPlace, isMainFrame, frameProcessId, frameRoutingId) => {
     if (isMainFrame) return;
     const frameUrl = String(url || "");
     if (frameUrl.includes("127.0.0.1") || frameUrl.includes("localhost")) {
-      mainWindow?.webContents.send("preview:event", { type: "preview.frame-loading", properties: {} });
+      emitWorkspacePreviewEvent({ type: "preview.frame-loading", properties: {} });
       try {
         const frame = (webFrameMain as any).fromId(frameProcessId, frameRoutingId);
         void injectPreviewScrollbar(frame);
@@ -10587,13 +11026,134 @@ function createStructuredDiagnostic(errorMessage: string, source: string, lineNu
     void isInPlace;
   });
 
-  if (devUrl) {
-    void mainWindow.loadURL(devUrl);
-  } else {
-    const rendererIndex = path.join(__dirname, "../renderer/index.html");
-    console.log("[Neko/Renderer] loading", rendererIndex);
-    void mainWindow.loadFile(rendererIndex);
-  }
+}
+
+function createWindow() {
+  const windowIconPath = process.platform === "win32"
+    ? path.join(__dirname, "../assets/icon.ico")
+    : path.join(__dirname, "../assets/icon.png");
+
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 1100,
+    minHeight: 700,
+    show: false,
+    frame: false,
+    icon: fs.existsSync(windowIconPath) ? windowIconPath : undefined,
+    backgroundColor: "#070510",
+    webPreferences: {
+      preload: path.join(__dirname, "../preload/preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  Menu.setApplicationMenu(null);
+
+  mainWindow.on("maximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("window:maximized-change", true);
+    }
+  });
+  mainWindow.on("unmaximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("window:maximized-change", false);
+    }
+  });
+  mainWindow.on("restore", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("window:maximized-change", false);
+    }
+  });
+
+  mainWindow.once("ready-to-show", () => {
+    // Start maximized like a normal Windows desktop app.
+    mainWindow?.maximize();
+    mainWindow?.show();
+  });
+
+  thumbnailService.setMainWindowGetter(() => mainWindow);
+  thumbnailService.setInternalPreviewViewGetter(() => workspaceRuntime.internalPreviewView);
+  thumbnailService.setIsInsideAppRootChecker((p: string) => isInsideNekoApplication(p));
+
+  supabaseManager.on("state-changed", (state) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("supabase:state-changed", state);
+    }
+  });
+
+  const forwardMigrationEvent = forwardWorkspaceMigrationEvent;
+
+  migrationManager.on("migration-asked", (proposal) => forwardMigrationEvent("asked", proposal));
+  migrationManager.on("migration-replied", (data) => forwardMigrationEvent("replied", data));
+  migrationManager.on("migration-executing", (proposal) => forwardMigrationEvent("executing", proposal));
+  migrationManager.on("migration-completed", (data) => forwardMigrationEvent("completed", data));
+  migrationManager.on("migration-failed", (data) => forwardMigrationEvent("failed", data));
+  migrationManager.on("migration-expired", (proposal) => forwardMigrationEvent("expired", proposal));
+  migrationManager.on("migration-cancelled", (proposal) => forwardMigrationEvent("cancelled", proposal));
+
+  vercelManager.on("state-changed", (state) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("vercel:state-changed", state);
+    }
+  });
+
+  vercelManager.on("log", (message) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("vercel:log", message);
+    }
+  });
+
+  lovableMcpServer.setActiveSessionGetter(() => getActiveSessionId());
+
+  lovableMcpServer.setOnJitRequired(({ sessionId, toolName, projectId, jitId }) => {
+    const rootSessionId = resolveRootSessionId(sessionId) || sessionId;
+    console.log(`[Lovable Guard] Layer 2 MCP JIT required for tool=${toolName} session=${rootSessionId} jitId=${jitId}`);
+
+    setTaskState(rootSessionId, "waiting_for_lovable_cloud", "lovable-mcp-cloud-required", {
+      projectId,
+      toolName,
+      jitId,
+      source: "mcp_tool"
+    });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("lovable:jit-required", {
+        sessionId: rootSessionId,
+        toolName,
+        projectId,
+        jitId,
+        source: "mcp_tool"
+      });
+    }
+  });
+
+  lovableCloudManager.on("state-changed", async (state) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      sendWorkspaceRenderer("lovable:state-changed", state);
+    }
+    const currentPath = lovableCloudManager.getActiveProjectPath();
+    if (currentPath) {
+      if (state.isLovableProject && (state.projectId || state.detectedProjectId)) {
+        await lovableMcpServer.start().catch(() => {});
+        await writeLovableOpenCodeConfig(currentPath, lovableMcpServer.getUrl(), lovableMcpServer.getSecretToken()).catch(() => {});
+      } else if (!state.isLovableProject) {
+        await removeLovableOpenCodeConfig(currentPath).catch(() => {});
+      }
+    }
+  });
+
+  const devUrl = process.env.VITE_DEV_SERVER_URL;
+
+  workspaceTabs=new WorkspaceTabs(mainWindow,workspaceRegistry,{
+   preload:path.join(__dirname,"../preload/preload.js"),index:path.join(__dirname,"../renderer/index.html"),devUrl,created:contents=>wireStudioContents(contents),
+   select:lease=>{currentWorkspaceLease=lease;workspaceVisibility.select(lease);},
+   close:async lease=>{await closeWorkspaceIdentity(lease);workspaceResults.delete(lease.workspaceId);},
+   busy:lease=>workspaceRegistry.run(lease,()=>activeAgentRequests.size>0||workspaceRuntime.activeWorkspace?.status==="starting"),
+   confirmClose:async label=>(await dialog.showMessageBox(mainWindow!,{type:"question",title:"Fechar projeto",message:`${label} possui uma tarefa em andamento ou prompts na fila. Interromper, descartar a fila e fechar?`,buttons:["Manter aberto","Interromper e fechar"],defaultId:0,cancelId:0})).response===1
+  });
+  if(devUrl)void mainWindow.loadURL(new URL("/tabs.html",devUrl).href);else void mainWindow.loadFile(path.join(__dirname,"../renderer/tabs.html"));workspaceTabs.newHome();
 }
 
 app.whenReady().then(() => {
@@ -10614,8 +11174,9 @@ app.whenReady().then(() => {
     closeMainWindow();
   });
 
-  ipcMain.handle("app:version", () => "0.5.03");
+  ipcMain.handle("app:version", () => app.getVersion());
   ipcMain.handle("renderer:report-error", (_event, payload: { type: string; message: string; filename: string; lineno: number; colno: number; stack: string }) => {
+    traceProjectOpen("renderer-error", {type:payload.type,message:payload.message?.slice(0,500),filename:payload.filename?.slice(0,200),stack:payload.stack?.slice(0,1500)});
     console.error(`[BLACKSCREEN-RENDERER] ${payload.type}`, { message: payload.message?.slice(0, 500), filename: payload.filename?.slice(0, 200), lineno: payload.lineno, colno: payload.colno, stack: payload.stack?.slice(0, 1000) });
   });
   ipcMain.handle("app:openExternal", async (_event, url: string) => {
@@ -10632,28 +11193,21 @@ app.whenReady().then(() => {
   void licenseManager.initialize();
   void chatGptManager.initialize();
   chatGptManager.onStateChange((state) => {
-    mainWindow?.webContents.send("chatgpt:state-changed", state);
+    sendWorkspaceRenderer("chatgpt:state-changed", state);
   });
 
 
   licenseManager.setOnStateChange(async (newState, prevState) => {
     console.log(`[Neko/License] Estado alterado de ${prevState.state} para ${newState.state}`);
-    console.log(`[BLACKSCREEN] license-state-change:main`, { from: prevState.state, to: newState.state, wasLicensed: prevState.isLicensed, nowLicensed: newState.isLicensed, currentProject });
+    console.log(`[BLACKSCREEN] license-state-change:main`, { from: prevState.state, to: newState.state, wasLicensed: prevState.isLicensed, nowLicensed: newState.isLicensed, currentProject: workspaceRuntime.currentProject });
     // Envia evento de alteração de estado para o Renderer
-    mainWindow?.webContents.send("license:state-changed", newState);
+    sendWorkspaceRenderer("license:state-changed", newState);
 
     // Se perdeu o acesso licenciado (transferência para outro PC, revogação ou expiração), fecha o workspace imediatamente
     if (!newState.isLicensed && prevState.isLicensed) {
       console.warn("[Neko/License] Licença perdida/transferida. Encerrando workspace e servidores ativos imediatamente.");
-      console.warn("[BLACKSCREEN] license-revoked:killing-workspace", { currentProject, hasActiveWorkspace: !!activeWorkspace });
-      await stopPreview();
-      await stopOpenCode();
-      currentProject = null;
-      activeWorkspace = null;
-      mainWindow?.webContents.send("opencode:event", {
-        type: "neko.project.closed",
-        properties: { reason: "license.revoked_or_transferred" }
-      });
+      console.warn("[BLACKSCREEN] license-revoked:killing-workspace", { currentProject: workspaceRuntime.currentProject, hasActiveWorkspace: !!workspaceRuntime.activeWorkspace });
+      await workspaceTabs?.closeProjects();
     }
   });
 
@@ -10695,13 +11249,16 @@ app.whenReady().then(() => {
   ipcMain.handle("chatgpt:get-state", async () => {
     return chatGptManager.getState();
   });
-  ipcMain.handle("chatgpt:connect", async () => {
+  handleWorkspaceIpc("chatgpt:connect", async () => {
+    const owner = getWorkspaceLease();
     const res = await chatGptManager.startLogin();
-    if (res.success && currentProject) {
-      await chatGptManager.syncOpenCodeConfig(currentProject);
-      if (opencodeProcess) {
+    let ownerLive = false;
+    if (owner) { try { workspaceRegistry.assertLive(owner); ownerLive = true; } catch {} }
+    if (res.success && ownerLive && workspaceRuntime.currentProject) {
+      await chatGptManager.syncOpenCodeConfig(workspaceRuntime.currentProject);
+      if (workspaceRuntime.opencodeProcess) {
         console.log("[Neko/ChatGpt] Reiniciando OpenCode para carregar novo provedor Meu ChatGPT...");
-        await startOpenCode(currentProject);
+        await startOpenCode(workspaceRuntime.currentProject);
       }
     }
     return res;
@@ -10710,13 +11267,16 @@ app.whenReady().then(() => {
     chatGptManager.cancelLogin();
     return { success: true };
   });
-  ipcMain.handle("chatgpt:disconnect", async () => {
+  handleWorkspaceIpc("chatgpt:disconnect", async () => {
+    const owner = getWorkspaceLease();
     await chatGptManager.disconnect();
-    if (currentProject) {
-      await chatGptManager.syncOpenCodeConfig(currentProject);
-      if (opencodeProcess) {
+    let ownerLive = false;
+    if (owner) { try { workspaceRegistry.assertLive(owner); ownerLive = true; } catch {} }
+    if (ownerLive && workspaceRuntime.currentProject) {
+      await chatGptManager.syncOpenCodeConfig(workspaceRuntime.currentProject);
+      if (workspaceRuntime.opencodeProcess) {
         console.log("[Neko/ChatGpt] Reiniciando OpenCode após desconectar Meu ChatGPT...");
-        await startOpenCode(currentProject);
+        await startOpenCode(workspaceRuntime.currentProject);
       }
     }
     return { success: true };
@@ -10754,20 +11314,14 @@ app.whenReady().then(() => {
   ipcMain.handle("license:deactivate", async (_event, payload?: { licenseId?: string }) => {
     const res = await licenseManager.deactivate(payload?.licenseId);
     if (res.ok) {
-      await stopPreview();
-      await stopOpenCode();
-      currentProject = null;
-      activeWorkspace = null;
-      mainWindow?.webContents.send("opencode:event", {
-        type: "neko.project.closed",
-        properties: { reason: "license.deactivated" }
-      });
+      await workspaceTabs?.closeProjects();
     }
     return res;
   });
 
   createWindow();
   try {
+    updaterManager.setStateSender(state=>sendWorkspaceRenderer("updater:state-changed",state));
     updaterManager.initialize(mainWindow);
   } catch (err) {
     console.warn("[Neko/Updater] Falha ao inicializar o gerenciador de atualizações:", err);
@@ -10817,7 +11371,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("runtime:get-requirements", async (_event, projectPath?: string) => {
-    const target = projectPath || currentProject;
+    const target = projectPath || workspaceRuntime.currentProject;
     if (!target) return { requirements: [], cardData: [] };
     try {
       const safePath = assertProjectRootSafe(target, "runtime-read");
@@ -10867,11 +11421,7 @@ app.whenReady().then(() => {
 
   // Encaminhar eventos de ciclo de vida de runtime aos renderers ativos
   runtimeManager.getLifecycleManager().subscribeEvents((event) => {
-    BrowserWindow.getAllWindows().forEach((win) => {
-      try {
-        win.webContents.send("runtime:lifecycle-event", event);
-      } catch {}
-    });
+    sendWorkspaceRenderer("runtime:lifecycle-event", event);
   });
 
   // Verificação automática silenciosa em segundo plano após inicialização da janela
@@ -10889,19 +11439,15 @@ app.whenReady().then(() => {
   });
 });
 
-app.on("before-quit", () => {
-  cancelGithubAuthorization("app_before_quit");
-  licenseManager.shutdown();
-  supabaseManager.shutdown();
-  vercelManager.shutdown();
-  void stopPreview();
-  void stopOpenCode();
-});
-
-app.on("will-quit", () => {
-  cancelGithubAuthorization("app_will_quit");
-  void stopPreview();
-  void stopOpenCode();
+let shutdownComplete=false;
+let shutdownPending:Promise<void>|null=null;
+async function stopAllWorkspaces(){
+ const results=await Promise.allSettled(workspaceRegistry.list().map(lease=>closeWorkspaceIdentity(lease)));
+ for(const result of results)if(result.status==="rejected")console.error("[Workspace shutdown]",result.reason);
+}
+app.on("before-quit",event=>{
+ if(shutdownComplete)return;event.preventDefault();
+ if(!shutdownPending){cancelGithubAuthorization("app_before_quit");licenseManager.shutdown();shutdownPending=stopAllWorkspaces().finally(()=>{shutdownComplete=true;app.quit();});}
 });
 
 app.on("window-all-closed", () => {
@@ -10911,28 +11457,19 @@ app.on("window-all-closed", () => {
 
 // Process-level safety net: se o processo Node/Electron sofrer encerramento abrupto,
 // garantir a eliminação síncrona de processos órfãos no SO.
-process.on("exit", () => {
-  cancelGithubAuthorization("process_exit");
-  if (process.platform === "win32") {
-    if (opencodeProcess?.pid) {
-      try { spawnSync("taskkill.exe", ["/PID", String(opencodeProcess.pid), "/T", "/F"], { windowsHide: true }); } catch {}
-    }
-    if (previewProcess?.pid) {
-      try { spawnSync("taskkill.exe", ["/PID", String(previewProcess.pid), "/T", "/F"], { windowsHide: true }); } catch {}
-    }
-  }
+process.on("exit",()=>{
+ if(process.platform!=="win32")return;
+ for(const lease of workspaceRegistry.list())workspaceRegistry.run(lease,()=>{
+  for(const child of [workspaceRuntime.opencodeProcess,workspaceRuntime.previewProcess])if(child?.pid){try{spawnSync("taskkill.exe",["/PID",String(child.pid),"/T","/F"],{windowsHide:true});}catch{}}
+ });
 });
 
 process.on("SIGINT", () => {
   cancelGithubAuthorization("sigint");
-  void stopPreview();
-  void stopOpenCode();
   app.quit();
 });
 
 process.on("SIGTERM", () => {
   cancelGithubAuthorization("sigterm");
-  void stopPreview();
-  void stopOpenCode();
   app.quit();
 });

@@ -1,6 +1,6 @@
 {
   "name": "nekoai",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "private": true,
   "description": "NekoAI - AI software builder",
   "main": "dist/main/main.js",

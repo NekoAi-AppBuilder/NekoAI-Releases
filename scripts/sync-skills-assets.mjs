@@ -17,9 +17,6 @@ try {
     process.exit(1)
   }
 
-  fs.mkdirSync(targetSrc, { recursive: true })
-  console.log("Target dir created, copying files...")
-
   function copyDirRecursive(src, dst) {
     fs.mkdirSync(dst, { recursive: true })
     const entries = fs.readdirSync(src, { withFileTypes: true })
@@ -34,14 +31,17 @@ try {
     }
   }
 
-  if (hasExtSkills) {
+  // Only seed src assets from external extension if src assets does not exist or is empty
+  const srcAssetsEmpty = !hasTargetSrc || fs.readdirSync(targetSrc).length === 0
+  if (srcAssetsEmpty && hasExtSkills) {
+    fs.mkdirSync(targetSrc, { recursive: true })
     copyDirRecursive(extSkills, targetSrc)
-    console.log("Copied from extension to src assets!")
+    console.log("Seeded src assets from extension directory.")
   }
 
   const targetDist = path.join(root, "dist", "main", "skills", "assets")
   copyDirRecursive(targetSrc, targetDist)
-  console.log("Dist copy complete from repository assets!")
+  console.log("Dist copy complete from repository src/main/skills/assets!")
 } catch (err) {
   console.error("CAUGHT ERROR:", err)
   process.exit(1)

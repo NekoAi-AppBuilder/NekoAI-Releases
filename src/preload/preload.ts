@@ -1,6 +1,34 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { QueuedPromptRequest } from "../shared/prompt-queue";
+import type { ConversationSave } from "../shared/conversations";
 
+const openingProjectArgument = process.argv.find(value => value.startsWith("--neko-opening-project="));
+let openingProjectPath: string | null = null;
+try { if (openingProjectArgument) openingProjectPath = decodeURIComponent(openingProjectArgument.slice("--neko-opening-project=".length)); } catch {}
 contextBridge.exposeInMainWorld("neko", {
+  openingProjectPath,
+  conversationsList: () => ipcRenderer.invoke("conversations:list"),
+  conversationsSave: (payload: ConversationSave) => ipcRenderer.invoke("conversations:save", payload),
+  conversationsOpen: (id?: string, fresh = false) => ipcRenderer.invoke("conversations:open", { id, fresh }),
+  promptQueueState: () => ipcRenderer.invoke("prompt-queue:state"),
+  promptQueuePause: () => ipcRenderer.invoke("prompt-queue:pause"),
+  promptQueueResume: (revision: number) => ipcRenderer.invoke("prompt-queue:resume", revision),
+  promptQueueDispatch: (payload: QueuedPromptRequest, revision: number) => ipcRenderer.invoke("prompt-queue:dispatch", { ...payload, revision }),
+  onPromptQueueChanged: (callback: (state: any) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: any) => callback(state);
+    ipcRenderer.on("prompt-queue:changed", listener);
+    return () => ipcRenderer.removeListener("prompt-queue:changed", listener);
+  },
+  tabsList: () => ipcRenderer.invoke("tabs:list"),
+  tabsBootstrap: () => ipcRenderer.invoke("tabs:bootstrap"),
+  tabsNew: () => ipcRenderer.invoke("tabs:new"),
+  tabsSelect: (id:string) => ipcRenderer.invoke("tabs:select",id),
+  tabsClose: (id:string) => ipcRenderer.invoke("tabs:close",id),
+  tabsBusy: (busy:boolean) => ipcRenderer.invoke("tabs:busy",busy),
+  onTabsChanged: (callback:(state:any)=>void) => { const listener=(_event:Electron.IpcRendererEvent,state:any)=>callback(state);ipcRenderer.on("tabs:changed",listener);return ()=>ipcRenderer.removeListener("tabs:changed",listener); },
+
+  workspacesList: () => ipcRenderer.invoke("workspaces:list"),
+  workspaceInvoke: (lease: { workspaceId: string; generation: number }, channel: string, args: unknown[] = []) => ipcRenderer.invoke("workspace:invoke", { ...lease, channel, args }),
   version: () => ipcRenderer.invoke("app:version"),
   chooseProject: (options?: { defaultPath?: string }) => ipcRenderer.invoke("project:choose", options),
   getLastProjectDirectory: () => ipcRenderer.invoke("preferences:getLastProjectDirectory"),
@@ -57,6 +85,7 @@ contextBridge.exposeInMainWorld("neko", {
   refreshPreview: () => ipcRenderer.invoke("preview:refresh"),
   previewRoutes: (opts?: { force?: boolean }) => ipcRenderer.invoke("preview:routes", opts),
   previewNavigate: (routePath: string) => ipcRenderer.invoke("preview:navigate", routePath),
+  captureInternalPreview: () => ipcRenderer.invoke("preview:internalCapture"),
   setInternalPreviewOverlay: (active: boolean) => ipcRenderer.invoke("preview:internalOverlay", active),
   siteCloneAnalyze: (url: string, limits?: any) => ipcRenderer.invoke("siteClone:analyze", { url, limits }),
   siteCloneCapture: (url: string) => ipcRenderer.invoke("siteClone:capture", { url }),
@@ -69,7 +98,7 @@ contextBridge.exposeInMainWorld("neko", {
   validateBuild: () => ipcRenderer.invoke("project:validateBuild"),
   onEvent: (callback: (event: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("opencode:event", listener); return () => ipcRenderer.removeListener("opencode:event", listener); },
   onPreviewEvent: (callback: (event: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("preview:event", listener); return () => ipcRenderer.removeListener("preview:event", listener); },
-  githubStatus: (refresh = false) => ipcRenderer.invoke("github:status", refresh),
+  githubStatus: (refreshOrOptions?: boolean | { refresh?: boolean; projectPath?: string }) => ipcRenderer.invoke("github:status", refreshOrOptions),
   githubSelectAccount: (accountId: string, projectPath?: string) => ipcRenderer.invoke("github:selectAccount", { accountId, projectPath }),
   githubDisconnectAccount: (accountId: string) => ipcRenderer.invoke("github:disconnectAccount", { accountId }),
   githubStart: (forceReauthorize = false) => ipcRenderer.invoke("github:start", forceReauthorize),
@@ -84,7 +113,7 @@ contextBridge.exposeInMainWorld("neko", {
   githubChooseCloneDestination: () => ipcRenderer.invoke("github:chooseCloneDestination"),
   githubOpenFolder: (folderPath: string) => ipcRenderer.invoke("github:openFolder", folderPath),
   githubCloneProject: (repoFullName: string, parentPath?: string, projectName?: string) => ipcRenderer.invoke("github:cloneProject", { repoFullName, parentPath, projectName }),
-  githubPublishProject: (repoName: string, isPrivate = true) => ipcRenderer.invoke("github:publishProject", { repoName, private: isPrivate }),
+  githubPublishProject: (repoName: string, isPrivate = true, projectPath?: string, directPublish = false, accountId?: string) => ipcRenderer.invoke("github:publishProject", { repoName, private: isPrivate, projectPath, directPublish, accountId }),
   githubCancelPublish: () => ipcRenderer.invoke("github:cancelPublish"),
   githubAutoCommitTask: (payload?: { projectPath?: string; taskId?: string; message?: string } | string, legacyMessage?: string) => {
     if (typeof payload === "string") {
@@ -97,7 +126,7 @@ contextBridge.exposeInMainWorld("neko", {
   githubGetDefaultBranch: () => ipcRenderer.invoke("github:getDefaultBranch"),
   githubCommit: (message: string, files?: string[]) => ipcRenderer.invoke("github:commit", { message, files }),
   githubPush: () => ipcRenderer.invoke("github:push"),
-  githubCommitPush: (message: string, files?: string[]) => ipcRenderer.invoke("github:commitPush", { message, files }),
+  githubCommitPush: (message: string, files?: string[], projectPath?: string, directPublish = false) => ipcRenderer.invoke("github:commitPush", { message, files, projectPath, directPublish }),
   githubCreatePullRequest: (repoFullName: string, head: string, base: string, title: string, body: string) => ipcRenderer.invoke("github:createPullRequest", { repoFullName, head, base, title, body }),
   githubGetPullRequestStatus: (payload?: { repoFullName?: string; head?: string; base?: string; prNumber?: number }) => ipcRenderer.invoke("github:getPullRequestStatus", payload),
   githubListPullRequests: (payload?: { repoFullName?: string; page?: number; perPage?: number; state?: string }) => ipcRenderer.invoke("github:listPullRequests", payload),
@@ -115,7 +144,7 @@ contextBridge.exposeInMainWorld("neko", {
   githubFinalizeSync: (payload?: { projectPath?: string; message?: string }) => ipcRenderer.invoke("github:finalizeSync", payload),
   githubGetConflictDetails: (projectPath?: string) => ipcRenderer.invoke("github:getConflictDetails", projectPath),
   githubCheckAndRefreshConflicts: (projectPath?: string) => ipcRenderer.invoke("github:checkAndRefreshConflicts", projectPath),
-  githubCheckRepoAccess: (repoFullName: string) => ipcRenderer.invoke("github:checkRepoAccess", repoFullName),
+  githubCheckRepoAccess: (payloadOrName: string | { repoFullName: string; projectPath?: string; accountId?: string }) => ipcRenderer.invoke("github:checkRepoAccess", payloadOrName),
   onGithubEvent: (callback: (event: any) => void) => { const listener = (_event: Electron.IpcRendererEvent, data: any) => callback(data); ipcRenderer.on("github:event", listener); return () => ipcRenderer.removeListener("github:event", listener); },
   supabaseGetState: () => ipcRenderer.invoke("supabase:get-state"),
   supabaseConnectWithToken: (token: string) => ipcRenderer.invoke("supabase:connect-with-token", token),

@@ -1,13 +1,11 @@
 ---
 name: supabase-postgres-best-practices
-description: "Postgres best practices maintained by Supabase, for Postgres running anywhere. Load this skill BEFORE writing or changing anything that lives in a Postgres database: creating or altering tables and columns (including choosing column types), schema design, migrations and declarative schema files, RLS policies and the tests that verify them, indexes, triggers, database functions, queues and scheduled jobs (pg_cron, pgmq), vector/semantic search (pgvector), and restoring dumps (pg_restore) or importing data. Also load it when diagnosing slow queries, high CPU, timeouts, EXPLAIN plans, connection exhaustion, locking, bloat, or rows visible to the wrong user or tenant. This is not just a performance guide — schema, migration, security, and SQL authoring tasks need these rules too, even for a one-column change or a single query."
+description: "Otimização avançada de banco de dados PostgreSQL e Supabase: criação e alteração de tabelas, tipos de dados ideais, criação de índices (B-Tree, GIN, GiST), eliminação de N+1 queries, paginação por cursor, chaves estrangeiras indexadas, constraints seguras, full-text search e JSONB. Use quando o usuário disser 'banco de dados lento', 'queries demorando', 'criar tabela no Supabase', 'otimizar banco', 'adicionar índices', 'relacionamento entre tabelas', 'timeout no banco', 'modelagem de banco' ou 'postgres best practices'."
 license: MIT
 metadata:
   author: supabase
-  version: "1.1.1"
+  version: "1.2.0"
   organization: Supabase
-  date: January 2026
-  abstract: Comprehensive Postgres performance optimization guide for developers using Supabase and Postgres. Contains performance rules across 8 categories, prioritized by impact from critical (query performance, connection management) to incremental (advanced features). Each rule includes detailed explanations, incorrect vs. correct SQL examples, query plan analysis, and specific performance metrics to guide automated optimization and code generation.
 ---
 
 <!-- Adapted from the original open-source skill for an agent that only reads and edits project files: 16 of the rules are included (queries and indexes, schema design, data access, advanced features); connection management, monitoring, locking, partitioning and the security rules were left out, and the "Rule files" index was added from each rule's own title. License: see LICENSE.txt in this folder. -->
@@ -33,46 +31,49 @@ Reference these guidelines when:
 | 6 | Data Access Patterns | MEDIUM | `data-` |
 | 8 | Advanced Features | LOW | `advanced-` |
 
-## How to Use
+## Como Consultar os Playbooks Técnicos
 
-Read individual rule files for detailed explanations and SQL examples:
+Consulte os playbooks detalhados diretamente em seus caminhos no projeto:
 
-```
-references/query-missing-indexes.md
-references/query-partial-indexes.md
-```
+- `.agents/skills/supabase-postgres-best-practices/references/query-missing-indexes.md` — Adicionar índices em colunas de WHERE e JOIN (CRITICAL)
+- `.agents/skills/supabase-postgres-best-practices/references/query-composite-indexes.md` — Índices compostos para queries multicoluna (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/query-covering-indexes.md` — Índices de cobertura (INCLUDE) para evitar lookups (MEDIUM-HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/query-index-types.md` — Selecionar o tipo de índice ideal (B-Tree, GIN, GiST, BRIN) (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/query-partial-indexes.md` — Índices parciais com filtro WHERE (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/schema-primary-keys.md` — Estratégia ótima de Primary Key (UUID vs BIGINT) (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/schema-data-types.md` — Escolha ideal de tipos de dados (TIMESTAMPTZ, TEXT, NUMERIC) (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/schema-constraints.md` — Adição segura de constraints em migrações (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/schema-foreign-key-indexes.md` — Indexar colunas de Foreign Keys (HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/schema-lowercase-identifiers.md` — Identificadores em minúsculas (snake_case) (MEDIUM)
+- `.agents/skills/supabase-postgres-best-practices/references/data-n-plus-one.md` — Eliminar N+1 com batching ou JOINs no Supabase (MEDIUM-HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/data-pagination.md` — Paginação por cursor em vez de OFFSET elevado (MEDIUM-HIGH)
+- `.agents/skills/supabase-postgres-best-practices/references/data-batch-inserts.md` — Inserções em lote para alta performance (MEDIUM)
+- `.agents/skills/supabase-postgres-best-practices/references/data-upsert.md` — ON CONFLICT DO UPDATE (UPSERT) (MEDIUM)
+- `.agents/skills/supabase-postgres-best-practices/references/advanced-jsonb-indexing.md` — Índices GIN em colunas JSONB (MEDIUM)
+- `.agents/skills/supabase-postgres-best-practices/references/advanced-full-text-search.md` — Busca textual eficiente com tsvector e índices GIN (MEDIUM)
 
-Each rule file contains:
-- Brief explanation of why it matters
-- Incorrect SQL example with explanation
-- Correct SQL example with explanation
-- Optional EXPLAIN output or metrics
-- Additional context and references
-- Supabase-specific notes (when applicable)
+---
 
-## Rule files
+## Ciclo de Execução de Engenharia
 
-- `references/query-missing-indexes.md` — Add Indexes on WHERE and JOIN Columns (CRITICAL)
-- `references/query-composite-indexes.md` — Create Composite Indexes for Multi-Column Queries (HIGH)
-- `references/query-covering-indexes.md` — Use Covering Indexes to Avoid Table Lookups (MEDIUM-HIGH)
-- `references/query-index-types.md` — Choose the Right Index Type for Your Data (HIGH)
-- `references/query-partial-indexes.md` — Use Partial Indexes for Filtered Queries (HIGH)
-- `references/schema-primary-keys.md` — Select Optimal Primary Key Strategy (HIGH)
-- `references/schema-data-types.md` — Choose Appropriate Data Types (HIGH)
-- `references/schema-constraints.md` — Add Constraints Safely in Migrations (HIGH)
-- `references/schema-foreign-key-indexes.md` — Index Foreign Key Columns (HIGH)
-- `references/schema-lowercase-identifiers.md` — Use Lowercase Identifiers for Compatibility (MEDIUM)
-- `references/data-n-plus-one.md` — Eliminate N+1 Queries with Batch Loading (MEDIUM-HIGH)
-- `references/data-pagination.md` — Use Cursor-Based Pagination Instead of OFFSET (MEDIUM-HIGH)
-- `references/data-batch-inserts.md` — Batch INSERT Statements for Bulk Data (MEDIUM)
-- `references/data-upsert.md` — Use UPSERT for Insert-or-Update Operations (MEDIUM)
-- `references/advanced-jsonb-indexing.md` — Index JSONB Columns for Efficient Querying (MEDIUM)
-- `references/advanced-full-text-search.md` — Use tsvector for Full-Text Search (MEDIUM)
+Ao criar ou otimizar estruturas no Postgres/Supabase:
 
-## References
+1. **Inspecionar:**
+   - Inspecione as migrações existentes em `supabase/migrations/` e queries no código frontend/backend.
+   - Identifique consultas lentas, colunas de Foreign Key não indexadas (`REFERENCES`) e ausência de índices em filtros frequentes.
 
-- https://www.postgresql.org/docs/current/
-- https://supabase.com/docs
-- https://wiki.postgresql.org/wiki/Performance_Optimization
-- https://supabase.com/docs/guides/database/overview
-- https://supabase.com/docs/guides/auth/row-level-security
+2. **Planejar:**
+   - Projete a alteração em SQL compatível com Postgres (usar snake_case, tipos explícitos como `timestamptz`).
+   - Se for adicionar índices em tabelas em produção, planeje o uso de `CREATE INDEX IF NOT EXISTS`.
+
+3. **Implementar:**
+   - Crie uma migração SQL versionada em `supabase/migrations/<timestamp>_<nome>.sql`.
+   - Adicione chaves estrangeiras com índices explícitos na tabela de origem.
+   - Para JSONB, crie índices GIN específicos (`jsonb_path_ops`).
+
+4. **Validar:**
+   - Verifique a sintaxe SQL e cheque se a migração pode ser executada sem travar o banco ou quebrar schemas existentes.
+   - Assegure que as chamadas client-side (via Supabase JS) utilizam `.select('..., foreign_table(...)')` corretamente sem induzir N+1.
+
+5. **Reportar:**
+   - Documente a migração SQL gerada, índices criados e o ganho esperado de eficiência nas consultas.

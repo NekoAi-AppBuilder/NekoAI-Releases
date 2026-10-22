@@ -1,3 +1,4 @@
+import { WorkspaceObjects, serializedObject } from "../workspaces/workspace-objects";
 import electron from "electron";
 import type { BrowserWindow as ElectronBrowserWindow } from "electron";
 type BrowserWindow = ElectronBrowserWindow;
@@ -766,6 +767,14 @@ export class LovableCloudManager extends EventEmitter {
     }
   }
 
+  public shutdown(): void {
+    ++this.projectGeneration;
+    if (this.sessionProbeInterval) clearInterval(this.sessionProbeInterval);
+    this.sessionProbeInterval = null;
+    if (this.loginWindow && !this.loginWindow.isDestroyed()) this.loginWindow.close();
+    this.loginWindow = null;
+  }
+
   public getActiveProjectPath(): string | null {
     return this.activeProjectPath;
   }
@@ -1021,4 +1030,5 @@ export class LovableCloudManager extends EventEmitter {
   }
 }
 
-export const lovableCloudManager = new LovableCloudManager();
+const sharedVault = serializedObject(new LovableVaultManager());
+export const lovableCloudManager = new WorkspaceObjects(() => new LovableCloudManager(sharedVault), { events: ["state-changed"], dispose: object => object.shutdown() }).proxy;

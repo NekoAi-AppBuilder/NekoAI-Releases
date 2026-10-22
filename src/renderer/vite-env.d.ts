@@ -1,7 +1,27 @@
 /// <reference types="vite/client" />
 
+type WorkspaceTabsSnapshot = import("../shared/workspace-tabs").WorkspaceTabsSnapshot;
+
 interface Window {
   neko: {
+    openingProjectPath: string | null;
+    conversationsList(): Promise<import("../shared/conversations").ConversationSummary[]>;
+    conversationsSave(payload: import("../shared/conversations").ConversationSave): Promise<void>;
+    conversationsOpen(id?: string, fresh?: boolean): Promise<import("../shared/conversations").OpenConversation>;
+    promptQueueState(): Promise<import("../shared/prompt-queue").PromptQueueGateState>;
+    promptQueuePause(): Promise<import("../shared/prompt-queue").PromptQueueGateState>;
+    promptQueueResume(revision: number): Promise<import("../shared/prompt-queue").PromptQueueGateState>;
+    promptQueueDispatch(payload: import("../shared/prompt-queue").QueuedPromptRequest, revision: number): Promise<any>;
+    onPromptQueueChanged(callback: (state: import("../shared/prompt-queue").PromptQueueGateState) => void): () => void;
+    tabsList: () => Promise<WorkspaceTabsSnapshot>;
+      tabsBootstrap: () => Promise<{projectPath:string;source:string}|null>;
+      tabsNew: () => Promise<string>;
+      tabsSelect: (id:string) => Promise<boolean>;
+      tabsClose: (id:string) => Promise<boolean>;
+      tabsBusy: (busy:boolean) => Promise<void>;
+      onTabsChanged: (callback:(state:WorkspaceTabsSnapshot)=>void) => () => void;
+      workspacesList(): Promise<{ workspaceId: string; generation: number; projectPath: string; projectKey: string; sessionIds: readonly string[] }[]>;
+    workspaceInvoke(lease: { workspaceId: string; generation: number }, channel: string, args?: unknown[]): Promise<any>;
     version(): Promise<string>;
     chooseProject(options?: { defaultPath?: string }): Promise<string | null>;
     getLastProjectDirectory?(): Promise<string | null>;
@@ -46,6 +66,7 @@ interface Window {
     refreshPreview(): Promise<{ ok: boolean; method?: string; reason?: string }>;
     previewRoutes(opts?: { force?: boolean }): Promise<{ routes: { path: string; label: string }[]; projectPath: string }>;
     previewNavigate(routePath: string): Promise<{ ok: boolean; target: string; method?: string }>;
+    captureInternalPreview(): Promise<{ dataUrl: string; bounds: { x: number; y: number; width: number; height: number }; zoomFactor: number } | null>;
     setInternalPreviewOverlay(active: boolean): Promise<{ ok: boolean; visible?: boolean }>;
     siteCloneAnalyze(url: string, limits?: { maxPages?: number; maxDepth?: number; concurrency?: number; pageTimeoutMs?: number; maxPageBytes?: number; crawlTimeoutMs?: number }): Promise<any>;
     siteCloneCapture(url: string): Promise<any>;
@@ -58,14 +79,14 @@ interface Window {
     validateBuild(): Promise<{ ok: boolean; skipped: boolean; message: string; output: string }>;
     onEvent(callback: (event: any) => void): () => void;
     onPreviewEvent(callback: (event: any) => void): () => void;
-    githubStatus(refresh?: boolean): Promise<any>;
+    githubStatus(refreshOrOptions?: boolean | { refresh?: boolean; projectPath?: string }): Promise<any>;
     githubSelectAccount?(accountId: string, projectPath?: string): Promise<any>;
     githubDisconnectAccount?(accountId: string): Promise<any>;
     githubStart(forceReauthorize?: boolean): Promise<any>;
     githubCancel(): Promise<{ ok: boolean }>;
     githubDisconnect(): Promise<boolean>;
     githubOpen(url: string): Promise<boolean>;
-    githubGitStatus(): Promise<any>;
+    githubGitStatus(projectPath?: string): Promise<any>;
     githubListBranches(repoFullName: string): Promise<string[]>;
     githubCheckoutBranch(branchName: string): Promise<any>;
     githubCreateBranch(name: string, baseBranch?: string): Promise<any>;
@@ -73,11 +94,11 @@ interface Window {
     githubChooseCloneDestination(): Promise<any>;
     githubOpenFolder(folderPath: string): Promise<boolean>;
     githubCloneProject(repoFullName: string, parentPath?: string, projectName?: string): Promise<any>;
-    githubPublishProject(repoName: string, isPrivate?: boolean): Promise<any>;
+    githubPublishProject(repoName: string, isPrivate?: boolean, projectPath?: string, directPublish?: boolean, accountId?: string): Promise<any>;
     githubCancelPublish?(): Promise<any>;
     githubCommit?(message: string, files?: string[]): Promise<any>;
     githubPush?(): Promise<any>;
-    githubCommitPush(message: string, files?: string[]): Promise<any>;
+    githubCommitPush(message: string, files?: string[], projectPath?: string, directPublish?: boolean): Promise<any>;
     githubAutoCommitTask?(payload?: { projectPath?: string; taskId?: string; message?: string } | string, legacyMessage?: string): Promise<{ ok: boolean; committed?: boolean; pushed?: boolean; status?: any; message?: string; skipped?: boolean; reason?: string }>;
     githubGetAutoCommit?(projectPath?: string): Promise<boolean>;
     githubSetAutoCommit?(projectPath: string, enabled: boolean): Promise<{ ok: boolean; enabled: boolean }>;
@@ -93,7 +114,7 @@ interface Window {
     githubFinalizeSync?(payload?: { projectPath?: string; message?: string }): Promise<any>;
     githubGetConflictDetails?(projectPath?: string): Promise<any[]>;
     githubCheckAndRefreshConflicts?(projectPath?: string): Promise<{ ok: boolean; hasConflicts: boolean; conflictFiles: any[]; remoteUpdated: boolean; message?: string }>;
-    githubCheckRepoAccess?(repoFullName: string): Promise<{ accessible: boolean; status: number }>;
+    githubCheckRepoAccess?(payloadOrName: string | { repoFullName: string; projectPath?: string; accountId?: string }): Promise<{ accessible: boolean; canWrite?: boolean; status: number; permissions?: any; private?: boolean }>;
     supabaseGetState(): Promise<any>;
     supabaseConnectWithToken(token: string): Promise<any>;
     supabaseRefreshProjects(clearNotice?: boolean): Promise<any>;

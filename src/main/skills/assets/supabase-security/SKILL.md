@@ -1,10 +1,10 @@
 ---
 name: supabase-security
-description: "Supabase security checklist: Row Level Security and policies, auth claims and sessions, API keys in the client, views, SECURITY DEFINER functions, Data API exposure and storage access. Use when the task touches auth, RLS, policies, user data or storage, when data is visible to the wrong user or not visible at all, or when asked to review or harden the security of a Supabase project."
+description: "Auditoria e correção profunda de segurança Supabase: Row Level Security (RLS) e policies, auth claims e sessões, service_role/anon keys no frontend, views com security_invoker, funções SECURITY DEFINER, exposição da Data API e storage buckets. Use quando o usuário pedir 'proteger meu banco', 'dados vazando', 'qualquer um consegue ver os dados', 'erro de permissão no Supabase', 'configurar RLS', 'proteger tabelas', 'usuário acessando dados de outro', 'bloquear acesso anônimo', 'security definer', 'storage público', 'chave exposta' ou 'harden Supabase security'."
 license: MIT
 metadata:
   author: supabase
-  version: "0.1.2"
+  version: "0.2.0"
 ---
 
 <!-- Adapted from the original open-source skill for an agent that only reads and edits project files: only the principles and the security checklist of the official Supabase skill were kept (CLI, MCP server, documentation lookup and migration workflow were removed), plus one reference from the official Postgres best-practices skill. License: see LICENSE.txt in this folder. -->
@@ -67,6 +67,32 @@ When working on any Supabase task that touches auth, RLS, views, storage, or use
 - **Storage access control**
   - **Storage upsert requires INSERT + SELECT + UPDATE.** Granting only INSERT allows new uploads but file replacement (upsert) silently fails. You need all three.
 
-## Reference Guides
+- **RLS performance** → [.agents/skills/supabase-security/references/security-rls-performance.md](.agents/skills/supabase-security/references/security-rls-performance.md)
 
-- **RLS performance** → [references/security-rls-performance.md](references/security-rls-performance.md)
+---
+
+## Ciclo de Execução de Engenharia
+
+Ao receber qualquer tarefa de segurança Supabase, execute o ciclo completo:
+
+1. **Inspecionar:**
+   - Verifique o schema do banco e migrações em `supabase/migrations/` (ou schemas locais).
+   - Inspecione variáveis de ambiente frontend (`.env`, `.env.local`): garanta que **nunca** existam chaves `service_role` expostas como `VITE_SUPABASE_SERVICE_ROLE` ou `NEXT_PUBLIC_SUPABASE_SERVICE_ROLE`.
+   - Identifique quais tabelas têm RLS ativado e quais policies existem.
+
+2. **Planejar:**
+   - Mapeie quem deve ler, criar, alterar e deletar cada registro (owner, membros da organização, admin ou público).
+   - Para updates, planeje tanto o predicado `USING` (quais linhas podem ser selecionadas para update) quanto `WITH CHECK` (quais novos valores são permitidos).
+
+3. **Implementar:**
+   - Crie uma migração SQL clara e idempotente em `supabase/migrations/<timestamp>_<desc>.sql` ou aplique conforme o padrão do projeto.
+   - Ative RLS explicitamente: `ALTER TABLE <nome> ENABLE ROW LEVEL SECURITY;`.
+   - Crie policies específicas por operação (SELECT, INSERT, UPDATE, DELETE) usando `TO authenticated` ou `TO anon` em vez do deprecado `auth.role()`.
+   - Em views expostas, garanta `WITH (security_invoker = true)`.
+
+4. **Validar:**
+   - Verifique a sintaxe SQL e cheque se não há recursão infinita em policies que consultam a mesma tabela (leia o guia de performance RLS).
+   - Confirme que queries autenticadas filtram por `(select auth.uid()) = user_id` de forma sargable com índices.
+
+5. **Reportar:**
+   - Descreva as tabelas protegidas, políticas aplicadas e garantias de isolamento de dados verificadas.

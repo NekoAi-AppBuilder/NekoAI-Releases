@@ -335,3 +335,200 @@ describe("Agent Skills — Resiliência do Painel, Filtros e Fonte de Dados dos 
   });
 });
 
+describe("Agent Skills — Resolução de Referências e Playbooks Internos", () => {
+  let tempDir: string;
+  let manager: SkillsManager;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "neko-skills-ref-test-"));
+    manager = new SkillsManager();
+    manager.setProject(tempDir);
+  });
+
+  afterEach(async () => {
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  it("deve garantir que todos os links .agents/skills/<id>/ nos 10 SKILL.md apontem para arquivos reais existentes", async () => {
+    // Instala todas as 10 skills no projeto de teste
+    for (const skill of OFFICIAL_SKILLS_CATALOG) {
+      await manager.installSkill(skill.id, tempDir);
+    }
+
+    let totalLinksChecked = 0;
+
+    for (const skill of OFFICIAL_SKILLS_CATALOG) {
+      const skillMdPath = path.join(tempDir, ".agents", "skills", skill.id, "SKILL.md");
+      const content = await fs.readFile(skillMdPath, "utf8");
+
+      // Encontrar todas as ocorrências de caminhos .agents/skills/
+      const regex = /\.agents\/skills\/([a-zA-Z0-9_\-./]+)/g;
+      let match;
+      while ((match = regex.exec(content)) !== null) {
+        // Remover âncoras # caso existam
+        const matchedPath = match[0].split("#")[0].replace(/[)\]'",;]+$/, "");
+        const targetFullPath = path.join(tempDir, matchedPath);
+        const exists = fsSync.existsSync(targetFullPath);
+        expect(exists).toBe(true);
+        totalLinksChecked++;
+      }
+    }
+
+    // Deve ter verificado pelo menos 25 referências técnicas nos playbooks
+    expect(totalLinksChecked).toBeGreaterThanOrEqual(25);
+  });
+
+  it("não deve conter caminhos relativos órfãos (ex: 'references/' sem o prefixo .agents/skills)", async () => {
+    const assetsDir = path.resolve(__dirname, "../src/main/skills/assets");
+    for (const skill of OFFICIAL_SKILLS_CATALOG) {
+      const skillMdPath = path.join(assetsDir, skill.id, "SKILL.md");
+      const content = await fs.readFile(skillMdPath, "utf8");
+
+      // Buscar markdown links do tipo ](references/ ou ](rules/ sem o prefixo .agents/skills
+      const unescapedRelLinkRegex = /\]\((?!https?:\/\/)(?!#)(?!mailto)(references\/|rules\/)/g;
+      const unescapedMatches = content.match(unescapedRelLinkRegex);
+      expect(unescapedMatches).toBeNull();
+    }
+  });
+});
+
+describe("Agent Skills — Descoberta de Contexto e Mapeamento de Intenção (OpenCode native)", () => {
+  let tempDir: string;
+  let manager: SkillsManager;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "neko-skills-context-test-"));
+    manager = new SkillsManager();
+    manager.setProject(tempDir);
+  });
+
+  afterEach(async () => {
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  it("deve retornar array vazio de IDs e contexto vazio quando nenhuma skill estiver instalada", async () => {
+    const ids = await manager.getInstalledSkillIds(tempDir);
+    expect(ids).toEqual([]);
+
+    const context = await manager.getInstalledSkillsContext(tempDir);
+    expect(context).toBeNull();
+  });
+
+  it("deve injetar briefing semântico somente para skills instaladas com gatilhos em português e inglês", async () => {
+    await manager.installSkill("frontend-design", tempDir);
+    await manager.installSkill("supabase-security", tempDir);
+
+    const ids = await manager.getInstalledSkillIds(tempDir);
+    expect(ids).toEqual(["frontend-design", "supabase-security"]);
+
+    const context = await manager.getInstalledSkillsContext(tempDir);
+    expect(context).toContain("ESPECIALIDADES DO PROJETO (AGENT SKILLS INSTALADAS EM .agents/skills/):");
+    expect(context).toContain("frontend-design");
+    expect(context).toContain("supabase-security");
+    expect(context).toContain(".agents/skills/<id>/SKILL.md");
+
+    // Gatilhos de linguagem natural em português
+    expect(context.includes("site parece amador") || context.includes("Anti-AI-slop")).toBe(true);
+    expect(context.includes("proteger dados") || context.includes("RLS") || context.includes("vazamento de dados")).toBe(true);
+
+    // Não deve conter skills que não foram instaladas
+    expect(context).not.toContain("supabase-postgres-best-practices");
+    expect(context).not.toContain("core-web-vitals");
+  });
+
+  it("deve manter o briefing de contexto conciso sem estourar limite de tokens", async () => {
+    // Instala todas as 10 skills
+    for (const skill of OFFICIAL_SKILLS_CATALOG) {
+      await manager.installSkill(skill.id, tempDir);
+    }
+
+    const context = await manager.getInstalledSkillsContext(tempDir);
+    // Deve ser um briefing compacto com menos de 3.500 caracteres
+    expect(context.length).toBeLessThan(3500);
+    expect(context.length).toBeGreaterThan(500);
+  });
+});
+
+describe("Agent Skills — Avaliação de Qualidade Comparativa (10 Cenários Reais)", () => {
+  it("Cenário 1 (Design): 'meu site parece amador' — elimina limitações artificiais e aplica princípios anti-slop", async () => {
+    const design = getSkillDefinition("frontend-design");
+    expect(design).toBeDefined();
+    // Limite artificial removido do prompt
+    expect(design?.usar.prompt.includes("no máximo 3 arquivos")).toBe(false);
+    expect(design?.usar.prompt.includes("no máximo")).toBe(false);
+    expect(design?.usar.prompt.includes("(1) inspecione")).toBe(true);
+    expect(design?.usar.prompt.includes("(4) valide")).toBe(true);
+
+    const designMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/frontend-design/SKILL.md"), "utf8");
+    expect(designMd).toContain("Anti-AI-Slop");
+    expect(designMd).toContain("Inspecione o Projeto");
+    expect(designMd).toContain("Valide a Responsividade");
+  });
+
+  it("Cenário 2 (SEO): 'dados estruturados e metatags' — referências JSON-LD e tags sociais resolvidas", async () => {
+    const seoMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/seo/SKILL.md"), "utf8");
+    expect(seoMd).toContain(".agents/skills/seo/references/STRUCTURED-DATA.md");
+    expect(seoMd).toContain("Ciclo de Execução de Engenharia");
+  });
+
+  it("Cenário 3 (Segurança): 'usuário acessando dados de outro' — auditoria RLS e ciclo de migração segura", async () => {
+    const secMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/supabase-security/SKILL.md"), "utf8");
+    expect(secMd).toContain(".agents/skills/supabase-security/references/security-rls-performance.md");
+    expect(secMd).toContain("Ciclo de Execução de Engenharia");
+    expect(secMd).toContain("service_role");
+  });
+
+  it("Cenário 4 (Performance React): 'react travando ao digitar' — playbooks Vercel e ciclo de otimização", async () => {
+    const perfMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/react-best-practices/SKILL.md"), "utf8");
+    expect(perfMd).toContain(".agents/skills/react-best-practices/rules/async-parallel.md");
+    expect(perfMd).toContain(".agents/skills/react-best-practices/rules/rerender-memo.md");
+    expect(perfMd).toContain("Ciclo de Execução de Engenharia");
+  });
+
+  it("Cenário 5 (Acessibilidade): 'revisar acessibilidade da interface' — remediação ativa em vez de relatório passivo", async () => {
+    const a11yMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/web-design-guidelines/SKILL.md"), "utf8");
+    expect(a11yMd).toContain("corrija ativamente");
+    expect(a11yMd).toContain("Ciclo de Execução de Engenharia");
+    expect(a11yMd).toContain("focus-visible");
+  });
+
+  it("Cenário 6 (Textos): 'copy fraca e parece texto de robô' — eliminação de AI slop e referências a frameworks", async () => {
+    const copyMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/copywriting/SKILL.md"), "utf8");
+    expect(copyMd).toContain(".agents/skills/copywriting/references/copy-frameworks.md");
+    expect(copyMd).toContain(".agents/skills/copywriting/references/ai-tells.md");
+    expect(copyMd).toContain("Ciclo de Execução de Engenharia");
+  });
+
+  it("Cenário 7 (Conversão): 'página não converte e taxa baixa' — proposta de valor e referência de formulários", async () => {
+    const croMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/cro/SKILL.md"), "utf8");
+    expect(croMd).toContain(".agents/skills/cro/references/form.md");
+    expect(croMd).toContain("Ciclo de Execução de Engenharia");
+  });
+
+  it("Cenário 8 (Cadastro): 'login confuso e abandono de signup' — UX Supabase Auth e mensagens humanizadas", async () => {
+    const signupMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/signup/SKILL.md"), "utf8");
+    expect(signupMd).toContain("Boas Práticas com Supabase Auth");
+    expect(signupMd).toContain("Ciclo de Execução de Engenharia");
+  });
+
+  it("Cenário 9 (Banco de Dados): 'queries lentas no Postgres' — 16 playbooks técnicos e migrações seguras", async () => {
+    const pgMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/supabase-postgres-best-practices/SKILL.md"), "utf8");
+    expect(pgMd).toContain(".agents/skills/supabase-postgres-best-practices/references/query-missing-indexes.md");
+    expect(pgMd).toContain(".agents/skills/supabase-postgres-best-practices/references/data-n-plus-one.md");
+    expect(pgMd).toContain("Ciclo de Execução de Engenharia");
+  });
+
+  it("Cenário 10 (Carregamento): 'layout pulando e CLS ruim' — playbooks Core Web Vitals e dimensões explícitas", async () => {
+    const cwvMd = await fs.readFile(path.resolve(__dirname, "../src/main/skills/assets/core-web-vitals/SKILL.md"), "utf8");
+    expect(cwvMd).toContain(".agents/skills/core-web-vitals/references/LCP.md");
+    expect(cwvMd).toContain(".agents/skills/core-web-vitals/references/CLS.md");
+    expect(cwvMd).toContain(".agents/skills/core-web-vitals/references/INP.md");
+    expect(cwvMd).toContain("Ciclo de Execução de Engenharia");
+  });
+});
+
+

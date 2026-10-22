@@ -1,6 +1,7 @@
 import { createHighlighterCore, type HighlighterCore } from "shiki/core";
 import { createJavaScriptRegexEngine } from "@shikijs/engine-javascript";
 import themeDarkPlus from "@shikijs/themes/dark-plus";
+import themeLightPlus from "@shikijs/themes/light-plus";
 import langHtml from "@shikijs/langs/html";
 import langCss from "@shikijs/langs/css";
 import langJs from "@shikijs/langs/javascript";
@@ -57,7 +58,7 @@ let highlighterPromise: Promise<HighlighterCore> | null = null;
 function getHighlighter(): Promise<HighlighterCore> {
   if (!highlighterPromise) {
     highlighterPromise = createHighlighterCore({
-      themes: [themeDarkPlus],
+      themes: [themeDarkPlus, themeLightPlus],
       langs: [
         langHtml,
         langCss,
@@ -86,23 +87,24 @@ function getHighlighter(): Promise<HighlighterCore> {
 // Inicia o singleton do highlighter de imediato em background
 void getHighlighter().catch(() => {});
 
-export function tokenizePlainFallback(code: string): CodeLineTokens[] {
+export function tokenizePlainFallback(code: string, theme: "dark" | "light" = "dark"): CodeLineTokens[] {
   const rawLines = code.split(/\r?\n/);
-  return rawLines.map((line) => [{ content: line || " ", color: "#d4d4d4" }]);
+  return rawLines.map((line) => [{ content: line || " ", color: theme === "light" ? "#211a2d" : "#d4d4d4" }]);
 }
 
 const tokenCache = new Map<string, { content: string; lines: CodeLineTokens[] }>();
 
-export async function tokenizeCode(filePath: string, code: string): Promise<CodeLineTokens[]> {
-  const cached = tokenCache.get(filePath);
+export async function tokenizeCode(filePath: string, code: string, theme: "dark" | "light" = "dark"): Promise<CodeLineTokens[]> {
+  const cacheKey = `${theme}:${filePath}`;
+  const cached = tokenCache.get(cacheKey);
   if (cached && cached.content === code) {
     return cached.lines;
   }
 
   const lang = getLanguageForFile(filePath);
   if (!lang) {
-    const plainLines = tokenizePlainFallback(code);
-    tokenCache.set(filePath, { content: code, lines: plainLines });
+    const plainLines = tokenizePlainFallback(code, theme);
+    tokenCache.set(cacheKey, { content: code, lines: plainLines });
     return plainLines;
   }
 
@@ -110,26 +112,26 @@ export async function tokenizeCode(filePath: string, code: string): Promise<Code
     const highlighter = await getHighlighter();
     const result = highlighter.codeToTokens(code, {
       lang,
-      theme: "dark-plus"
+      theme: theme === "light" ? "light-plus" : "dark-plus"
     });
 
     const lines: CodeLineTokens[] = result.tokens.map((tokenLine) => {
       if (tokenLine.length === 0) {
-        return [{ content: " ", color: "#d4d4d4" }];
+        return [{ content: " ", color: theme === "light" ? "#211a2d" : "#d4d4d4" }];
       }
       return tokenLine.map((tok) => ({
         content: tok.content,
-        color: tok.color || "#d4d4d4",
+        color: tok.color || (theme === "light" ? "#211a2d" : "#d4d4d4"),
         fontStyle: tok.fontStyle
       }));
     });
 
-    tokenCache.set(filePath, { content: code, lines });
+    tokenCache.set(cacheKey, { content: code, lines });
     return lines;
   } catch (err) {
     console.warn("[Neko/Highlighter] Erro de tokenização em", filePath, err);
-    const plain = tokenizePlainFallback(code);
-    tokenCache.set(filePath, { content: code, lines: plain });
+    const plain = tokenizePlainFallback(code, theme);
+    tokenCache.set(cacheKey, { content: code, lines: plain });
     return plain;
   }
 }

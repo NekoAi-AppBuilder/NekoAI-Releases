@@ -12,9 +12,11 @@ export interface UpdaterState {
 
 class NekoUpdaterManager {
   private window: BrowserWindow | null = null;
+  private stateSender: ((state:UpdaterState)=>void)|null=null;
+  public setStateSender(sender:(state:UpdaterState)=>void){this.stateSender=sender;}
   private state: UpdaterState = {
     status: "idle",
-    currentVersion: app.getVersion() || "0.5.3",
+    currentVersion: app.getVersion(),
     updateInfo: null,
     progress: null,
     error: null,
@@ -23,7 +25,7 @@ class NekoUpdaterManager {
 
   public initialize(window: BrowserWindow | null) {
     this.window = window;
-    this.state.currentVersion = app.getVersion() || "0.5.3";
+      this.state.currentVersion = app.getVersion();
 
     try {
       // Configurações do autoUpdater
@@ -52,6 +54,7 @@ class NekoUpdaterManager {
   }
 
   private emitState() {
+    if(this.stateSender){this.stateSender(this.getState());return;}
     if (this.window && !this.window.isDestroyed()) {
       this.window.webContents.send("updater:state-changed", this.getState());
     }

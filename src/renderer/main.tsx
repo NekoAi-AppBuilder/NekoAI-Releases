@@ -1,3 +1,10 @@
+import { ConversationTools, type ConversationTool } from "./components/ConversationTools";
+import { ConversationHistoryPanel } from "./components/ConversationHistoryPanel";
+import { useConversationHistory } from "./conversations/useConversationHistory";
+import type { ConversationMessage } from "../shared/conversations";
+import { ProjectTabs } from "./components/ProjectTabs";
+import { PromptQueue, type PromptQueueGateState, type QueuedPromptRequest } from "../shared/prompt-queue";
+import type { WorkspaceTabsSnapshot } from "../shared/workspace-tabs";
 import React from "react";
 import nekoLogo from "./assets/nekoai-logo.png";
 import { createRoot } from "react-dom/client";
@@ -7,7 +14,7 @@ import {
   ExternalLink, Eye, EyeOff, FileCode2, Folder, FolderOpen, Globe2, Loader2, Maximize2,
   Menu, Monitor, MoreHorizontal, MoreVertical, PanelLeft, PanelLeftClose, PanelLeftOpen, Plus, RefreshCw, Search, Send,
   Settings2, Smartphone, Sparkles, SquareTerminal, Tablet, X, Zap, Paperclip, Image as ImageIcon, FileText, AtSign, Square, ShieldAlert, Copy, Undo2, Pencil, ExternalLink as ExternalLinkIcon, Unplug, Unlink, Link2, GitBranch, GitCommit, GitPullRequest, GitMerge, AlertTriangle, FolderPlus, Lock, Star, LogOut, Home as HomeIcon, Trash2, CloudUpload, CheckCircle2, Play, Volume2,
-  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info, Mic, MicOff, BarChart2, MicAudioLines
+  Key, ShieldCheck, Laptop, Calendar, BadgeCheck, Database, Minus, Info, Mic, MicOff, BarChart2, MicAudioLines, Sun, Moon
 } from "lucide-react";
 import providerSprite from "./assets/opencode-provider-sprite.svg?raw";
 import { getModelCapabilities } from "../shared/vision";
@@ -318,6 +325,7 @@ function ProviderIconSprite() {
 }
 
 import "./styles.css";
+import "./studio-design.css";
 
 type Model = {
   providerID: string;
@@ -585,7 +593,7 @@ function formatProjectActivity(item: RecentProject): string {
 }
 
 type Node = { name: string; path: string; type: "file" | "directory"; children?: Node[] };
-type Message = { role: "user" | "assistant" | "system" | "error"; text: string; attachments?: Attachment[]; taskId?: string; durationMs?: number; createdAt?: number };
+type Message = ConversationMessage;
 type PendingPlan = { request: string; attachments: Attachment[]; contextPaths: string[]; planText: string; messageCreatedAt: number; requestId?: string; taskId?: string; sessionID?: string; options?: string[]; planFilePath?: string };
 type ApprovedPlan = { planText: string; approvedAt: number; messageCreatedAt: number };
 type Activity = { id: string; icon: "brain" | "tool" | "file" | "command" | "status" | "check" | "error" | "wait"; title: string; detail?: string; state: "running" | "done" | "error"; ts: number };
@@ -595,6 +603,12 @@ type PermissionRequest = { id: string; sessionID: string; permission: string; pa
 // exactly where it stopped.
 type AgentQuestion = { taskId: string; sessionID: string; questionId: string; question: string; options?: string[]; allowFreeText: boolean; requestId?: string; isNativeTool?: boolean };
 type Attachment = { path: string; name: string; mime: string; size: number; url?: string; previewUrl?: string; kind: "image" | "document" | "text"; extension?: string };
+type QueuedComposerPrompt = {
+  id: string; sessionId: string; projectPath: string;
+  text: string; displayText: string; attachments: Attachment[];
+  selectedModel?: { providerID: string; modelID: string };
+  request: QueuedPromptRequest;
+};
 type SlashCommand = { name?: string; description?: string };
 // Console de runtime do Preview (console.log/info/warn/error/debug do projeto).
 type ConsoleLevel = "log" | "info" | "warn" | "error" | "debug";
@@ -1293,6 +1307,19 @@ function App() {
   }, []);
 
   const [project, setProject] = React.useState<string | null>(null);
+  const [openingProjectPath, setOpeningProjectPath] = React.useState<string | null>(() => window.neko.openingProjectPath || null);
+  const [openingProjectError, setOpeningProjectError] = React.useState<string | null>(null);
+  const studioProjectPath = project || openingProjectPath;
+
+  const [projectTabs, setProjectTabs] = React.useState<WorkspaceTabsSnapshot | null>(null);
+  React.useEffect(() => {
+    let mounted = true;
+    const update = (snapshot: WorkspaceTabsSnapshot) => { if (mounted) setProjectTabs(snapshot); };
+    const unsubscribe = window.neko.onTabsChanged(update);
+    void window.neko.tabsList().then(update).catch(error => console.warn("[Project tabs]", error));
+    return () => { mounted = false; unsubscribe(); };
+  }, []);
+
   const [isExiting, setIsExiting] = React.useState(false);
   const isExitingRef = React.useRef(false);
   const [isSwitchingProject, setIsSwitchingProject] = React.useState(false);
@@ -1378,14 +1405,17 @@ function App() {
   }, [nekoMenuOpen, viewMenuOpen, windowMenuOpen, integrationsMenuOpen]);
 
   const projectName = React.useMemo(() => {
-    if (!project) return "Projeto";
-    const recent = recentProjects.find(p => p.path === project);
+    if (!studioProjectPath) return "Projeto";
+    const recent = recentProjects.find(p => p.path === studioProjectPath);
     if (recent?.name) return recent.name;
-    const parts = project.split(/[/\\]/).filter(Boolean);
+    const parts = studioProjectPath.split(/[/\\]/).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : "Projeto";
-  }, [project, recentProjects]);
+  }, [studioProjectPath, recentProjects]);
   const projectDisplayName = projectName;
-  const [messages, setMessages] = React.useState<Message[]>([]);
+  const conversationHistory = useConversationHistory(project, sessionId);
+  const { messages, setMessages, restore: restoreConversation } = conversationHistory;
+  const [conversationChanging, setConversationChanging] = React.useState(false);
+  const conversationChangingRef = React.useRef(false);
   const [input, setInput] = React.useState("");
   const [isEnhancingPrompt, setIsEnhancingPrompt] = React.useState(false);
   const [previousPromptForUndo, setPreviousPromptForUndo] = React.useState<string | null>(null);
@@ -1495,6 +1525,8 @@ function App() {
   };
 
   const sendRef = React.useRef<(overrideText?: string) => Promise<void>>(() => Promise.resolve());
+  const answerQuestionRef = React.useRef<(text: string) => Promise<void>>(() => Promise.resolve());
+  const executionModelRef = React.useRef<{ providerID: string; modelID: string; variant?: string } | undefined>(undefined);
   const [isRecordingAudio, setIsRecordingAudio] = React.useState(false);
   const [isTranscribingAudio, setIsTranscribingAudio] = React.useState(false);
   const [recordingDuration, setRecordingDuration] = React.useState(0);
@@ -1707,7 +1739,7 @@ function App() {
   }, [cleanupAudioStream, input, isTranscribingAudio]);
 
   const handleToggleVoiceRecording = async () => {
-    if (busy || isTranscribingAudio) return;
+    if (isTranscribingAudio) return;
 
     if (isRecordingAudio) {
       await handleFinishRecording("stop");
@@ -1811,13 +1843,50 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [isRecordingAudio, isTranscribingAudio, handleCancelRecording, handleFinishRecording]);
   const [busy, setBusy] = React.useState(false);
+  const promptQueueRef = React.useRef(new PromptQueue<QueuedComposerPrompt>());
+  const promptQueue = promptQueueRef.current;
+  const [promptQueueSnapshot, setPromptQueueSnapshot] = React.useState(() => promptQueue.snapshot());
+  const [promptQueueGate, setPromptQueueGate] = React.useState<PromptQueueGateState | null>(null);
+  const promptQueueGateRef = React.useRef<PromptQueueGateState | null>(null);
+  const queueDispatchingRef = React.useRef(false);
+  const queueWrappingRef = React.useRef(false);
+  const queueErrorPendingRef = React.useRef(false);
+  const [queuePumpVersion, setQueuePumpVersion] = React.useState(0);
+  const shownQueuedPromptsRef = React.useRef(new Set<string>());
+  const applyPromptQueueGate = React.useCallback((state: PromptQueueGateState) => {
+    if (!state || state.revision < (promptQueueGateRef.current?.revision ?? -1)) return;
+    promptQueueGateRef.current = state;
+    setPromptQueueGate(state);
+  }, []);
+  React.useEffect(() => promptQueue.subscribe(() => setPromptQueueSnapshot(promptQueue.snapshot())), [promptQueue]);
+  React.useEffect(() => {
+    let alive = true;
+    const receive = (state: PromptQueueGateState) => { if (alive) applyPromptQueueGate(state); };
+    const unsubscribe = window.neko.onPromptQueueChanged(receive);
+    void window.neko.promptQueueState().then(receive).catch(() => {
+      if (alive) promptQueue.pause("Não foi possível consultar a fila. Tente retomá-la.");
+    });
+    return () => { alive = false; unsubscribe(); };
+  }, [applyPromptQueueGate, promptQueue]);
+  const pauseQueuesOnError = React.useCallback((finishActive = true) => {
+    queueErrorPendingRef.current = true;
+    const active = promptQueue.snapshot().active;
+    if (active && finishActive) promptQueue.finish(active.id);
+    void window.neko.promptQueuePause().then(state => {
+      applyPromptQueueGate(state);
+      queueErrorPendingRef.current = false;
+      setQueuePumpVersion(value => value + 1);
+    }).catch(() => promptQueue.pause("As filas estão pausadas. Não foi possível confirmar o estado do aplicativo."));
+  }, [applyPromptQueueGate, promptQueue]);
   const [activity, setActivity] = React.useState<Activity[]>([]);
   const [workingStatus, setWorkingStatus] = React.useState<string>("");
   const [timelineOpen, setTimelineOpen] = React.useState<boolean>(false);
   const [timelineTaskId, setTimelineTaskId] = React.useState<string | null>(null);
   const [taskTimelines, setTaskTimelines] = React.useState<Map<string, TaskTimeline>>(new Map());
   const currentTaskTimelineRef = React.useRef<TaskTimeline | null>(null);
-  const [skillsPanelOpen, setSkillsPanelOpen] = React.useState<boolean>(false);
+  const [conversationTool, setConversationTool] = React.useState<ConversationTool>("chat");
+  const skillsPanelOpen = conversationTool === "skills";
+  const setSkillsPanelOpen = React.useCallback((open: boolean) => setConversationTool(open ? "skills" : "chat"), []);
   const [skillsState, setSkillsState] = React.useState<SkillsProjectState | null>(null);
   const [skillsLoading, setSkillsLoading] = React.useState<boolean>(false);
   const [pendingPermissions, setPendingPermissions] = React.useState<PermissionRequest[]>([]);
@@ -2634,6 +2703,7 @@ function App() {
   const [githubError, setGithubError] = React.useState("");
   const [githubLinkRepo, setGithubLinkRepo] = React.useState<GithubStatus["repos"][number] | null>(null);
   const [githubLinkStatus, setGithubLinkStatus] = React.useState<GitStatus>({ initialized: false, branch: null, remote: null, linkedRepo: null, dirty: false, changedFiles: [], summary: { modified: 0, untracked: 0, deleted: 0, staged: 0, total: 0 } });
+  const hasPendingPublication = Boolean(!githubLinkStatus.linkedRepo || githubLinkStatus.dirty || githubLinkStatus.unpushed || (githubLinkStatus.ahead || 0) > 0 || (githubLinkStatus.summary?.total || 0) > 0 || (githubLinkStatus.changedFiles && githubLinkStatus.changedFiles.length > 0));
   const [githubLinkBusy, setGithubLinkBusy] = React.useState(false);
   const [githubLinkError, setGithubLinkError] = React.useState("");
   const [githubReplaceRemote, setGithubReplaceRemote] = React.useState(false);
@@ -2909,11 +2979,67 @@ function App() {
   const [githubRepoSearch, setGithubRepoSearch] = React.useState("");
   const [githubCloneLoadingRepos, setGithubCloneLoadingRepos] = React.useState(false);
   const cloneFetchGenRef = React.useRef(0);
-  const [pendingGithubIntent, setPendingGithubIntent] = React.useState<"clone" | "publish" | null>(null);
-  const pendingGithubIntentRef = React.useRef<"clone" | "publish" | null>(null);
-  const setGithubIntent = React.useCallback((intent: "clone" | "publish" | null) => {
-    pendingGithubIntentRef.current = intent;
-    setPendingGithubIntent(intent);
+
+  // --- NekoAI Theme & Unified Pending Github Intent (Phase 1) ---
+  const [theme, setTheme] = React.useState<"dark" | "light">(() => {
+    try {
+      return (localStorage.getItem("neko:theme") as "dark" | "light") || "dark";
+    } catch {
+      return "dark";
+    }
+  });
+
+  React.useEffect(() => {
+    const update=(event:StorageEvent)=>{if(event.key!=="neko:theme")return;const value=event.newValue==="light"?"light":"dark";setTheme(value);document.body.classList.toggle("theme-bright",value==="light");};
+    window.addEventListener("storage",update);return ()=>window.removeEventListener("storage",update);
+  },[]);
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem("neko:theme");
+      if (saved === "light") {
+        document.body.classList.add("theme-bright");
+        setTheme("light");
+      } else {
+        document.body.classList.remove("theme-bright");
+        setTheme("dark");
+      }
+    } catch {}
+  }, []);
+
+  const handleToggleTheme = React.useCallback(() => {
+    setTheme(prev => {
+      const next = prev === "dark" ? "light" : "dark";
+      try { localStorage.setItem("neko:theme", next); } catch {}
+      if (next === "light") {
+        document.body.classList.add("theme-bright");
+      } else {
+        document.body.classList.remove("theme-bright");
+      }
+      return next;
+    });
+  }, []);
+
+  type GithubIntent = {
+    type: "clone" | "publish";
+    projectPath?: string;
+    attemptId: string;
+    createdAt: number;
+    executed: boolean;
+  } | null;
+
+  const [pendingGithubIntent, setPendingGithubIntent] = React.useState<GithubIntent>(null);
+  const pendingGithubIntentRef = React.useRef<GithubIntent>(null);
+  const setGithubIntent = React.useCallback((intent: GithubIntent | "clone" | "publish" | null) => {
+    let normalized: GithubIntent = null;
+    if (intent === "clone") {
+      normalized = { type: "clone", attemptId: `intent-${Date.now()}`, createdAt: Date.now(), executed: false };
+    } else if (intent === "publish") {
+      normalized = { type: "publish", projectPath: projectRef.current || undefined, attemptId: `intent-${Date.now()}`, createdAt: Date.now(), executed: false };
+    } else if (intent) {
+      normalized = intent;
+    }
+    pendingGithubIntentRef.current = normalized;
+    setPendingGithubIntent(normalized);
   }, []);
   const [githubPublishRepoName, setGithubPublishRepoName] = React.useState("");
   const [githubPublishPrivate, setGithubPublishPrivate] = React.useState(true);
@@ -3282,11 +3408,14 @@ function App() {
       setRecentProjectsMenuOpen(false);
       return true;
     }
+    const loadingInThisStudio = !activeProject;
     projectLoadKindRef.current = activeProject ? "switch" : "load";
     isSwitchingProjectRef.current = true;
-    isExitingRef.current = true;
-    setIsExiting(true);
-    setStatus("starting");
+    if (loadingInThisStudio) {
+      isExitingRef.current = true;
+      setIsExiting(true);
+      setStatus("starting");
+    }
     try {
       console.log("[BLACKSCREEN] openRecentProject:before-ipc", { path });
       const res = await window.neko.openProject(path, source);
@@ -3296,6 +3425,13 @@ function App() {
         if (!projectRef.current) setStatus("offline");
         return false;
       }
+      if (res.openedInTab) {
+        if (!projectRef.current) setStatus("offline");
+        setModal(null);
+        setProjectMenuOpen(false);
+        setRecentProjectsMenuOpen(false);
+        return true;
+      }
       if (res.error) {
         console.log("[BLACKSCREEN] openRecentProject:error-result", { error: res.error });
         showToast(res.error || "Erro ao abrir projeto");
@@ -3304,8 +3440,9 @@ function App() {
       }
       console.log("[BLACKSCREEN] openRecentProject:before-set-state", { targetPath: res.path || path, projectBefore: project });
       setProject(res.path || path);
+      setOpeningProjectPath(null);
       setStatus("online");
-      setMessages([]);
+      restoreConversation(res.conversation, res.path || path);
       setSessionId(res.session?.id || "");
       setTree(res.tree || []);
       setActiveFile(null);
@@ -3317,7 +3454,7 @@ function App() {
       setPreviewFrameReady(false);
       setPreviewFramework(null);
       setPreviewPackageManager(null);
-      setGithubLinkStatus({ loading: false, linkedRepo: res.gitStatus?.linkedRepo || null, branch: res.gitStatus?.branch || null });
+      setGithubLinkStatus(res.gitStatus || { initialized:false,branch:null,remote:null,linkedRepo:null,dirty:false });
       setGithubAutoCommit(Boolean(res.autoCommit));
       setSupabaseState(res.supabaseState || null);
       setVercelState(res.vercelState || null);
@@ -3334,24 +3471,46 @@ function App() {
       return true;
     } catch (err: any) {
       console.error("[BLACKSCREEN] openRecentProject:runtime-error", err);
+      setOpeningProjectError(err?.message || "Erro ao abrir projeto");
       showToast(err?.message || "Erro ao abrir projeto");
       if (!projectRef.current) setStatus("offline");
       return false;
     } finally {
       isSwitchingProjectRef.current = false;
-      isExitingRef.current = false;
-      setIsExiting(false);
+      if (loadingInThisStudio) {
+        isExitingRef.current = false;
+        setIsExiting(false);
+      }
       console.log("[BLACKSCREEN] openRecentProject:finally");
     }
   }, [showToast, removeRecentProject]);
 
+  const bootstrapStartedRef=React.useRef(false);
+  React.useEffect(() => {
+    if(bootstrapStartedRef.current)return;
+    bootstrapStartedRef.current=true;
+    void window.neko.tabsBootstrap().then(initial => {
+      if (initial) void openRecentProject(initial.projectPath,initial.source);
+    }).catch(error=>showToast(error?.message || "Não foi possível iniciar a aba do projeto."));
+  }, [openRecentProject,showToast]);
+  React.useEffect(() => { void window.neko.tabsBusy(Boolean(busy || promptQueueSnapshot.active || promptQueueSnapshot.pending.length || isSwitchingProject || isExiting || pendingQuestion || pendingPermissions.length)).catch(()=>{}); }, [busy,promptQueueSnapshot,isSwitchingProject,isExiting,pendingQuestion,pendingPermissions.length]);
+
   const exitProject = React.useCallback(async (source?: string) => {
+    if (source === "homeNav") {
+      await window.neko.tabsNew();
+      return;
+    }
     console.log("[BLACKSCREEN] exitProject:start", { source, project: projectRef.current, isExiting: isExitingRef.current });
     if (isExitingRef.current) return;
     isExitingRef.current = true;
     try {
-      await window.neko.stop({ source: source || "user" }).catch(() => {});
-    } catch {}
+      await conversationHistory.flush();
+      const closed = await window.neko.stop({ source: source || "user" }).catch(() => false);
+      if (closed === false) { isExitingRef.current=false;setIsExiting(false);return; }
+    } catch (error: any) {
+      showToast(error?.message || "Não foi possível salvar a conversa antes de fechar.");
+      isExitingRef.current = false; setIsExiting(false); return;
+    }
     setProject(null);
     setSkillsPanelOpen(false);
     setSkillsState(null);
@@ -3375,12 +3534,13 @@ function App() {
       if (chosen) {
         setRecentProjectsMenuOpen(false);
         setProjectMenuOpen(false);
-        void openRecentProject(chosen, "ProjectChooser");
+        await openRecentProject(chosen, "ProjectChooser");
       }
     } catch (err) {
       console.error("[App] openOtherProject error:", err);
+      showToast(err instanceof Error ? err.message : "Não foi possível abrir o projeto selecionado.");
     }
-  }, [openRecentProject]);
+  }, [openRecentProject,showToast]);
 
   const chooseNewProjectParent = React.useCallback(async () => {
     try {
@@ -3835,8 +3995,7 @@ function App() {
 
   // Overlays (modais e dropdowns): quando um overlay está aberto, a visibilidade da view
   // nativa (WebContentsView) é suspensa via setInternalPreviewOverlay para que o overlay DOM
-  // pinte perfeitamente sobre a superfície de preview (o iframe underlay permanece renderizado
-  // no DOM, garantindo que o Preview continue visível ao fundo sem desaparecer).
+  // pinte sobre a captura da própria superfície nativa, mantendo seus pixels e limites.
   const isTitlebarMenuOpen = Boolean(nekoMenuOpen || viewMenuOpen || windowMenuOpen || integrationsMenuOpen);
   const isModalOpen = Boolean(modal || isSwitchingProject || lightboxImage);
   const isTopbarDropdownOpen = Boolean(githubBranchMenuOpen || projectMenuOpen || recentProjectsMenuOpen || isTitlebarMenuOpen);
@@ -3844,13 +4003,43 @@ function App() {
   const isComposerDropdownOpen = Boolean(modelOpen || chatModeMenuOpen);
   const isTimelineOverlay = Boolean(timelineOpen && workspaceTab === "preview");
   const isBlockingOverlayOpen = Boolean(isModalOpen || isTopbarDropdownOpen || isInternalDropdownOpen || isTimelineOverlay || isComposerDropdownOpen);
-  const isAnyOverlayOpen = Boolean(isBlockingOverlayOpen || globalNotification || contextualFeedback);
+  const isAnyOverlayOpen = Boolean(isBlockingOverlayOpen || globalNotification || contextualFeedback || gitGuideStep);
+
+  const [previewOverlaySnapshot, setPreviewOverlaySnapshot] = React.useState<Awaited<ReturnType<typeof window.neko.captureInternalPreview>>>(null);
+  const previewOverlayGeneration = React.useRef(0);
+  React.useEffect(() => {
+    const generation = ++previewOverlayGeneration.current;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const nativePreview = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl);
+    if (isAnyOverlayOpen && nativePreview) {
+      const capture = async () => {
+        try {
+          const snapshot = await window.neko.captureInternalPreview();
+          if (generation !== previewOverlayGeneration.current) return;
+          if (!snapshot) { retryTimer = setTimeout(capture, 100); return; }
+          const image = new Image(); image.src = snapshot.dataUrl; await image.decode();
+          if (generation === previewOverlayGeneration.current) setPreviewOverlaySnapshot(snapshot);
+        } catch {
+          if (generation === previewOverlayGeneration.current) retryTimer = setTimeout(capture, 100);
+        }
+      };
+      void capture();
+    } else {
+      // Leave the captured pixels in place until IPC confirms that the native view is back.
+      void window.neko.setInternalPreviewOverlay(false).then(async () => {
+        await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        if (generation === previewOverlayGeneration.current) setPreviewOverlaySnapshot(null);
+      }).catch(() => {});
+    }
+    return () => { ++previewOverlayGeneration.current; clearTimeout(retryTimer); };
+  }, [isAnyOverlayOpen, previewSurface, workspaceTab, previewUrl]);
 
   React.useEffect(() => {
-    if (previewSurface === "webcontents" && workspaceTab === "preview" && previewUrl) {
-      window.neko.setInternalPreviewOverlay(isAnyOverlayOpen).catch(() => {});
-    }
-  }, [isAnyOverlayOpen, previewSurface, workspaceTab, previewUrl]);
+    if (!isAnyOverlayOpen || !previewOverlaySnapshot || previewSurface !== "webcontents" || workspaceTab !== "preview") return;
+    let first = 0, second = 0;
+    first = requestAnimationFrame(() => { second = requestAnimationFrame(() => { void window.neko.setInternalPreviewOverlay(true).catch(() => {}); }); });
+    return () => { cancelAnimationFrame(first); cancelAnimationFrame(second); };
+  }, [isAnyOverlayOpen, previewOverlaySnapshot, previewSurface, workspaceTab]);
 
   const pendingPlanTaskRef = React.useRef<string | null>(null);
   const providersGenerationRef = React.useRef(0);
@@ -3893,7 +4082,7 @@ function App() {
   // NOT re-introduce busy or working status. A new task resets it to "running".
   // waiting_for_user / waiting_for_approval are NOT terminal: the task is
   // paused waiting for the user and resumes on the same agent session.
-  const taskPhaseRef = React.useRef<"none" | "running" | "waiting_for_user" | "waiting_for_approval" | "completed" | "cancelled" | "failed">("none");
+  const taskPhaseRef = React.useRef<"none" | "idle" | "running" | "waiting_for_user" | "waiting_for_approval" | "waiting_for_lovable_cloud" | "completed" | "cancelled" | "failed">("none");
   const lastEmittedErrorRef = React.useRef<{ taskId: string; text: string; time: number } | null>(null);
   const isTaskTerminal = React.useCallback(() => {
     return taskPhaseRef.current === "completed" || taskPhaseRef.current === "cancelled" || taskPhaseRef.current === "failed";
@@ -3932,6 +4121,13 @@ function App() {
   const [showContextMenu, setShowContextMenu] = React.useState(false);
   const [dragOver, setDragOver] = React.useState(false);
   const composerRef = React.useRef<HTMLTextAreaElement | null>(null);
+  React.useLayoutEffect(() => {
+    const field = composerRef.current;
+    if (!field) return;
+    field.style.height = "auto";
+    field.style.height = `${Math.min(Math.max(field.scrollHeight, 92), 180)}px`;
+  }, [input, project]);
+
   const messagesRef = React.useRef<HTMLDivElement | null>(null);
   const previousContentHeight = React.useRef(0);
   const [homeView, setHomeView] = React.useState<"home" | "allProjects">("home");
@@ -4256,15 +4452,22 @@ function App() {
           console.log("[GitHub Intent] App installation needed, keeping on 'github' modal");
           setGithubIntent(null);
           setModal("github");
-        } else if (intent === "clone") {
+        } else if (intent?.type === "clone") {
           console.log("[GitHub Intent] github connected, resuming clone flow");
-          console.log("[GitHub Intent] opening githubClone modal");
           setGithubIntent(null);
           setModal("githubClone");
-        } else if (intent === "publish") {
+        } else if (intent?.type === "publish") {
           console.log("[GitHub Intent] github connected, resuming publish flow");
-          setGithubIntent(null);
-          setModal("githubPublish");
+          if (intent.projectPath && intent.projectPath === projectRef.current && !intent.executed) {
+            intent.executed = true;
+            setGithubIntent(null);
+            setModal(null);
+            void executeDirectPublish(intent.projectPath, intent.attemptId);
+          } else {
+            console.log("[GitHub Intent] project changed or already executed:", { intentPath: intent.projectPath, current: projectRef.current });
+            setGithubIntent(null);
+            setModal(projectRef.current ? "github" : "githubClone");
+          }
         } else {
           if (modalRef.current === "githubDevice") {
             setModal(projectRef.current ? "github" : "githubClone");
@@ -4683,6 +4886,7 @@ function App() {
           return next;
         });
       } else if (event.type === "supabase:migration:failed") {
+        void window.neko.promptQueuePause().then(applyPromptQueueGate).catch(() => {});
         setPendingMigration(null);
         setMigrationHistory(prev => new Map(prev).set(payload.id, payload));
       } else if (event.type === "supabase:migration:replied") {
@@ -4822,6 +5026,11 @@ function App() {
             setModal(null);
             setWorkingStatus("Conexão estabelecida. Continuando sua solicitação...");
             setBusy(true);
+            taskPhaseRef.current = "running";
+            currentTaskIdRef.current = null;
+            requestStartedAtRef.current = Date.now();
+            requestInFlightRef.current = true;
+            requestObservedBusyRef.current = false;
 
             void window.neko.prompt(
               pending.sessionId,
@@ -4832,10 +5041,16 @@ function App() {
               pending.planMode,
               pending.effort
             ).then((res: any) => {
+              if (taskPhaseRef.current === "cancelled") return;
               if (res?.taskId) {
                 currentTaskIdRef.current = String(res.taskId);
               }
             }).catch((err: any) => {
+              if (taskPhaseRef.current === "cancelled") return;
+              pauseQueuesOnError();
+              taskPhaseRef.current = "failed";
+              requestInFlightRef.current = false;
+              requestObservedBusyRef.current = false;
               console.error("[Lovable Guard] Error resuming pending prompt:", err);
               setBusy(false);
               setWorkingStatus("");
@@ -5042,27 +5257,30 @@ function App() {
               updated[lastIndex] = {
                 ...last,
                 taskId: last.taskId || assignedTaskId,
+                engineMessageId: String(latest?.info?.id || latest?.id || ""),
                 durationMs: last.durationMs ?? durationMs
               };
               return updated;
             }
             return prev;
           }
-          return [...prev, { role: "assistant", text, taskId: assignedTaskId, durationMs, createdAt: Date.now() }];
+          return [...prev, { role: "assistant", text, engineMessageId: String(latest?.info?.id || latest?.id || ""), taskId: assignedTaskId, durationMs, createdAt: Date.now() }];
         });
         if (activeTask) activeTaskRef.current = null;
       }
       const nextTree = await window.neko.tree();
       setTree(nextTree);
-    } catch {}
-  }, [sanitizeUserFacingText]);
+    } catch {
+      if (promptQueue.snapshot().active || promptQueue.snapshot().pending.length) pauseQueuesOnError();
+    }
+  }, [sanitizeUserFacingText, promptQueue, pauseQueuesOnError]);
 
   // Bounded auto-repair dispatch. It owns the full task lifecycle (busy,
   // in-flight, taskId correlation) so the completion protocol can always
   // conclude the repair cycle. Never dispatched while another request is
   // already in flight.
   const dispatchRepairPrompt = React.useCallback(async (diagnostic: string, title: string) => {
-    if (!sessionId || requestInFlightRef.current || validationRunningRef.current) return false;
+    if (!sessionId || requestInFlightRef.current || validationRunningRef.current || queueWrappingRef.current) return false;
     requestInFlightRef.current = true;
     requestObservedBusyRef.current = false;
     currentTaskIdRef.current = null;
@@ -5073,7 +5291,7 @@ function App() {
     setWorkingStatus(`Corrigindo o projeto (tentativa ${repairAttemptsRef.current}/3)...`);
     upsertActivity({ id: "auto-repair", icon: "error", title, detail: "O Neko encontrou um problema e está corrigindo automaticamente.", state: "running" });
     try {
-      const repairResult = await window.neko.prompt(sessionId, `A validação automática encontrou um problema no projeto. NÃO encerre a tarefa. Corrija diretamente os arquivos e continue até o projeto funcionar.\n\nDiagnóstico técnico:\n${diagnostic}\n\nDepois de corrigir, verifique novamente o Preview e o build.`, getEffectiveModel(selectedModel), [], [], false, effort);
+      const repairResult = await window.neko.prompt(sessionId, `A validação automática encontrou um problema no projeto. NÃO encerre a tarefa. Corrija diretamente os arquivos e continue até o projeto funcionar.\n\nDiagnóstico técnico:\n${diagnostic}\n\nDepois de corrigir, verifique novamente o Preview e o build.`, (promptQueue.snapshot().active?.request.model ?? getEffectiveModel(selectedModel)), [], [], false, (promptQueue.snapshot().active?.request.effort ?? effort));
       if (repairResult?.taskId) {
         currentTaskIdRef.current = String(repairResult.taskId);
         console.log(`[TaskLifecycle] repair:accepted taskId=${repairResult.taskId}`);
@@ -5081,6 +5299,7 @@ function App() {
       setRepairState("awaiting-preview-update");
       return true;
     } catch (error) {
+      pauseQueuesOnError();
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
       retryActiveRef.current = false;
@@ -5159,6 +5378,7 @@ function App() {
         }
         void refreshPullRequestStatus();
       } else {
+        pauseQueuesOnError();
         if (result.reason === "remote-ahead" || result.reason === "diverged") {
           if (result.syncStatus) {
             setGitSyncStatus(result.syncStatus);
@@ -5177,6 +5397,7 @@ function App() {
       }
     } catch (err: any) {
       const friendly = getUserFacingError(err, "Erro ao enviar alterações automáticas para o GitHub.");
+      pauseQueuesOnError();
       showToast(friendly);
       appendTerminalLine("error", `Falha no Auto Commit: ${friendly}`, "GitHub");
     }
@@ -5225,6 +5446,7 @@ function App() {
       const buildFailed = build?.ok === false;
       
       if (previewFailed || buildFailed) {
+        pauseQueuesOnError();
         requestInFlightRef.current = false;
         requestObservedBusyRef.current = false;
         setRepairState("idle");
@@ -5253,17 +5475,18 @@ function App() {
       const finishTaskId = currentTaskIdRef.current || (sessionIdRef.current ? `task-${sessionIdRef.current}` : undefined);
       void triggerAutoCommitIfEligible(finishTaskId);
     } catch (error) {
+      pauseQueuesOnError();
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
       setRepairState("idle");
     } finally {
       validationRunningRef.current = false;
-      if (!requestInFlightRef.current) {
+      if (!requestInFlightRef.current && !queueWrappingRef.current) {
         setBusy(false);
         setWorkingStatus("");
       }
     }
-  }, [sessionId, repairState, currentErrorSignature, upsertActivity, triggerAutoCommitIfEligible]);
+  }, [sessionId, repairState, currentErrorSignature, upsertActivity, triggerAutoCommitIfEligible, pauseQueuesOnError]);
 
   // Conclusion is driven by the main-process task state machine
   // (neko.task.state = completed). The renderer only reacts: clear busy,
@@ -5303,21 +5526,30 @@ function App() {
     setWorkingStatus("");
     finishActivity();
     console.log(`[TaskLifecycle] concludeCurrentTask called state=${state} taskId=${currentTaskIdRef.current ?? "-"} phase-before=${beforePhase} phase-after=${state} -> renderer:setBusy(false)`);
-    if (state === "completed") {
-      void syncSessionOutput();
-      // Atualiza o catálogo de rotas do Preview para refletir páginas criadas/modificadas durante a tarefa
-      void loadPreviewRoutes(true);
-      // Auto Commit desacoplado: disparado diretamente ao concluir a tarefa sem bloquear na validação de Preview/Build
-      const finishTaskId = currentTaskIdRef.current || (sessionIdRef.current ? `task-${sessionIdRef.current}` : undefined);
-      void triggerAutoCommitIfEligible(finishTaskId);
-      // Final validation is a wrap-up, NOT a gate: the UI is already in the
-      // concluded state. It manages its own busy and may trigger bounded
-      // auto-repair.
-      if (!validationRunningRef.current) {
-        void runTaskValidation();
-      }
+    const queuedId = promptQueue.snapshot().active?.id;
+    if (state === "cancelled") {
+      promptQueue.pause("A tarefa foi cancelada. Revise os prompts pendentes antes de retomar.");
+      if (queuedId) promptQueue.finish(queuedId);
     }
-  }, [finishActivity, completeTaskTimeline, syncSessionOutput, runTaskValidation, currentErrorSignature, busy, triggerAutoCommitIfEligible]);
+    if (state === "completed") {
+      // Retain queue ownership through output, validation and Auto Commit so
+      // wrap-up from this task can never clear or overwrite the next task.
+      queueWrappingRef.current = true;
+      setBusy(true);
+      setWorkingStatus("Finalizando tarefa...");
+      const finishTaskId = currentTaskIdRef.current || undefined;
+      void Promise.all([
+        syncSessionOutput(), loadPreviewRoutes(true),
+        triggerAutoCommitIfEligible(finishTaskId),
+        validationRunningRef.current ? Promise.resolve() : runTaskValidation()
+      ]).catch(() => pauseQueuesOnError()).finally(() => {
+        queueWrappingRef.current = false;
+        if (queuedId) promptQueue.finish(queuedId);
+        if (!requestInFlightRef.current) { setBusy(false); setWorkingStatus(""); }
+        setQueuePumpVersion(value => value + 1);
+      });
+    }
+  }, [finishActivity, completeTaskTimeline, syncSessionOutput, runTaskValidation, currentErrorSignature, busy, triggerAutoCommitIfEligible, promptQueue, pauseQueuesOnError]);
 
   // Authoritative task states coming from the main-process state machine.
   // The agent cycle (running -> question/approval -> running -> completed)
@@ -5325,6 +5557,11 @@ function App() {
   const applyTaskState = React.useCallback((state: string, props: any) => {
     const sessionID = String(props?.sessionID ?? "");
     if (sessionID && sessionIdRef.current && sessionID !== sessionIdRef.current) return;
+    const incomingTaskId = String(props?.taskId || "");
+    const knownTaskId = currentTaskIdRef.current;
+    if (props?.at && Number(props.at) < requestStartedAtRef.current) return;
+    if (incomingTaskId && knownTaskId && !knownTaskId.startsWith("task-") && incomingTaskId !== knownTaskId) return;
+    if (incomingTaskId && (!knownTaskId || knownTaskId.startsWith("task-"))) currentTaskIdRef.current = incomingTaskId;
     if (state === "running") {
       if (isTaskTerminal()) return;
       if (taskPhaseRef.current === "running") return;
@@ -5466,6 +5703,7 @@ function App() {
       return;
     }
     if (state === "failed") {
+      pauseQueuesOnError();
       completeTaskTimeline("failed", String(props?.reason ?? ""));
       taskPhaseRef.current = "failed";
       retryActiveRef.current = false;
@@ -5481,7 +5719,7 @@ function App() {
       console.log(`[TaskLifecycle] state=failed taskId=${props?.taskId ?? "-"} reason=${String(props?.reason ?? "")}`);
       return;
     }
-  }, [concludeCurrentTask, completeTaskTimeline, isTaskTerminal, upsertActivity, finishActivity, pendingPermissions, pendingMigration]);
+  }, [concludeCurrentTask, completeTaskTimeline, isTaskTerminal, upsertActivity, finishActivity, pendingPermissions, pendingMigration, pauseQueuesOnError]);
 
   // Stable references for the event-handler effect. The effect must NEVER
   // re-subscribe because a callback identity changed: several callbacks
@@ -5983,6 +6221,7 @@ function App() {
           return;
         }
 
+        pauseQueuesOnError();
         const diagnostic = formatAgentError(props);
         const errorText = diagnostic.details
           ? `ERRO\n${diagnostic.friendly}\n\n${diagnostic.details}`
@@ -6031,14 +6270,14 @@ function App() {
           isModelIncompatibilityError(diagnostic.friendly) ||
           isModelIncompatibilityError(String(props?.error?.message || ""));
 
-        if (isModelIncompatible && selectedModelRef.current) {
-          const badModel = selectedModelRef.current;
+        if (isModelIncompatible && (executionModelRef.current || selectedModelRef.current)) {
+          const badModel = (executionModelRef.current || selectedModelRef.current)!;
           console.warn(`[Neko/Model] Desativando modelo incompatível na sessão: ${badModel.providerID}/${badModel.modelID}`);
           setModels(prev => prev.filter(m => !(m.providerID === badModel.providerID && m.modelID === badModel.modelID)));
           setManagedModels(prev => prev.filter(m => !(m.providerID === badModel.providerID && m.modelID === badModel.modelID)));
           try { localStorage.removeItem(LAST_MODEL_STORAGE_KEY); } catch {}
           const remaining = models.filter(m => m.connected && m.enabled && !(m.providerID === badModel.providerID && m.modelID === badModel.modelID));
-          if (remaining[0]) {
+          if (remaining[0] && selectedModelRef.current?.providerID === badModel.providerID && selectedModelRef.current?.modelID === badModel.modelID) {
             const nextModel = { providerID: remaining[0].providerID, modelID: remaining[0].modelID };
             modelPickSourceRef.current = "fallback";
             setSelectedModel(nextModel);
@@ -6176,7 +6415,7 @@ function App() {
   // mode, tab changes and window resize all drive the native preview surface.
   React.useLayoutEffect(() => {
     const host = previewViewHostRef.current;
-    const visible = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host) && !isAnyOverlayOpen;
+    const visible = previewSurface === "webcontents" && workspaceTab === "preview" && Boolean(previewUrl) && previewInternalSession > 0 && Boolean(host);
     let raf = 0;
     let pumpRaf = 0;
 
@@ -6259,7 +6498,7 @@ function App() {
       window.removeEventListener("transitionend", schedule);
       window.removeEventListener("transitioncancel", schedule);
     };
-  }, [previewSurface, workspaceTab, previewUrl, previewEffectiveUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen, isAnyOverlayOpen]);
+  }, [previewSurface, workspaceTab, previewUrl, previewEffectiveUrl, previewInternalSession, device, terminalOpen, chatCollapsed, timelineOpen]);
 
   // Fallback watchdog for build execution. OpenCode can occasionally leave
   // session.status as busy or events can be dropped.
@@ -6298,7 +6537,7 @@ function App() {
           // stay continuously idle for 12s — the main-process determination
           // (permission/question/completed) always finishes well before that.
           if (!idleStableSince) idleStableSince = Date.now();
-          if (Date.now() - idleStableSince >= 12000) {
+          if (Date.now() - idleStableSince >= 12000 && !promptQueue.snapshot().active) {
             console.log(`[TaskLifecycle] watchdog concluded task (session idle) session=${sessionId} taskId=${currentTaskIdRef.current ?? "-"}`);
             concludeCurrentTaskRef.current("completed");
           }
@@ -6457,7 +6696,7 @@ function App() {
   async function startCloneReconstruction() {
     const analysis = cloneAnalysis;
     const capture = cloneCapture;
-    if (!analysis?.ok || cloneReconstructBusy || busy) return;
+    if (!analysis?.ok || cloneReconstructBusy || busy || requestInFlightRef.current || queueWrappingRef.current || promptQueue.snapshot().active) return;
     if (!sessionId || !project) {
       setCloneError("Abra ou crie um projeto primeiro — a reconstrução escreve arquivos dentro do workspace.");
       return;
@@ -6609,97 +6848,23 @@ function App() {
     setModal("newProject");
   }
 
-  const send = React.useCallback(async (overrideText?: string) => {
-    if (!sessionId || requestInFlightRef.current) return;
-    const text = (typeof overrideText === "string" ? overrideText : input).trim();
-    const hasAttachments = attachments.length > 0;
-    if (!text && !hasAttachments) return;
-
-    if (pendingQuestionRef.current) {
-      setInput("");
-      setAttachments([]);
-      setUploadErrors([]);
-      void answerQuestion(text);
-      return;
-    }
-
+  const queueHistoryRef = React.useRef(messages);
+  queueHistoryRef.current = messages;
+  const executeQueuedPrompt = React.useCallback(async (item: QueuedComposerPrompt, revision: number) => {
+    queueDispatchingRef.current = true;
+    executionModelRef.current = item.request.model;
+    const { sessionId, text } = item;
+    const resolved = { agentPromptText: item.request.text };
+    const promptAttachments = item.request.attachments || [];
+    const contextPaths = item.request.contextPaths || [];
+    const planMode = Boolean(item.request.planMode);
+    const effort = item.request.effort;
+    const userIndex = queueHistoryRef.current.length;
     handledQuestionIdsRef.current.clear();
-
-    // Context resolution via central resolver:
-    const resolverState: ResolverContextState = {
-      projectRoot: project,
-      projectName: project ? project.split(/[/\\]/).pop() : undefined,
-      previewUrl,
-      previewStatus,
-      previewFramework,
-      previewMessage,
-      tree,
-      gitStatus: githubLinkStatus,
-      terminalLines,
-      consoleEntries
-    };
-    const resolved = resolveChatMessage(text, resolverState);
-
-    // Se for comando puro do OpenCode que não pertence aos 6 comandos nativos da Neko nem contém contextos semânticos
-    if (text.startsWith("/") && !resolved.command && !resolved.semanticContexts.length && !resolved.filePaths.length) {
-      const parts = text.split(/\s+/);
-      const cmd = parts[0].slice(1);
-      const args = parts.slice(1).join(" ");
-      setInput("");
-      setShowSlashMenu(false);
-      setAutocompleteMode(null);
-      setAutocompleteTrigger(null);
-      requestInFlightRef.current = true;
-      requestObservedBusyRef.current = false;
-      currentTaskIdRef.current = null;
-      taskPhaseRef.current = "running";
-      retryActiveRef.current = false;
-      setBusy(true);
-      setWorkingStatus("Executando comando...");
-      setMessages(prev => [...prev, { role: "user", text, createdAt: Date.now() }]);
-      try {
-        const result = await window.neko.runCommand(sessionId, cmd, args, getEffectiveModel(selectedModel));
-        if (result?.taskId) currentTaskIdRef.current = String(result.taskId);
-      } catch (error) {
-        requestInFlightRef.current = false;
-        requestObservedBusyRef.current = false;
-        taskPhaseRef.current = "failed";
-        setBusy(false);
-        setWorkingStatus("");
-        setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
-      }
-      return;
+    if (!shownQueuedPromptsRef.current.has(item.id)) {
+      shownQueuedPromptsRef.current.add(item.id);
+      setMessages(prev => [...prev, { role: "user", text: item.displayText, clientRequestId: item.request.clientRequestId, attachments: item.attachments.length ? item.attachments : undefined, createdAt: Date.now() }]);
     }
-
-    // Build attachment list for prompt
-    const promptAttachments = attachments.map(a => ({
-      type: a.kind,
-      url: a.url || a.previewUrl || "",
-      mime: a.mime,
-      path: a.path,
-      name: a.name
-    }));
-
-    // Arquivos físicos referenciados com @ (ex: @src/App.tsx)
-    const contextPaths: string[] = [...resolved.filePaths];
-
-    // Reset editing state
-    setEditingMessageIndex(null);
-
-    // Adiciona mensagem do usuário no histórico mantendo o texto original limpo
-    const userMessage: Message = { role: "user", text: resolved.userDisplayText, attachments: attachments.length > 0 ? [...attachments] : undefined, createdAt: Date.now() };
-    setMessages(prev => [...prev, userMessage]);
-    const userIndex = messages.length;
-
-    // Clear input e menus
-    setInput("");
-    setAttachments([]);
-    setUploadErrors([]);
-    setShowSlashMenu(false);
-    setShowContextMenu(false);
-    setAutocompleteMode(null);
-    setAutocompleteTrigger(null);
-
     // Set up task lifecycle
     taskAutoCommitSuppressedRef.current = false;
     const taskId = `task-${Date.now()}`;
@@ -6756,23 +6921,34 @@ function App() {
     lastEmittedErrorRef.current = null;
 
     try {
-      const result = await window.neko.prompt(
-        sessionId,
-        resolved.agentPromptText,
-        getEffectiveModel(selectedModel),
-        promptAttachments.length > 0 ? promptAttachments : undefined,
-        contextPaths.length > 0 ? contextPaths : undefined,
-        planMode,
-        effort
-      );
-      if (result?.cancelled) return;
+      const result = await window.neko.promptQueueDispatch(item.request, revision);
+      if (promptQueue.snapshot().active?.id !== item.id) return;
+      if (result?.queueBlocked) {
+        applyPromptQueueGate(result.gate);
+        if (result.busy) promptQueue.pause("Existe uma tarefa nesta sessão. Aguarde a conclusão antes de retomar.");
+        requestInFlightRef.current = false;
+        requestObservedBusyRef.current = false;
+        taskPhaseRef.current = "none";
+        setBusy(false);
+        setWorkingStatus("");
+        promptQueue.defer(item.id);
+        return;
+      }
+      if (result?.cancelled) {
+        promptQueue.pause("A tarefa foi cancelada. Revise os próximos prompts antes de retomar.");
+        promptQueue.finish(item.id);
+        requestInFlightRef.current = false;
+        setBusy(false);
+        taskPhaseRef.current = "cancelled";
+        return;
+      }
       if (result?.waitingForLovableCloud) {
         console.log("[Lovable Guard] prompt preserved, waiting for Lovable Cloud connection (Layer 1)");
         pendingJITRef.current = {
           source: "layer1",
           sessionId,
           text: resolved.agentPromptText,
-          model: getEffectiveModel(selectedModel),
+          model: item.request.model,
           attachments: promptAttachments.length > 0 ? promptAttachments : undefined,
           contextPaths: contextPaths.length > 0 ? contextPaths : undefined,
           planMode,
@@ -6784,7 +6960,7 @@ function App() {
         setModal("lovable_jit");
         return;
       }
-      if (result?.taskId) {
+      if (result?.taskId && promptQueue.snapshot().active?.id === item.id) {
         const backendTaskId = String(result.taskId);
         currentTaskIdRef.current = backendTaskId;
         if (activeTaskRef.current) {
@@ -6804,18 +6980,123 @@ function App() {
       }
     } catch (error) {
       if (taskPhaseRef.current === "cancelled") return;
+      pauseQueuesOnError();
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
       taskPhaseRef.current = "failed";
       setBusy(false);
       setWorkingStatus("");
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
+    } finally {
+      queueDispatchingRef.current = false;
+      setQueuePumpVersion(value => value + 1);
     }
-  }, [sessionId, input, attachments, selectedModel, planMode, effort, messages.length, getEffectiveModel, sanitizeUserFacingText, upsertActivity, project, previewUrl, previewStatus, previewFramework, previewMessage, tree, githubLinkStatus, terminalLines, consoleEntries]);
+  }, [upsertActivity, sanitizeUserFacingText, applyPromptQueueGate, pauseQueuesOnError, promptQueue]);
+
+  const send = React.useCallback(async (overrideText?: string) => {
+    if (!sessionId || !project || conversationChangingRef.current) return;
+    const text = (typeof overrideText === "string" ? overrideText : input).trim();
+    if (!text && !attachments.length) return;
+    if (pendingQuestionRef.current) {
+      if (!text) return;
+      setInput("");
+      void answerQuestionRef.current(text);
+      return;
+    }
+    const resolved = resolveChatMessage(text, {
+      projectRoot: project, projectName: project.split(/[/\\]/).pop(),
+      previewUrl, previewStatus, previewFramework, previewMessage,
+      tree, gitStatus: githubLinkStatus, terminalLines, consoleEntries
+    });
+    const commandParts = text.startsWith("/") && !resolved.command && !resolved.semanticContexts.length && !resolved.filePaths.length
+      ? text.split(/\s+/) : null;
+    const promptAttachments = attachments.map(a => ({ ...a }));
+    const clientRequestId = crypto.randomUUID();
+    promptQueue.enqueue({
+      id: clientRequestId, sessionId, projectPath: project, text,
+      displayText: resolved.userDisplayText, attachments: promptAttachments,
+      selectedModel: selectedModel ? { ...selectedModel } : undefined,
+      request: {
+        sessionId, text: resolved.agentPromptText, displayText: resolved.userDisplayText, clientRequestId,
+        model: getEffectiveModel(selectedModel) ? { ...getEffectiveModel(selectedModel)! } : undefined,
+        attachments: promptAttachments.map(a => ({ path: a.path, name: a.name, mime: a.mime, size: a.size, kind: a.kind, extension: a.extension })),
+        contextPaths: [...resolved.filePaths], planMode, effort,
+        command: commandParts ? { name: commandParts[0].slice(1), args: commandParts.slice(1).join(" ") } : undefined
+      }
+    });
+    setInput(""); setAttachments([]); setUploadErrors([]);
+    setEditingMessageIndex(null); setShowSlashMenu(false); setShowContextMenu(false);
+    setAutocompleteMode(null); setAutocompleteTrigger(null);
+  }, [sessionId, project, conversationChanging, input, attachments, selectedModel, getEffectiveModel, planMode, effort, previewUrl, previewStatus, previewFramework, previewMessage, tree, githubLinkStatus, terminalLines, consoleEntries, promptQueue]);
   sendRef.current = send;
+
+  React.useEffect(() => {
+    if (!sessionId || !project || conversationChanging || !promptQueueGate || promptQueueGate.paused || queueErrorPendingRef.current ||
+        queueDispatchingRef.current || queueWrappingRef.current || requestInFlightRef.current || validationRunningRef.current ||
+        busy || pendingQuestionRef.current || pendingPlanRef.current || planAwaitingRef.current || pendingPermissions.length ||
+        pendingJITRef.current || pendingMigration || ["running", "waiting_for_user", "waiting_for_approval", "waiting_for_lovable_cloud"].includes(taskPhaseRef.current)) return;
+    const next = promptQueue.take(sessionId, project);
+    if (next) void executeQueuedPrompt(next, promptQueueGate.revision);
+  }, [promptQueueSnapshot, promptQueueGate, queuePumpVersion, sessionId, project, conversationChanging, busy, pendingPermissions.length, pendingMigration, executeQueuedPrompt, promptQueue]);
+
+  function conversationSwitchBlocked() {
+    const queue = promptQueue.snapshot();
+    return Boolean(busy || requestInFlightRef.current || queueWrappingRef.current || validationRunningRef.current || queue.active || queue.pending.length || pendingQuestionRef.current || pendingPlanRef.current || pendingPermissions.length || pendingJITRef.current || pendingMigration || conversationChangingRef.current);
+  }
+  async function openConversation(id?: string, fresh = false) {
+    if (!fresh && id === conversationHistory.conversation?.id) { setConversationTool("chat"); return; }
+    if (!project || conversationSwitchBlocked()) { showToast("Conclua ou pare a tarefa e limpe a fila antes de trocar de conversa."); return; }
+    if (input.trim() || attachments.length) { showToast("Envie ou limpe o rascunho atual antes de trocar de conversa."); return; }
+    conversationChangingRef.current = true;
+    setConversationChanging(true);
+    try {
+      await conversationHistory.flush();
+      const record = await window.neko.conversationsOpen(id, fresh);
+      restoreConversation(record, project);
+      sessionIdRef.current = record.sessionId;
+      setSessionId(record.sessionId);
+      currentTaskIdRef.current = null; taskPhaseRef.current = "none";
+      requestInFlightRef.current = false; requestObservedBusyRef.current = false;
+      retryActiveRef.current = false; activeTaskRef.current = null;
+      handledQuestionIdsRef.current.clear(); shownQueuedPromptsRef.current.clear();
+      setPendingQuestion(null); pendingQuestionRef.current = null;
+      setPendingPlan(null); planAwaitingRef.current = false; pendingPlanTaskRef.current = null;
+      setApprovedPlan(null); setMigrationHistory(new Map());
+      setActivity([]); setTaskTimelines(new Map()); setTimelineTaskId(null); setTimelineOpen(false);
+      currentTaskTimelineRef.current = null; setWorkingStatus(""); setRepairState("idle");
+      promptQueue.resume(); setConversationTool("chat");
+    } catch (error: any) { showToast(error?.message || "Não foi possível abrir a conversa."); }
+    finally { conversationChangingRef.current = false; setConversationChanging(false); }
+  }
+
+  async function resumePromptQueues() {
+    try {
+      const current = promptQueueGateRef.current || await window.neko.promptQueueState();
+      const state = await window.neko.promptQueueResume(current.revision);
+      applyPromptQueueGate(state);
+      if (!state.paused) {
+        queueErrorPendingRef.current = false;
+        promptQueue.resume();
+        setQueuePumpVersion(value => value + 1);
+      }
+    } catch { showToast("Não foi possível retomar a fila. Tente novamente."); }
+  }
+
+  function editQueuedPrompt(id: string) {
+    if (input.trim() || attachments.length) { showToast("Envie ou limpe o rascunho atual antes de editar um prompt da fila."); return; }
+    const item = promptQueue.remove(id);
+    if (!item) return;
+    setInput(item.text); setAttachments(item.attachments.map(a => ({ ...a })));
+    setSelectedModel(item.selectedModel); setEffort(item.request.effort || "High");
+    setChatMode(item.request.planMode ? "plan" : "build");
+    composerRef.current?.focus();
+  }
 
   const stopDevelopment = React.useCallback(async () => {
     if (!sessionId) return;
+    promptQueue.pause("A tarefa foi interrompida. Revise os prompts pendentes antes de retomar.");
+    const queuedId = promptQueue.snapshot().active?.id;
+    if (queuedId) promptQueue.finish(queuedId);
     setPendingQuestion(null);
     pendingQuestionRef.current = null;
     setPendingPlan(null);
@@ -6851,13 +7132,19 @@ function App() {
   }, [sessionId, finishActivity]);
 
   const cancelJITPrompt = React.useCallback(() => {
+    promptQueue.pause("A conexão foi cancelada. Revise os prompts pendentes antes de retomar.");
+    const queuedId = promptQueue.snapshot().active?.id;
+    if (queuedId) promptQueue.finish(queuedId);
     const pending = pendingJITRef.current;
     pendingJITRef.current = null;
     void window.neko.lovableCancelJit?.("Operação cancelada pelo usuário.").catch(() => {});
     setModal(null);
     setWorkingStatus("");
     setBusy(false);
-    taskPhaseRef.current = "idle";
+    taskPhaseRef.current = "cancelled";
+    requestInFlightRef.current = false;
+    requestObservedBusyRef.current = false;
+    retryActiveRef.current = false;
     finishActivity();
     if (pending?.sessionId) {
       void window.neko.abort(pending.sessionId).catch(() => {});
@@ -6869,6 +7156,9 @@ function App() {
 
   const rejectPlan = React.useCallback(() => {
     if (!sessionId) return;
+    promptQueue.pause("A tarefa foi interrompida. Revise os prompts pendentes antes de retomar.");
+    const queuedId = promptQueue.snapshot().active?.id;
+    if (queuedId) promptQueue.finish(queuedId);
     taskAutoCommitSuppressedRef.current = true;
     const plan = pendingPlan;
     setPendingPlan(null);
@@ -6932,9 +7222,14 @@ function App() {
         await window.neko.questionReply(sessionId, plan.requestId, [[approvalAnswer]]);
         console.log(`[Plan] native approval sent requestId=${plan.requestId} session=${sessionId} answer=${approvalAnswer}`);
       } catch (error) {
+        if (String(taskPhaseRef.current) === "cancelled") return;
+        pauseQueuesOnError(false);
         requestInFlightRef.current = false;
         requestObservedBusyRef.current = false;
-        taskPhaseRef.current = "failed";
+        taskPhaseRef.current = "waiting_for_user";
+        planAwaitingRef.current = true;
+        pendingPlanTaskRef.current = plan.taskId || currentTaskIdRef.current;
+        setPendingPlan(plan);
         setBusy(false);
         setWorkingStatus("");
         setApprovedPlan(null);
@@ -6961,17 +7256,18 @@ function App() {
       const result = await window.neko.prompt(
         sessionId,
         "Plano aprovado. Prossiga com a implementação conforme o plano acima.",
-        getEffectiveModel(selectedModel),
+        (promptQueue.snapshot().active?.request.model ?? getEffectiveModel(selectedModel)),
         plan.attachments.length > 0 ? plan.attachments.map(a => ({ type: a.kind, url: a.url || a.previewUrl || "", mime: a.mime, path: a.path, name: a.name })) : undefined,
         plan.contextPaths.length > 0 ? plan.contextPaths : undefined,
         false,
-        effort
+        promptQueue.snapshot().active?.request.effort ?? effort
       );
       if (result?.taskId) {
         currentTaskIdRef.current = String(result.taskId);
         console.log(`[Plan] fallback approved and dispatched taskId=${result.taskId}`);
       }
     } catch (error) {
+      pauseQueuesOnError();
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
       taskPhaseRef.current = "failed";
@@ -6985,8 +7281,8 @@ function App() {
   }, [sessionId, pendingPlan, planApprovalBusy, selectedModel, effort, getEffectiveModel, sanitizeUserFacingText]);
 
   const answerQuestion = React.useCallback(async (value: string) => {
-    if (!sessionId || !pendingQuestion) return;
-    const question = pendingQuestion;
+    const question = pendingQuestionRef.current || pendingQuestion;
+    if (!sessionId || !question) return;
     setPendingQuestion(null);
     pendingQuestionRef.current = null;
     setWorkingStatus("Continuando...");
@@ -7006,7 +7302,9 @@ function App() {
         await window.neko.questionReply(sessionId, question.requestId, [value]);
         console.log(`[Question] native reply dispatched requestId=${question.requestId} questionId=${question.questionId}`);
       } else {
-        const result = await window.neko.prompt(sessionId, value, getEffectiveModel(selectedModel));
+        currentTaskIdRef.current = null;
+        requestStartedAtRef.current = Date.now();
+        const result = await window.neko.prompt(sessionId, value, (promptQueue.snapshot().active?.request.model ?? getEffectiveModel(selectedModel)));
         if (result?.taskId) {
           currentTaskIdRef.current = String(result.taskId);
           console.log(`[Question] answer dispatched taskId=${result.taskId} questionId=${question.questionId}`);
@@ -7022,14 +7320,21 @@ function App() {
         completedAt: Date.now()
       });
     } catch (error) {
+      if (String(taskPhaseRef.current) === "cancelled") return;
+      pauseQueuesOnError(!question.isNativeTool);
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
-      taskPhaseRef.current = "failed";
+      taskPhaseRef.current = question.isNativeTool ? "waiting_for_user" : "failed";
+      if (question.isNativeTool) {
+        pendingQuestionRef.current = question;
+        setPendingQuestion(question);
+      }
       setBusy(false);
       setWorkingStatus("");
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
     }
   }, [sessionId, pendingQuestion, selectedModel, getEffectiveModel, sanitizeUserFacingText, upsertActivity, sanitizeTimelineDetail]);
+  answerQuestionRef.current = answerQuestion;
 
   const rejectQuestion = React.useCallback(async (questionParam?: AgentQuestion | null) => {
     const question = questionParam || pendingQuestion;
@@ -7051,7 +7356,9 @@ function App() {
       } else {
         const fallbackText = "Continuar sem resposta — escolha por você, mantendo o objetivo da tarefa.";
         setMessages(prev => [...prev, { role: "user", text: fallbackText, createdAt: Date.now() }]);
-        const result = await window.neko.prompt(sessionId, fallbackText, getEffectiveModel(selectedModel));
+        currentTaskIdRef.current = null;
+        requestStartedAtRef.current = Date.now();
+        const result = await window.neko.prompt(sessionId, fallbackText, promptQueue.snapshot().active?.request.model ?? getEffectiveModel(selectedModel));
         if (result?.taskId) {
           currentTaskIdRef.current = String(result.taskId);
         }
@@ -7066,9 +7373,15 @@ function App() {
         completedAt: Date.now()
       });
     } catch (error) {
+      if (String(taskPhaseRef.current) === "cancelled") return;
+      pauseQueuesOnError(!question.isNativeTool);
       requestInFlightRef.current = false;
       requestObservedBusyRef.current = false;
-      taskPhaseRef.current = "failed";
+      taskPhaseRef.current = question.isNativeTool ? "waiting_for_user" : "failed";
+      if (question.isNativeTool) {
+        pendingQuestionRef.current = question;
+        setPendingQuestion(question);
+      }
       setBusy(false);
       setWorkingStatus("");
       setMessages(prev => [...prev, { role: "error", text: sanitizeUserFacingText(error instanceof Error ? error.message : error) }]);
@@ -7105,6 +7418,7 @@ function App() {
       });
     } catch (error) {
       // Permission remains in queue, user can retry
+      pauseQueuesOnError(false);
       console.error("[Permission] reply failed - keeping permission in queue", error);
       setWorkingStatus("Falha ao enviar resposta - tente novamente");
       showToast("Erro ao processar autorização. Tente novamente.", undefined);
@@ -7299,12 +7613,105 @@ function App() {
     }
   }
 
+  // --- Direct Publish Execution (Phase 1) ---
+  const directPublishBusyRef = React.useRef(false);
+  const executeDirectPublish = React.useCallback(async (targetProject: string, attemptId: string) => {
+    if (directPublishBusyRef.current) return;
+    directPublishBusyRef.current = true;
+    setGithubCommitBusy(true);
+    const routeFailure = (message: string, status = 0, committed = false) => {
+      const normalized = message.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+      setGithubCommitError(message);
+      if (status === 401 || /expired|bad.credentials|unauthorized|nao autenticad/.test(normalized)) {
+        setGithubIntent({type:"publish",projectPath:targetProject,attemptId,createdAt:Date.now(),executed:false});
+        void startGithubConnect(true);
+      } else if (status === 403 || status === 404 || /sem acesso|nao tem acesso|nao possui acesso|nao foi encontrado|nao existe|not.found|repository.*not|permission|forbidden|403|404/.test(normalized)) {
+        setModal("github");
+      } else {
+        setModal("gitCenter");
+        showToast(committed ? "Commit salvo. Resolva o envio no Git Center." : message);
+      }
+    };
+    try {
+      const git = await window.neko.githubGitStatus(targetProject);
+      if (!git?.linkedRepo) { prepareGithubPublish(); return; }
+      const res = await window.neko.githubCommitPush("Atualização pelo NekoAI", undefined, targetProject, true);
+      if (!res?.ok) {
+        routeFailure(res?.error || res?.message || "Não foi possível publicar as alterações.", res?.status, Boolean(res?.committed && !res?.pushed));
+        return;
+      }
+      setGithubCommitError("");
+      setGithubCommitSuccess(true);
+      setTimeout(() => setGithubCommitSuccess(false), 4000);
+      void syncGithubContext();
+    } catch (error: any) {
+      routeFailure(String(error?.message || error || "Falha ao publicar alterações."), Number(error?.status) || 0);
+    } finally {
+      directPublishBusyRef.current = false;
+      setGithubCommitBusy(false);
+      setGithubPublishBusy(false);
+    }
+  }, [syncGithubContext,showToast]);
+
+  const handleDirectPublish = React.useCallback(async () => {
+    if (!project) return;
+    if (directPublishBusyRef.current || githubPublishBusy || githubCommitBusy) return;
+
+    const currentProj = project;
+    const attemptId = `pub-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+    // Situação D — Nenhuma conta GitHub conectada
+    if (!githubStatus.connected) {
+      setGithubIntent({
+        type: "publish",
+        projectPath: currentProj,
+        attemptId,
+        createdAt: Date.now(),
+        executed: false
+      });
+      void startGithubConnect(false);
+      return;
+    }
+
+    // Obter git status atualizado do projeto
+    let git = githubLinkStatus;
+    try {
+      git = await window.neko?.githubGitStatus?.(currentProj);
+      if (git) setGithubLinkStatus(git);
+    } catch {}
+
+    const linkedRepo = git?.linkedRepo;
+
+    // Situação A — Projeto local, sem publicação
+    if (!linkedRepo) {
+      prepareGithubPublish();
+      return;
+    }
+
+    // Check current write access: a cached repository list is not authorization.
+    const activeAcc = githubStatus.activeAccount || githubStatus.user;
+    let isAccessible = false;
+    try {
+      const check = await window.neko.githubCheckRepoAccess({repoFullName:linkedRepo,projectPath:currentProj,accountId:activeAcc?.id});
+      isAccessible = Boolean(check?.accessible && check?.canWrite);
+    } catch {}
+
+    if (!isAccessible) {
+      // Abre configurações GitHub mostrando "Repositório sem acesso"
+      setModal("github");
+      return;
+    }
+
+    // Situação C — Projeto com remoto e conta com permissão: enviar alterações
+    await executeDirectPublish(currentProj, attemptId);
+  }, [project, githubStatus, githubLinkStatus, prepareGithubPublish, executeDirectPublish, githubPublishBusy, githubCommitBusy]);
+
   async function startGithubConnect(forceReauthorize: boolean = false) {
     console.log("[GitHub/UI] add account clicked");
     if (githubBusy) return;
-    if (modalRef.current === "githubClone" || pendingGithubIntentRef.current === "clone") {
+    if (modalRef.current === "githubClone" || pendingGithubIntentRef.current?.type === "clone") {
       setGithubIntent("clone");
-    } else if (modalRef.current === "githubPublish" || pendingGithubIntentRef.current === "publish") {
+    } else if (modalRef.current === "githubPublish" || pendingGithubIntentRef.current?.type === "publish") {
       setGithubIntent("publish");
     }
     setGithubBusy(true);
@@ -7584,12 +7991,12 @@ function App() {
 
   function prepareGithubPublish() {
     setGithubIntent("publish");
-    setGithubPublishRepoName("");
+    setGithubPublishRepoName(String(projectName || "projeto").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0,100) || "projeto");
     setGithubPublishPrivate(true);
     setGithubPublishError("");
     setGithubPublishBusy(false);
     if (!githubStatus.connected || githubStatus.needsInstallation) {
-      setModal("github");
+      void startGithubConnect(false);
       return;
     }
     setModal("githubPublish");
@@ -7775,7 +8182,7 @@ function App() {
           const ws = res.workspaceResult;
           setProject(ws.path || res.path);
           setStatus("online");
-          setMessages([]);
+          restoreConversation(ws.conversation, ws.path || res.path);
           setSessionId(ws.session?.id || "");
           setTree(ws.tree || []);
           setActiveFile(null);
@@ -8753,7 +9160,8 @@ function App() {
           aria-label="Selecionar página do Preview"
           title={previewCurrentRoute === "/" ? "Página inicial" : `Página: ${previewCurrentRoute}`}
         >
-          <span className="preview-page-label">{currentRouteLabel || "Home"}</span>
+          <Search size={12} className="preview-page-search-glyph" aria-hidden="true" />
+          <span className="preview-page-label">{previewCurrentRoute === "/" ? "Página inicial" : currentRouteLabel}</span>
           <ChevronDown size={13} className="preview-page-caret"/>
         </button>
         {previewRouteOpen && (
@@ -8797,7 +9205,7 @@ function App() {
                     onMouseEnter={() => setPreviewRouteMenuFocus(index)}
                     tabIndex={-1}
                   >
-                    <span className="preview-page-check">{route.path === previewCurrentRoute ? <Check size={13}/> : null}</span>
+                    <span className="preview-page-check"><FileText size={13}/></span>
                     <span className="preview-page-item-text">{route.label}</span>
                     {route.path !== "/" && <span className="preview-page-item-path">{route.path}</span>}
                   </button>
@@ -8810,7 +9218,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${licenseState.isLicensed && studioProjectPath ? "has-studio" : ""}`}>
       <header className="neko-custom-titlebar">
         <div className="titlebar-left-menus neko-titlebar-menu-wrap">
           {/* NekoAI Menu */}
@@ -9092,6 +9500,10 @@ function App() {
           </div>
         </div>
 
+                <button className="titlebar-menu-btn studio-tutorials-btn" onClick={() => setModal("tutorials")} title="Tutoriais do NekoAI" aria-label="Tutoriais do NekoAI">
+                  <Play size={13} fill="currentColor"/>
+                  <span>Tutoriais</span>
+                </button>
         <div className="titlebar-drag-spacer" />
 
         <div className="titlebar-win-controls">
@@ -9148,7 +9560,7 @@ function App() {
 
       <ProviderIconSprite />
 
-      {((!project && status === "starting") || (isExiting && !project)) ? (
+      {(!openingProjectPath && ((!project && status === "starting") || (isExiting && !project))) ? (
         <div className="home-loading-overlay" role="status" aria-live="polite">
           <div className="home-loading-box">
             <Loader2 size={26} className="spin home-loading-spin" />
@@ -9169,376 +9581,461 @@ function App() {
       )}
 
       {licenseState.isLicensed ? (
-        project ? (
+        studioProjectPath ? (
           <>
           {console.log("[BLACKSCREEN] workspace-render", { project, status, isLicensed: licenseState.isLicensed, isExiting: isExitingRef.current })}
-        <header className={`topbar ${chatCollapsed ? "chat-collapsed" : ""}`}>
-          <div className="topbar-left">
-            <div className="brand">
-              <img className="neko-logo-image" src={nekoLogo} alt="NekoAI" />
+        <div className="studio-layout">
+          <aside className="app-sidebar">
+            <div className="sidebar-top-group">
+              <button
+                type="button"
+                className="sidebar-brand-btn"
+                title="NekoAI"
+                aria-label="NekoAI"
+                onClick={() => void exitProject("homeNav")}
+              >
+                <span className="sidebar-brand-crop"><img className="sidebar-brand-icon" src={nekoLogo} alt="NekoAI" /></span>
+              </button>
+              <button
+                type="button"
+                className="sidebar-action-btn sidebar-home-btn"
+                disabled={isExiting}
+                onClick={() => void exitProject("homeNav")}
+                title="Página inicial"
+                aria-label="Página inicial"
+              >
+                {isExiting ? <Loader2 size={16} className="spin" /> : <HomeIcon size={16} />}
+              </button>
+              <button
+                type="button"
+                className="sidebar-action-btn sidebar-collapse-btn"
+                onClick={() => setChatCollapsed(v => !v)}
+                title={chatCollapsed ? "Expandir chat" : "Recolher chat"}
+                aria-label={chatCollapsed ? "Expandir chat" : "Recolher chat"}
+              >
+                {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+              </button>
+              <button
+                type="button"
+                className="sidebar-action-btn sidebar-add-btn"
+                disabled={isSwitchingProject}
+                onClick={() => void openOtherProject()}
+                title="Abrir projeto existente"
+                aria-label="Abrir projeto existente"
+              >
+                <Plus size={16} />
+              </button>
             </div>
 
-            {(project || recentProjects.length > 0) ? <div className="project-selector-wrap">
-              <button
-                className="project-selector"
-                onClick={() => project ? openProjectSelector() : setRecentProjectsMenuOpen(v => !v)}
-                title={project || "Projetos recentes"}
-              >
-                <span className="project-selector-icon"><FolderOpen size={17}/></span>
-                <span className="project-selector-copy">
-                  <b>{project ? projectName : "Projetos recentes"}</b>
-                  <span>{project ? (githubLinkStatus.linkedRepo || project) : "Selecione um projeto recente"}</span>
-                </span>
-                <span className="project-selector-chevron">
-                  {(projectMenuOpen || recentProjectsMenuOpen) ? <ChevronUp size={14}/> : <ChevronDown size={14}/>}
-                </span>
-              </button>
-
-              {projectMenuOpen && project ? <div className="project-selector-menu recent-menu">
-                <div className="recent-menu-label">PROJETO ATUAL</div>
-                <div className="project-menu-current">
-                  <FolderOpen size={14}/>
-                  <div><b>{projectName}</b><small>{project}</small></div>
-                </div>
-                {recentProjects.filter(item => item.path !== project).length ? <>
-                  <div className="recent-menu-label">PROJETOS RECENTES</div>
-                  {recentProjects.filter(item => item.path !== project).map(item =>
-                    <button
-                      key={item.path}
-                      className="recent-project-item"
-                      disabled={isSwitchingProject}
-                      onClick={() => { setProjectMenuOpen(false); setRecentProjectsMenuOpen(false); void openRecentProject(item.path, "RecentProjects"); }}
-                    >
-                      <Folder size={14}/>
-                      <span><b>{item.name}</b><small>{item.path}</small></span>
-                      {isSwitchingProject ? <Loader2 size={12} className="spin" /> : null}
-                    </button>
+            <div className="sidebar-bottom-group">
+                <button
+                  className={`integration-status ${chatgptState.status === "connected" ? "online" : chatgptState.status === "authorizing" ? "busy" : chatgptState.status === "error" ? "error" : "idle"}`}
+                  onClick={() => {
+                    setChatgptError(null);
+                    if (typeof window.neko?.chatgptGetState === "function") {
+                      void window.neko.chatgptGetState().then((s: any) => { if (s) setChatgptState(s); }).catch(() => {});
+                    } else {
+                      setChatgptError("A API do ChatGPT não está disponível nesta versão.");
+                    }
+                    setModal("chatgpt");
+                  }}
+                  title={
+                    chatgptState.status === "connected"
+                      ? `ChatGPT — Conectado (${chatgptState.email || chatgptState.plan || "Conta pessoal"})`
+                      : chatgptState.status === "authorizing"
+                      ? "ChatGPT — Aguardando autorização no navegador..."
+                      : chatgptState.status === "error"
+                      ? `ChatGPT — Erro: ${chatgptState.error || "falha na conexão"}`
+                      : "ChatGPT — Conectar conta pessoal"
+                  }
+                >
+                  {chatgptState.status === "authorizing" ? (
+                    <Loader2 size={16} className="spin" />
+                  ) : (
+                    <ChatGptIcon size={17} />
                   )}
-                </> : null}
-                {githubStatus.connected && githubLinkStatus.linkedRepo ? <div className="project-menu-row" onClick={e => e.stopPropagation()}>
-                  <span className="repo-badge"><GitHubIcon size={13}/>{githubLinkStatus.linkedRepo}</span>
-                  <span className="branch-badge" onClick={e => e.stopPropagation()}><GitBranch size={12}/>{githubLinkStatus.branch || "main"}</span>
-                </div> : null}
-                <button className="project-menu-action" disabled={isSwitchingProject} onClick={() => void openOtherProject()}>
-                  <FolderOpen size={14}/> Abrir outro projeto
+                  <span className="integration-dot" />
                 </button>
-              </div> : null}
 
-              {recentProjectsMenuOpen && !project ? <div className="project-selector-menu recent-menu">
-                <div className="recent-menu-label">PROJETOS RECENTES</div>
-                {recentProjects.map(item =>
+                <button
+                  className={`integration-status ${vercelState.connection === "connected" ? "online" : vercelState.deployment === "deploying" ? "busy" : vercelState.connection === "error" || vercelState.deployment === "error" ? "error" : "idle"}`}
+                  onClick={() => {
+                    setVercelError(null);
+                    const folderName = project ? (project.split(/[\\\\\\/]/).filter(Boolean).pop() || "") : "";
+                    setVercelProjectName(slugifyVercelProjectName(folderName));
+                    setModal("vercel");
+                  }}
+                  title={
+                    vercelState.deployment === "deploying"
+                      ? "Vercel — Publicando em produção..."
+                      : vercelState.deploymentUrl
+                      ? `Vercel — Publicado: ${vercelState.deploymentUrl}`
+                      : vercelState.connection === "connected"
+                      ? `Vercel — Conectado como ${vercelState.username || "usuário"}`
+                      : vercelState.connection === "authorizing"
+                      ? "Vercel — Conectando no terminal..."
+                      : vercelState.connection === "error"
+                      ? `Vercel — Erro: ${vercelState.error || "falha na conexão"}`
+                      : "Vercel — Publicar em produção"
+                  }
+                >
+                  {vercelState.deployment === "deploying" ? (
+                    <Loader2 size={16} className="spin" />
+                  ) : (
+                    <VercelIcon size={17} />
+                  )}
+                  <span className="integration-dot" />
+                </button>
+
+                <button
+                  className={`integration-status ${supabaseState.status === "connected" ? "online" : "idle"}`}
+                  onClick={() => {
+                    console.log("[SupabaseUI] topbar Supabase icon clicked, current state:", supabaseState);
+                    void window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
+                    setSupabaseError("");
+                    setSupabaseView("auto");
+                    setModal("supabase");
+                  }}
+                  title={
+                    supabaseState.status === "connected"
+                      ? `Supabase — Conectado${supabaseState.projectName ? `: ${supabaseState.projectName}` : ""}`
+                      : ["checking", "authorizing", "verifying", "selecting", "validating", "installing"].includes(supabaseState.status)
+                      ? "Supabase — Conectando..."
+                      : supabaseState.status === "error"
+                      ? `Supabase — Erro${supabaseState.error ? `: ${supabaseState.error}` : ""}`
+                      : "Supabase — Não conectado"
+                  }
+                >
+                  <SupabaseIcon size={17}/>
+                  <span className="integration-dot"/>
+                </button>
+
+                <button
+                  className={`integration-status ${lovableState.status === "connected" ? "online" : lovableState.isLovableProject ? "busy" : "idle"}`}
+                  onClick={() => {
+                    setLovableError("");
+                    setModal("lovable");
+                    void window.neko.lovableGetState().then((s: any) => { if (s) setLovableState(s); }).catch(() => {});
+                  }}
+                  title={
+                    lovableState.status === "connected"
+                      ? `Lovable Cloud — Conectado${lovableState.projectId ? `: ${lovableState.projectId}` : ""}`
+                      : lovableState.status === "validating"
+                      ? "Lovable Cloud — Validando conexão..."
+                      : lovableState.status === "authorizing"
+                      ? "Lovable Cloud — Aguardando autenticação..."
+                      : lovableState.status === "error"
+                      ? `Lovable Cloud — Erro${lovableState.error ? `: ${lovableState.error}` : ""}`
+                      : lovableState.isLovableProject
+                      ? "Lovable Cloud — Projeto Lovable detectado (clique para conectar)"
+                      : "Lovable Cloud — Não conectado"
+                  }
+                >
+                  <LovableIcon size={17}/>
+                  <span className="integration-dot"/>
+                </button>
+
+                <button className={`integration-status ${githubStatus.connected ? (githubStatus.needsInstallation ? "busy" : "online") : "idle"}`} onClick={() => {
+                  setGithubError("");
+                  setGithubShowRepos(false);
+                  setGithubCommitSuccess(false);
+                  void syncGithubContext();
+                  if (project) {
+                    setModal("gitCenter");
+                    void window.neko.githubStatus(true).then(st => { if (st) setGithubStatus(st); }).catch(() => {});
+                    void window.neko.githubGitStatus().then(setGithubLinkStatus).catch(() => {});
+                    if (githubLinkStatus.linkedRepo && githubLinkStatus.branch) {
+                      void refreshPullRequestStatus();
+                    }
+                  } else {
+                    setModal("github");
+                  }
+                }} title={!githubStatus.connected ? "GitHub não conectado" : (githubStatus.needsInstallation ? `GitHub autorizado (@${githubStatus.user?.login || ""}) — Instalação do App necessária` : `GitHub conectado como @${githubStatus.user?.login || ""}`)}>
+                  <GitHubIcon size={17}/>
+                  <span className="integration-dot"/>
+                </button>
+
+
+              <button
+                type="button"
+                className="sidebar-action-btn sidebar-theme-btn"
+                onClick={handleToggleTheme}
+                title={theme === "light" ? "Mudar para tema escuro" : "Mudar para tema claro"}
+                aria-label="Alternar tema"
+              >
+                {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
+              </button>
+                {updaterState.status === "available" && (
                   <button
-                    key={item.path}
-                    className="recent-project-item"
-                    disabled={isSwitchingProject}
-                    onClick={() => { setProjectMenuOpen(false); setRecentProjectsMenuOpen(false); void openRecentProject(item.path, "RecentProjects"); }}
+                    className="top-update-available-pill"
+                    onClick={() => setModal("settings")}
+                    title={`Nova versão disponível (v${updaterState.updateInfo?.version || ""}) — Clique para abrir atualizações`}
+                    aria-label="Atualização Disponível"
                   >
-                    <Folder size={14}/>
-                    <span><b>{item.name}</b><small>{item.path}</small></span>
-                    {isSwitchingProject ? <Loader2 size={12} className="spin" /> : null}
+                    <span>Atualização Disponível!</span>
                   </button>
                 )}
-                <button className="project-menu-action" disabled={isSwitchingProject} onClick={() => void openOtherProject()}>
-                  <FolderOpen size={14}/> Abrir nova pasta
-                </button>
-              </div> : null}
-            </div> : null}
 
-            <button
-              className="collapse-chat-btn"
-              onClick={() => setChatCollapsed(v => !v)}
-              aria-label={chatCollapsed ? "Abrir chat" : "Fechar chat"}
-              title={chatCollapsed ? "Expandir chat" : "Recolher chat"}
-            >
-              {chatCollapsed ? <PanelLeftOpen size={15}/> : <PanelLeftClose size={15}/>}
-            </button>
-
-            {previewFramework ? <span className="workspace-framework">{previewFramework}</span> : null}
-
-            <div className="workspace-tabs">
-              <button className={workspaceTab === "preview" ? "active" : ""} onClick={() => setWorkspaceTab("preview")}><Eye size={14}/> Preview</button>
-              <button className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}><Code2 size={14}/> Código</button>
-            </div>
-          </div>
-
-          <div className="topbar-center">
-            {renderPreviewRouteSelector()}
-            {workspaceTab === "preview" && (
-              <div className="workspace-tools">
-                <button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")} title="Desktop"><Monitor size={14}/></button>
-                <button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")} title="Tablet"><Tablet size={14}/></button>
-                <button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")} title="Mobile"><Smartphone size={14}/></button>
-                <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={14}/></button>
-                <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; const targetUrl = previewEffectiveUrl || previewUrl; console.log("[Neko/PreviewExternal] click", `url=${String(targetUrl)}`); void window.neko.openPreviewExternal(targetUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={14}/></button>
-              </div>
-            )}
-          </div>
-
-          <div className="top-right-actions">
-            <button className="tutorials-top-btn" onClick={() => setModal("tutorials")} title="Tutoriais do NekoAI" aria-label="Tutoriais do NekoAI">
-              <Play size={13} fill="currentColor"/>
-              <span>Tutoriais</span>
-            </button>
-            <button
-              className={`integration-status ${chatgptState.status === "connected" ? "online" : chatgptState.status === "authorizing" ? "busy" : chatgptState.status === "error" ? "error" : "idle"}`}
-              onClick={() => {
-                setChatgptError(null);
-                if (typeof window.neko?.chatgptGetState === "function") {
-                  void window.neko.chatgptGetState().then((s: any) => { if (s) setChatgptState(s); }).catch(() => {});
-                } else {
-                  setChatgptError("A API do ChatGPT não está disponível nesta versão.");
-                }
-                setModal("chatgpt");
-              }}
-              title={
-                chatgptState.status === "connected"
-                  ? `ChatGPT — Conectado (${chatgptState.email || chatgptState.plan || "Conta pessoal"})`
-                  : chatgptState.status === "authorizing"
-                  ? "ChatGPT — Aguardando autorização no navegador..."
-                  : chatgptState.status === "error"
-                  ? `ChatGPT — Erro: ${chatgptState.error || "falha na conexão"}`
-                  : "ChatGPT — Conectar conta pessoal"
-              }
-            >
-              {chatgptState.status === "authorizing" ? (
-                <Loader2 size={16} className="spin" />
-              ) : (
-                <ChatGptIcon size={17} />
-              )}
-              <span className="integration-dot" />
-            </button>
-            <button
-              className={`integration-status ${vercelState.connection === "connected" ? "online" : vercelState.deployment === "deploying" ? "busy" : vercelState.connection === "error" || vercelState.deployment === "error" ? "error" : "idle"}`}
-              onClick={() => {
-                setVercelError(null);
-                const folderName = project ? (project.split(/[/\\]/).filter(Boolean).pop() || "") : "";
-                setVercelProjectName(slugifyVercelProjectName(folderName));
-                setModal("vercel");
-              }}
-              title={
-                vercelState.deployment === "deploying"
-                  ? "Vercel — Publicando em produção..."
-                  : vercelState.deploymentUrl
-                  ? `Vercel — Publicado: ${vercelState.deploymentUrl}`
-                  : vercelState.connection === "connected"
-                  ? `Vercel — Conectado como ${vercelState.username || "usuário"}`
-                  : vercelState.connection === "authorizing"
-                  ? "Vercel — Conectando no terminal..."
-                  : vercelState.connection === "error"
-                  ? `Vercel — Erro: ${vercelState.error || "falha na conexão"}`
-                  : "Vercel — Publicar em produção"
-              }
-            >
-              {vercelState.deployment === "deploying" ? (
-                <Loader2 size={16} className="spin" />
-              ) : (
-                <VercelIcon size={17} />
-              )}
-              <span className="integration-dot" />
-            </button>
-            <button
-              className={`integration-status ${supabaseState.status === "connected" ? "online" : "idle"}`}
-              onClick={() => {
-                console.log("[SupabaseUI] topbar Supabase icon clicked, current state:", supabaseState);
-                void window.neko.supabaseGetState().then((s: any) => { if (s) setSupabaseState(s); }).catch(() => {});
-                setSupabaseError("");
-                setSupabaseView("auto");
-                setModal("supabase");
-              }}
-              title={
-                supabaseState.status === "connected"
-                  ? `Supabase — Conectado${supabaseState.projectName ? `: ${supabaseState.projectName}` : ""}`
-                  : ["checking", "authorizing", "verifying", "selecting", "validating", "installing"].includes(supabaseState.status)
-                  ? "Supabase — Conectando..."
-                  : supabaseState.status === "error"
-                  ? `Supabase — Erro${supabaseState.error ? `: ${supabaseState.error}` : ""}`
-                  : "Supabase — Não conectado"
-              }
-            >
-              <SupabaseIcon size={17}/>
-              <span className="integration-dot"/>
-            </button>
-            <button
-              className={`integration-status ${lovableState.status === "connected" ? "online" : lovableState.isLovableProject ? "busy" : "idle"}`}
-              onClick={() => {
-                setLovableError("");
-                setModal("lovable");
-                void window.neko.lovableGetState().then((s: any) => { if (s) setLovableState(s); }).catch(() => {});
-              }}
-              title={
-                lovableState.status === "connected"
-                  ? `Lovable Cloud — Conectado${lovableState.projectId ? `: ${lovableState.projectId}` : ""}`
-                  : lovableState.status === "validating"
-                  ? "Lovable Cloud — Validando conexão..."
-                  : lovableState.status === "authorizing"
-                  ? "Lovable Cloud — Aguardando autenticação..."
-                  : lovableState.status === "error"
-                  ? `Lovable Cloud — Erro${lovableState.error ? `: ${lovableState.error}` : ""}`
-                  : lovableState.isLovableProject
-                  ? "Lovable Cloud — Projeto Lovable detectado (clique para conectar)"
-                  : "Lovable Cloud — Não conectado"
-              }
-            >
-              <LovableIcon size={17}/>
-              <span className="integration-dot"/>
-            </button>
-            <button className={`integration-status ${githubStatus.connected ? (githubStatus.needsInstallation ? "busy" : "online") : "idle"}`} onClick={() => {
-              setGithubError("");
-              setGithubShowRepos(false);
-              setGithubCommitSuccess(false);
-              void syncGithubContext();
-              if (project) {
-                setModal("gitCenter");
-                void window.neko.githubStatus(true).then(st => { if (st) setGithubStatus(st); }).catch(() => {});
-                void window.neko.githubGitStatus().then(setGithubLinkStatus).catch(() => {});
-                if (githubLinkStatus.linkedRepo && githubLinkStatus.branch) {
-                  void refreshPullRequestStatus();
-                }
-              } else {
-                setModal("github");
-              }
-            }} title={!githubStatus.connected ? "GitHub não conectado" : (githubStatus.needsInstallation ? `GitHub autorizado (@${githubStatus.user?.login || ""}) — Instalação do App necessária` : `GitHub conectado como @${githubStatus.user?.login || ""}`)}>
-              <GitHubIcon size={17}/>
-              <span className="integration-dot"/>
-            </button>
-            {updaterState.status === "available" && (
-              <button
-                className="top-update-available-pill"
-                onClick={() => setModal("settings")}
-                title={`Nova versão disponível (v${updaterState.updateInfo?.version || ""}) — Clique para abrir atualizações`}
-                aria-label="Atualização Disponível"
-              >
-                <span>Atualização Disponível!</span>
-              </button>
-            )}
-            <button
-              className={`integration-status ${updaterState.status === "available" ? "online" : updaterState.status === "error" ? "idle" : updaterState.status === "checking" || updaterState.status === "downloading" ? "busy" : "online"}`}
-              onClick={() => {
-                setModal("settings");
-              }}
-              title={
-                updaterState.status === "available"
-                  ? `Configurações — Nova versão disponível (${updaterState.updateInfo?.version || ""})`
-                  : updaterState.status === "downloaded"
-                  ? "Configurações — Atualização pronta para reiniciar"
-                  : updaterState.status === "downloading"
-                  ? `Configurações — Baixando atualização (${Math.round(updaterState.progress?.percent || 0)}%)`
-                  : updaterState.status === "error"
-                  ? `Configurações — Erro na verificação: ${updaterState.error || ""}`
-                  : "Configurações — NekoAI atualizado"
-              }
-            >
-              {updaterState.status === "checking" || updaterState.status === "downloading" ? (
-                <Loader2 size={16} className="spin" />
-              ) : (
-                <Settings2 size={17} />
-              )}
-              {updaterState.status !== "available" && <span className="integration-dot" />}
-            </button>
-            {project && githubLinkStatus.linkedRepo ? <div className="top-branch-wrap">
-              <button
-                className="top-branch-btn"
-                onClick={() => {
-                  if (githubBranchBusy) return;
-                  const next = !githubBranchMenuOpen;
-                  setGithubBranchMenuOpen(next);
-                  if (next) {
-                    void refreshGithubBranches();
+                <button
+                  className={`integration-status ${updaterState.status === "available" ? "online" : updaterState.status === "error" ? "idle" : updaterState.status === "checking" || updaterState.status === "downloading" ? "busy" : "online"}`}
+                  onClick={() => {
+                    setModal("settings");
+                  }}
+                  title={
+                    updaterState.status === "available"
+                      ? `Configurações — Nova versão disponível (${updaterState.updateInfo?.version || ""})`
+                      : updaterState.status === "downloaded"
+                      ? "Configurações — Atualização pronta para reiniciar"
+                      : updaterState.status === "downloading"
+                      ? `Configurações — Baixando atualização (${Math.round(updaterState.progress?.percent || 0)}%)`
+                      : updaterState.status === "error"
+                      ? `Configurações — Erro na verificação: ${updaterState.error || ""}`
+                      : "Configurações — NekoAI atualizado"
                   }
-                }}
-                disabled={githubBranchBusy}
-                title={githubLinkStatus.branch ? `Branch atual: ${githubLinkStatus.branch}` : githubLinkStatus.initialized ? "HEAD destacada (sem branch ativa)" : "Repositório não inicializado"}
-              >
-                {githubBranchBusy ? <Loader2 size={13} className="spin"/> : <GitBranch size={13}/>}
-                <span className="top-branch-name">{githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")}</span>
-                {githubBranchRefreshing ? <Loader2 size={11} className="spin" style={{ opacity: 0.7 }} /> : <ChevronDown size={13}/>}
-              </button>
-              {githubBranchMenuOpen ? <div className="top-branch-menu">
-                <div className="top-branch-list">
-                  {Array.from(new Set(githubBranches.length ? githubBranches : [githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")])).map(branch =>
-                    <button
-                      key={branch}
-                      disabled={githubBranchBusy || githubBranchRefreshing}
-                      className={`top-branch-item ${branch === (githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")) ? "active" : ""}`}
-                      onClick={() => { if (!githubBranchBusy && !githubBranchRefreshing && branch !== "HEAD destacada") void chooseGithubBranch(branch); }}
-                    >
-                      {branch === (githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")) ? <Check size={12}/> : <span className="branch-placeholder"/>}
-                      <span>{branch}</span>
-                      {githubBranchBusy && branch !== githubLinkStatus.branch ? <Loader2 size={10} className="spin branch-item-spin"/> : null}
-                    </button>
+                >
+                  {updaterState.status === "checking" || updaterState.status === "downloading" ? (
+                    <Loader2 size={16} className="spin" />
+                  ) : (
+                    <Settings2 size={17} />
                   )}
-                </div>
-                {githubBranchError ? <div className="branch-picker-error">{githubBranchError}</div> : null}
-                <div className="top-branch-divider" />
-                {!isCreatingBranch ? (
-                  <button
-                    className="top-branch-create-btn"
-                    disabled={githubBranchBusy || githubBranchRefreshing}
-                    onClick={() => {
-                      setIsCreatingBranch(true);
-                      setNewBranchInput("");
-                      setGithubBranchError("");
-                    }}
-                  >
-                    <Plus size={13} />
-                    <span>Criar nova branch</span>
-                  </button>
-                ) : (
-                  <div className="top-branch-create-panel" onClick={e => e.stopPropagation()}>
-                    <div className="top-branch-create-origin">
-                      Origem: <b>{githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")}</b>
-                    </div>
-                    <input
-                      type="text"
-                      className="top-branch-create-input"
-                      placeholder="Nome da nova branch..."
-                      value={newBranchInput}
-                      autoFocus
-                      disabled={githubBranchBusy || githubBranchRefreshing}
-                      onChange={e => setNewBranchInput(e.target.value)}
-                      onKeyDown={e => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          void createGithubBranch(newBranchInput);
-                        } else if (e.key === "Escape") {
-                          e.preventDefault();
-                          setIsCreatingBranch(false);
-                          setNewBranchInput("");
-                        }
-                      }}
-                    />
-                    <div className="top-branch-create-actions">
-                      <button
-                        type="button"
-                        className="top-branch-cancel-btn"
-                        disabled={githubBranchBusy || githubBranchRefreshing}
-                        onClick={() => {
-                          setIsCreatingBranch(false);
-                          setNewBranchInput("");
-                        }}
-                      >
-                        Cancelar
-                      </button>
-                      <button
-                        type="button"
-                        className="top-branch-confirm-btn"
-                        disabled={githubBranchBusy || githubBranchRefreshing || !newBranchInput.trim()}
-                        onClick={() => void createGithubBranch(newBranchInput)}
-                      >
-                        {githubBranchBusy ? <Loader2 size={12} className="spin"/> : "Criar"}
-                      </button>
-                    </div>
+                  {updaterState.status !== "available" && <span className="integration-dot" />}
+                </button>
+
+            </div>
+          </aside>
+
+          <div className="studio-main">
+            <header className="app-navbar">
+              <div className="navbar-left">
+                {(project || recentProjects.length > 0) ? (
+                  <div className="project-selector-wrap" style={{ width: "100%" }}>
+                    <button
+                      className="project-selector"
+                      onClick={() => project ? openProjectSelector() : setRecentProjectsMenuOpen(v => !v)}
+                      title={project || "Projetos recentes"}
+                    >
+                      <span className="project-selector-icon"><FolderOpen size={16}/></span>
+                      <span className="project-selector-copy">
+                        <b>{studioProjectPath ? projectName : "Projetos recentes"}</b>
+                        <span>{project ? (githubLinkStatus.linkedRepo || project) : "Selecione um projeto recente"}</span>
+                      </span>
+                      <span className="project-selector-chevron">
+                        {(projectMenuOpen || recentProjectsMenuOpen) ? <ChevronUp size={13}/> : <ChevronDown size={13}/>}
+                      </span>
+                    </button>
+
+                    {projectMenuOpen && project ? (
+                      <div className="project-selector-menu recent-menu">
+                        <div className="recent-menu-label">PROJETO ATUAL</div>
+                        <div className="project-menu-current">
+                          <FolderOpen size={14}/>
+                          <div><b>{projectName}</b><small>{project}</small></div>
+                        </div>
+                        {recentProjects.filter(item => item.path !== project).length ? (
+                          <>
+                            <div className="recent-menu-label">PROJETOS RECENTES</div>
+                            {recentProjects.filter(item => item.path !== project).map(item =>
+                              <button
+                                key={item.path}
+                                className="recent-project-item"
+                                disabled={isSwitchingProject}
+                                onClick={() => { setProjectMenuOpen(false); setRecentProjectsMenuOpen(false); void openRecentProject(item.path, "RecentProjects"); }}
+                              >
+                                <Folder size={14}/>
+                                <span><b>{item.name}</b><small>{item.path}</small></span>
+                                {isSwitchingProject ? <Loader2 size={12} className="spin" /> : null}
+                              </button>
+                            )}
+                          </>
+                        ) : null}
+                        {githubStatus.connected && githubLinkStatus.linkedRepo ? (
+                          <div className="project-menu-row" onClick={e => e.stopPropagation()}>
+                            <span className="repo-badge"><GitHubIcon size={13}/>{githubLinkStatus.linkedRepo}</span>
+                            <span className="branch-badge" onClick={e => e.stopPropagation()}><GitBranch size={12}/>{githubLinkStatus.branch || "main"}</span>
+                          </div>
+                        ) : null}
+                        <button className="project-menu-action" disabled={isSwitchingProject} onClick={() => void openOtherProject()}>
+                          <FolderOpen size={14}/> Abrir outro projeto
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {recentProjectsMenuOpen && !project ? (
+                      <div className="project-selector-menu recent-menu">
+                        <div className="recent-menu-label">PROJETOS RECENTES</div>
+                        {recentProjects.map(item =>
+                          <button
+                            key={item.path}
+                            className="recent-project-item"
+                            disabled={isSwitchingProject}
+                            onClick={() => { setProjectMenuOpen(false); setRecentProjectsMenuOpen(false); void openRecentProject(item.path, "RecentProjects"); }}
+                          >
+                            <Folder size={14}/>
+                            <span><b>{item.name}</b><small>{item.path}</small></span>
+                            {isSwitchingProject ? <Loader2 size={12} className="spin" /> : null}
+                          </button>
+                        )}
+                        <button className="project-menu-action" disabled={isSwitchingProject} onClick={() => void openOtherProject()}>
+                          <FolderOpen size={14}/> Abrir nova pasta
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="navbar-center">
+                {workspaceTab === "preview" && (
+                  <div className="workspace-tools">
+                    <button className={device === "desktop" ? "active" : ""} onClick={() => setDevice("desktop")} title="Desktop"><Monitor size={14}/></button>
+                    <button className={device === "tablet" ? "active" : ""} onClick={() => setDevice("tablet")} title="Tablet"><Tablet size={14}/></button>
+                    <button className={device === "mobile" ? "active" : ""} onClick={() => setDevice("mobile")} title="Mobile"><Smartphone size={14}/></button>
+
                   </div>
                 )}
-              </div> : null}
-            </div> : null}
-            {project ? (
-              <button className="top-exit-btn" onClick={() => void exitProject("topbarExit")} disabled={isExiting} title="Sair do projeto e voltar à Home" aria-label="Sair do projeto">
-                {isExiting ? <Loader2 size={15} className="spin"/> : <LogOut size={15}/>}
-              </button>
-            ) : null}
-          </div>
-        </header>
+
+                <div className="navbar-views-group">
+
+                  <div className="workspace-tabs">
+                    <button className={workspaceTab === "preview" ? "active" : ""} onClick={() => setWorkspaceTab("preview")}><Eye size={14}/> Preview</button>
+                    <button className={workspaceTab === "code" ? "active" : ""} onClick={() => setWorkspaceTab("code")}><Code2 size={14}/> Código</button>
+                  </div>
+                  {previewFramework ? <span className="workspace-framework">{previewFramework}</span> : null}
+                </div>
+
+                <div className="navbar-route-selector">
+                  {workspaceTab === "preview" && (
+                    <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => void handlePreviewRefresh()} aria-label="Atualizar preview" title={previewUrl && previewStatus === "ready" ? "Atualizar preview" : "Preview indisponível"}><RefreshCw size={14}/></button>
+                  )}
+                  {renderPreviewRouteSelector()}
+                  {workspaceTab === "preview" && (
+                    <button disabled={!previewUrl || previewStatus !== "ready"} onClick={() => { if (!previewUrl || previewStatus !== "ready") return; const targetUrl = previewEffectiveUrl || previewUrl; console.log("[Neko/PreviewExternal] click", `url=${String(targetUrl)}`); void window.neko.openPreviewExternal(targetUrl).then(() => console.log("[Neko/PreviewExternal] invoke-resolved")).catch((error) => console.warn("[Neko/PreviewExternal] invoke-rejected", String(error?.message ?? error))); }} aria-label="Abrir externamente" title={previewUrl && previewStatus === "ready" ? "Abrir em janela externa" : "Preview indisponível"}><ExternalLink size={14}/></button>
+                  )}
+                </div>
+              </div>
+
+              <div className="navbar-right">
+
+
+                {project && githubLinkStatus.linkedRepo ? (
+                  <div className="top-branch-wrap">
+                    <button
+                      className="top-branch-btn"
+                      onClick={() => {
+                        if (githubBranchBusy) return;
+                        const next = !githubBranchMenuOpen;
+                        setGithubBranchMenuOpen(next);
+                        if (next) {
+                          void refreshGithubBranches();
+                        }
+                      }}
+                      disabled={githubBranchBusy}
+                      title={githubLinkStatus.branch ? `Branch atual: ${githubLinkStatus.branch}` : githubLinkStatus.initialized ? "HEAD destacada (sem branch ativa)" : "Repositório não inicializado"}
+                    >
+                      {githubBranchBusy ? <Loader2 size={13} className="spin"/> : <GitBranch size={13}/>}
+                      <span className="top-branch-name">{githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")}</span>
+                      {githubBranchRefreshing ? <Loader2 size={11} className="spin" style={{ opacity: 0.7 }} /> : <ChevronDown size={13}/>}
+                    </button>
+                    {githubBranchMenuOpen ? (
+                      <div className="top-branch-menu">
+                        <div className="top-branch-list">
+                          {Array.from(new Set(githubBranches.length ? githubBranches : [githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")])).map(branch =>
+                            <button
+                              key={branch}
+                              disabled={githubBranchBusy || githubBranchRefreshing}
+                              className={`top-branch-item ${branch === (githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")) ? "active" : ""}`}
+                              onClick={() => { if (!githubBranchBusy && !githubBranchRefreshing && branch !== "HEAD destacada") void chooseGithubBranch(branch); }}
+                            >
+                              {branch === (githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")) ? <Check size={12}/> : <span className="branch-placeholder"/>}
+                              <span>{branch}</span>
+                              {githubBranchBusy && branch !== githubLinkStatus.branch ? <Loader2 size={10} className="spin branch-item-spin"/> : null}
+                            </button>
+                          )}
+                        </div>
+                        {githubBranchError ? <div className="branch-picker-error">{githubBranchError}</div> : null}
+                        <div className="top-branch-divider" />
+                        {!isCreatingBranch ? (
+                          <button
+                            className="top-branch-create-btn"
+                            disabled={githubBranchBusy || githubBranchRefreshing}
+                            onClick={() => {
+                              setIsCreatingBranch(true);
+                              setNewBranchInput("");
+                              setGithubBranchError("");
+                            }}
+                          >
+                            <Plus size={13} />
+                            <span>Criar nova branch</span>
+                          </button>
+                        ) : (
+                          <div className="top-branch-create-panel" onClick={e => e.stopPropagation()}>
+                            <div className="top-branch-create-origin">
+                              Origem: <b>{githubLinkStatus.branch || (githubLinkStatus.initialized ? "HEAD destacada" : "main")}</b>
+                            </div>
+                            <input
+                              type="text"
+                              className="top-branch-create-input"
+                              placeholder="Nome da nova branch..."
+                              value={newBranchInput}
+                              autoFocus
+                              disabled={githubBranchBusy || githubBranchRefreshing}
+                              onChange={e => setNewBranchInput(e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  void createGithubBranch(newBranchInput);
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  setIsCreatingBranch(false);
+                                  setNewBranchInput("");
+                                }
+                              }}
+                            />
+                            <div className="top-branch-create-actions">
+                              <button
+                                type="button"
+                                className="top-branch-cancel-btn"
+                                disabled={githubBranchBusy || githubBranchRefreshing}
+                                onClick={() => {
+                                  setIsCreatingBranch(false);
+                                  setNewBranchInput("");
+                                }}
+                              >
+                                Cancelar
+                              </button>
+                              <button
+                                type="button"
+                                className="top-branch-confirm-btn"
+                                disabled={githubBranchBusy || githubBranchRefreshing || !newBranchInput.trim()}
+                                onClick={() => void createGithubBranch(newBranchInput)}
+                              >
+                                {githubBranchBusy ? <Loader2 size={12} className="spin"/> : "Criar"}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <button
+                  type="button"
+                  className="navbar-publish-btn"
+                  disabled={githubCommitBusy || githubPublishBusy}
+                  onClick={handleDirectPublish}
+                  title="Publicar alterações no GitHub"
+                  aria-label={hasPendingPublication ? "Publicar Alterações" : "Publicado"}
+                >
+                  {githubCommitBusy || githubPublishBusy ? (
+                    <Loader2 size={13} className="spin" />
+                  ) : hasPendingPublication ? (
+                    <span className="navbar-publish-dot" />
+                  ) : null}
+                  <span>{githubCommitBusy || githubPublishBusy ? "Publicando..." : hasPendingPublication ? "Publicar Alterações" : "Publicado"}</span>
+                </button>
+              </div>
+            </header>
 
         {gitPendingSyncActive && (
           <div className="git-pending-sync-banner">
@@ -9562,18 +10059,28 @@ function App() {
 
         <main className={`studio ${chatCollapsed ? "chat-collapsed" : ""}`}>
           <section className="chat-panel">
-            {skillsPanelOpen ? (
+            <ConversationTools active={conversationTool} count={skillsState?.installedCount || 0} onSelect={tool => {
+              setConversationTool(tool);
+              if (tool === "history") void conversationHistory.refresh();
+              if (tool === "skills" && project) void loadSkillsState(project);
+            }}/>
+            {(conversationHistory.error || conversationHistory.conversation?.notice) && <div className="conversation-storage-notice" role="status">
+              <span>{conversationHistory.error || conversationHistory.conversation?.notice}</span>
+              {conversationHistory.error && <button type="button" onClick={() => void conversationHistory.flush().catch(() => {})}>Tentar salvar</button>}
+            </div>}
+            {conversationTool === "history" ? <ConversationHistoryPanel items={conversationHistory.history} activeId={conversationHistory.conversation?.id} loading={conversationHistory.loading || conversationChanging} blocked={conversationSwitchBlocked()} onOpen={id => void openConversation(id)} onNew={() => void openConversation(undefined, true)} onRefresh={() => void conversationHistory.refresh()}/> : skillsPanelOpen ? (
               <SkillsPanel
                 projectPath={project}
                 skillsState={skillsState}
                 isLoading={skillsLoading}
+                readOnly={conversationSwitchBlocked()}
                 onClose={() => setSkillsPanelOpen(false)}
                 onInstall={handleInstallSkill}
                 onRemove={handleRemoveSkill}
                 onRun={handleRunSkill}
               />
             ) : (
-              <div className="messages" ref={messagesRef}>
+              <div className="messages" ref={messagesRef} id="conversation-panel-chat" role="tabpanel" aria-labelledby="conversation-tool-chat">
               {messages.length === 0 && <div className={`empty ${project ? "project-empty" : "no-project-empty"}`}>
                 <div className="cat"><Sparkles size={24}/></div>
                 <h2>{project ? "O que vamos construir?" : "O que vamos construir?"}</h2>
@@ -9632,19 +10139,20 @@ function App() {
                     {message.role === "assistant" && (
                       <div className="message-actions assistant-actions">
                         <div className="message-actions-left">
-                          <button onClick={(e) => void undoAgentTask(index, e.currentTarget)} disabled={busy} title="Desfazer tarefa" aria-label="Desfazer tarefa"><Undo2 size={13}/></button>
+                          <button onClick={(e) => void undoAgentTask(index, e.currentTarget)} disabled={busy || message.restoredFromHistory} title={message.restoredFromHistory ? "O checkpoint desta tarefa não está disponível nesta sessão" : "Desfazer tarefa"} aria-label="Desfazer tarefa"><Undo2 size={13}/></button>
                           <button onClick={(e) => void copyMessage(message.text, e.currentTarget)} title="Copiar resposta" aria-label="Copiar resposta"><Copy size={13}/></button>
                           {message.durationMs !== undefined && <span className="message-duration" title="Tempo da tarefa">{formatTaskDuration(message.durationMs)}</span>}
                         </div>
                         {Boolean(message.taskId) && (
                           <button
                             className="message-timeline-btn"
+                            disabled={message.restoredFromHistory}
                             onClick={() => {
                               setTimelineTaskId(message.taskId!);
                               setWorkspaceTab("preview");
                               setTimelineOpen(true);
                             }}
-                            title="Ver detalhes da execução"
+                            title={message.restoredFromHistory ? "Os detalhes desta execução não foram persistidos" : "Ver detalhes da execução"}
                             aria-label="Ver detalhes da execução"
                           >
                             <span>Ver detalhes ›</span>
@@ -9720,6 +10228,21 @@ function App() {
             )}
 
           <div className="composer-wrap">
+            {(promptQueueSnapshot.pending.length > 0 || promptQueueSnapshot.pauseReason || promptQueueGate?.paused) && (
+              <section className="prompt-queue" aria-label="Fila de prompts deste projeto">
+                <div className="prompt-queue-head"><b>Fila de prompts · {promptQueueSnapshot.pending.length}</b>
+                  <div>{(promptQueueSnapshot.pauseReason || promptQueueGate?.paused) && <button type="button" onClick={() => void resumePromptQueues()}>{promptQueueGate?.paused ? "Retomar filas" : "Retomar fila"}</button>}
+                    {promptQueueSnapshot.pending.length > 0 && <button type="button" onClick={() => promptQueue.clearPending()}>Limpar</button>}</div>
+                </div>
+                {(promptQueueSnapshot.pauseReason || promptQueueGate?.paused) && <p role="status">{promptQueueSnapshot.pauseReason || `${promptQueueGate?.project ? promptQueueGate.project + ": " : ""}${promptQueueGate?.reason}`}</p>}
+                <ol>{promptQueueSnapshot.pending.map((item, index) => <li key={item.id}>
+                  <span className="prompt-queue-order">{index + 1}</span><div title={item.text}><span>{item.displayText || `${item.attachments.length} anexo(s)`}</span><small>{item.request.model?.modelID || "Modelo padrão"} · {item.request.planMode ? "Plan" : "Build"}{item.attachments.length ? ` · ${item.attachments.length} anexo(s)` : ""}</small></div>
+                  <button type="button" onClick={() => editQueuedPrompt(item.id)} aria-label={`Retirar prompt ${index + 1} para editar`} title="Retirar da fila para editar; o novo envio entra no final"><Pencil size={12}/></button>
+                  <button type="button" onClick={() => promptQueue.remove(item.id)} aria-label={`Remover prompt ${index + 1}`} title="Remover da fila"><X size={13}/></button>
+                </li>)}</ol>
+              </section>
+            )}
+
               <div className={`composer ${isRecordingAudio || isTranscribingAudio ? "voice-recording-mode" : ""}`}>
                 {isRecordingAudio || isTranscribingAudio ? (
                   <div className="composer-voice-recording-view">
@@ -9801,6 +10324,7 @@ function App() {
                   <>
                 <textarea
                   ref={composerRef}
+                  aria-label="Mensagem para o Neko"
                   value={input}
                   onChange={e => {
                     const value = e.target.value;
@@ -9895,8 +10419,8 @@ function App() {
                       void send();
                     }
                   }}
-                  placeholder={sessionId ? "Pergunte qualquer coisa, / para comandos, @ para contexto..." : "Crie um projeto para começar..."}
-                  disabled={!sessionId || busy}
+                  placeholder={sessionId ? pendingQuestion ? "Responda ao Neko para continuar a tarefa..." : busy || promptQueueSnapshot.active ? "Escreva o próximo prompt para adicionar à fila..." : "Pergunte qualquer coisa, / para comandos, @ para contexto..." : "Crie um projeto para começar..."}
+                  disabled={!sessionId || conversationChanging}
                   className={dragOver ? "drag-over" : ""}
                 />
                 {autocompleteMode && autocompleteItems.length > 0 && (
@@ -9926,7 +10450,7 @@ function App() {
                     className="composer-action-btn clip-btn" 
                     aria-label="Adicionar contexto ou arquivos" 
                     onClick={() => void handlePickAttachments()} 
-                    disabled={busy}
+                    disabled={!sessionId || conversationChanging}
                     title="Adicionar contexto ou arquivos"
                   >
                     <Paperclip size={16}/>
@@ -9938,7 +10462,7 @@ function App() {
                       className="composer-action-btn enhance-btn undo" 
                       aria-label="Desfazer Melhoria" 
                       onClick={handleUndoEnhance} 
-                      disabled={busy || isEnhancingPrompt} 
+                      disabled={isEnhancingPrompt} 
                       title="Desfazer melhoria e voltar ao original"
                     >
                       <Undo2 size={13}/>
@@ -9966,7 +10490,7 @@ function App() {
                       className="composer-action-btn enhance-btn" 
                       aria-label="Melhorar Prompt" 
                       onClick={() => void handleEnhancePrompt()} 
-                      disabled={busy || !input.trim()} 
+                      disabled={!input.trim()} 
                       title={geminiKeyStatus?.configured ? "Melhorar instrução com IA (Google Gemini)" : "Configurar chave Gemini para melhorar prompt"}
                     >
                       <span>Melhorar Prompt</span>
@@ -9978,7 +10502,7 @@ function App() {
                     className={`composer-action-btn voice-btn ${isRecordingAudio ? "recording" : ""} ${isTranscribingAudio ? "transcribing" : ""}`}
                     aria-label={isRecordingAudio ? "Parar gravação de voz" : isTranscribingAudio ? "Transcrevendo voz..." : "Prompt por voz"}
                     onClick={() => void handleToggleVoiceRecording()}
-                    disabled={busy || isTranscribingAudio}
+                    disabled={isTranscribingAudio}
                     title={isRecordingAudio ? "Clique para concluir e transcrever" : isTranscribingAudio ? "Transcrevendo áudio..." : geminiKeyStatus?.configured ? "Gravar prompt por voz (Google Gemini)" : "Configurar chave Gemini para gravar por voz"}
                   >
                     {isTranscribingAudio ? (
@@ -10016,26 +10540,7 @@ function App() {
                     )}
                   </button>
 
-                  <button
-                    type="button"
-                    className={`composer-action-btn skills-btn ${skillsPanelOpen ? "active" : ""}`}
-                    aria-label="Agent Skills"
-                    onClick={() => {
-                      const next = !skillsPanelOpen;
-                      setSkillsPanelOpen(next);
-                      if (next && project) {
-                        void loadSkillsState(project);
-                      }
-                    }}
-                    disabled={busy || isRecordingAudio || isTranscribingAudio}
-                    title="Agent Skills — Especialidades do Agente (Playbooks de especialista)"
-                  >
-                    <Sparkles size={13} style={{ color: "#a855f7" }} />
-                    <span>Skills</span>
-                    {skillsState?.installedCount ? (
-                      <span className="skills-badge-count">{skillsState.installedCount}</span>
-                    ) : null}
-                  </button>
+
                 </div>
 
                 <div className="composer-bar">
@@ -10049,7 +10554,7 @@ function App() {
                           }
                           return next;
                         });
-                      }} disabled={busy} aria-expanded={modelOpen} aria-label="Selecionar modelo">
+                      }} disabled={!sessionId || conversationChanging} aria-expanded={modelOpen} aria-label="Selecionar modelo">
                         <span className="spark">{selected ? <ProviderIcon id={selected.providerID} size={14}/> : <Sparkles size={14}/>}</span>
                         <span>{selected?.name || "Selecionar modelo"}</span>
                         <ChevronDown size={13}/>
@@ -10122,7 +10627,7 @@ function App() {
                       </div>}
                     </div>
 
-                    <button className="effort" onClick={() => setEffort(effort === "Low" ? "Medium" : effort === "Medium" ? "High" : "Low")} disabled={busy}>
+                    <button className="effort" onClick={() => setEffort(effort === "Low" ? "Medium" : effort === "Medium" ? "High" : "Low")} disabled={!sessionId || conversationChanging}>
                       <span>{effort}</span>
                       <ChevronDown size={13}/>
                     </button>
@@ -10132,8 +10637,8 @@ function App() {
                     <div className="chat-mode-anchor" ref={chatModeAnchorRef}>
                       <button
                         className={`chat-mode-trigger ${planMode ? "plan" : "build"}`}
-                        onClick={() => { if (!busy) setChatModeMenuOpen(v => !v); }}
-                        disabled={busy}
+                        onClick={() => setChatModeMenuOpen(v => !v)}
+                        disabled={!sessionId || conversationChanging}
                         aria-haspopup="listbox"
                         aria-expanded={chatModeMenuOpen}
                         aria-label={`Modo: ${chatModeLabel(chatMode)}`}
@@ -10155,14 +10660,13 @@ function App() {
                       )}
                     </div>
 
-                    <button 
-                      className={`send-btn ${busy ? "stop" : ""}`} 
-                      onClick={() => void (busy ? stopDevelopment() : send())} 
-                      disabled={!sessionId || (!busy && !input.trim() && attachments.length === 0)} 
-                      aria-label={busy ? "Parar desenvolvimento" : "Enviar"}
-                      title={busy ? "Parar desenvolvimento" : "Enviar"}
-                    >
-                      {busy ? <Square size={13} fill="currentColor"/> : <ArrowUp size={17}/>}
+                    {(busy || promptQueueSnapshot.active) && <button type="button" className="send-btn stop" onClick={() => void stopDevelopment()} aria-label="Parar tarefa e pausar fila" title="Parar tarefa e pausar fila"><Square size={13} fill="currentColor"/></button>}
+                    <button type="button" className="send-btn"
+                      onClick={() => void send()}
+                      disabled={!sessionId || conversationChanging || (!input.trim() && attachments.length === 0)}
+                      aria-label={pendingQuestion ? "Responder ao Neko" : busy || promptQueueSnapshot.active || promptQueueSnapshot.pending.length ? "Adicionar à fila" : "Enviar"}
+                      title={pendingQuestion ? "Responder ao Neko" : busy || promptQueueSnapshot.active || promptQueueSnapshot.pending.length ? "Adicionar à fila" : "Enviar"}>
+                      <ArrowUp size={17}/>
                     </button>
                   </div>
                 </div>
@@ -10173,7 +10677,11 @@ function App() {
           </section>
 
           <section className="workspace">
-            <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport"><iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} style={isBlockingOverlayOpen ? { pointerEvents: "none" } : undefined} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/>{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno" style={isBlockingOverlayOpen ? { pointerEvents: "none" } : undefined}/> : null}</div></div> : <PreviewLoaderView status={previewStatus} phase={previewPhase} message={previewMessage} framework={previewFramework} packageManager={previewPackageManager} onRetry={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })} onOpenLogs={() => { setTerminalOpen(true); setTerminalTab("logs"); }} />)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
+            <ProjectTabs projectOpen={Boolean(studioProjectPath)} snapshot={projectTabs} fallbackLabel={projectName || "Preview"}
+              onSelect={id => { void window.neko.tabsSelect(id).catch(error => showToast(error?.message || "Não foi possível selecionar o projeto.")); }}
+              onClose={id => { void window.neko.tabsClose(id).catch(error => showToast(error?.message || "Não foi possível fechar o projeto.")); }}
+              onOpen={() => { void openOtherProject(); }} />
+                <div className="workspace-content">{workspaceTab === "preview" ? <div className="preview-body">{timelineOpen ? <TimelineView timeline={(timelineTaskId ? taskTimelines.get(timelineTaskId) : undefined) || (timelineTaskId ? Array.from(taskTimelines.values()).find(t => t.taskId === timelineTaskId) : undefined) || (currentTaskIdRef.current ? taskTimelines.get(currentTaskIdRef.current) : undefined) || currentTaskTimelineRef.current} onBack={() => setTimelineOpen(false)} isTaskRunning={busy} /> : (!project && openingProjectPath ? <div className="preview-project-opening" role="status">{openingProjectError ? <><p>{openingProjectError}</p><button onClick={() => void openRecentProject(openingProjectPath, "ProjectTab", true)}>Tentar novamente</button></> : <><Loader2 size={28} className="spin"/><strong>Carregando {projectName}...</strong></>}</div> : previewUrl ? <div className={`browser-frame device-${device}`}><div className="browser-bar"><span className="browser-dots"><i/><i/><i/></span><span className="url">{previewEffectiveUrl || previewUrl}</span></div><div className="browser-viewport">{previewSurface === "iframe" ? <iframe key={previewFrameReloadKey} ref={previewFrameRef} title="Neko Preview" className={`preview-underlay-frame ${previewFrameReady ? "preview-frame-ready" : "preview-frame-loading"}`} style={isBlockingOverlayOpen ? { pointerEvents: "none" } : undefined} src={previewEffectiveUrl || previewUrl} onLoad={() => { const readyTimeout = setTimeout(() => setPreviewFrameReady(true), 3000); void window.neko.stylePreviewFrame().finally(() => { clearTimeout(readyTimeout); setPreviewFrameReady(true); }); }} onError={() => { appendTerminalLine("error", "Erro ao carregar preview no frame", "Preview"); setPreviewFrameReady(true); }}/> : null}{previewSurface === "webcontents" && previewOverlaySnapshot ? <img className="preview-overlay-snapshot" src={previewOverlaySnapshot.dataUrl} style={{ position: "fixed", inset: "auto", left: previewOverlaySnapshot.bounds.x / previewOverlaySnapshot.zoomFactor, top: previewOverlaySnapshot.bounds.y / previewOverlaySnapshot.zoomFactor, width: previewOverlaySnapshot.bounds.width / previewOverlaySnapshot.zoomFactor, height: previewOverlaySnapshot.bounds.height / previewOverlaySnapshot.zoomFactor }} alt="" aria-hidden="true"/> : null}{previewSurface === "webcontents" ? <div ref={previewViewHostRef} className="preview-webcontents-host" aria-label="Neko Preview interno" style={isBlockingOverlayOpen ? { pointerEvents: "none" } : undefined}/> : null}</div></div> : <PreviewLoaderView status={previewStatus} phase={previewPhase} message={previewMessage} framework={previewFramework} packageManager={previewPackageManager} onRetry={() => void window.neko.startPreview().then(preview => { if (preview?.status === "ready" && preview?.url) { setPreviewUrl(preview.url); setPreviewStatus(preview.status); if (preview.framework) setPreviewFramework(preview.framework); setPreviewLoading(false); } })} onOpenLogs={() => { setTerminalOpen(true); setTerminalTab("logs"); }} />)}</div> : <CodeWorkspace projectRoot={project} tree={tree} lastChangedFile={codeChangedFile} />}</div>
             <div className={`terminal-panel ${terminalOpen ? "open" : "closed"}`}>
               <div className="terminal-head"><div className="terminal-tabs"><button className={terminalTab === "logs" ? "active" : ""} onClick={() => { setTerminalTab("logs"); setTerminalOpen(true); }}>Logs</button><button className={terminalTab === "console" ? "active" : ""} onClick={() => { setTerminalTab("console"); setTerminalOpen(true); }}>Console</button><button className={terminalTab === "errors" ? "active" : ""} onClick={() => { setTerminalTab("errors"); setTerminalOpen(true); }}>Erros</button></div><button className="terminal-collapse" onClick={() => setTerminalOpen(v => !v)}>{terminalOpen ? <ChevronDown size={14}/> : <ChevronUp size={14}/>}</button></div>
               {terminalOpen && (terminalTab === "console" ? (
@@ -10208,6 +10716,8 @@ function App() {
             </div>
           </section>
         </main>
+          </div>
+        </div>
       </>
         ) : (
           <>
@@ -10463,7 +10973,7 @@ function App() {
       )}
 
     {modal && createPortal(
-      <div className="modal-backdrop" role="presentation" onClick={() => { console.log("[GitHub/UI] modal backdrop click — closing modal:", modal); if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "tutorials" ? "tutorials-modal" : ""} ${modal === "branchChanges" ? "branch-changes-modal" : ""} ${modal === "gitConflictResolver" ? "git-conflict-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
+      <div className="modal-backdrop" role="presentation" onClick={() => { console.log("[GitHub/UI] modal backdrop click — closing modal:", modal); if (!(modal === "siteClone" && cloneBusy)) setModal(null); }}><div className={`modal ${modal === "models" || modal === "providers" ? "provider-model-modal" : ""} ${modal === "tutorials" ? "tutorials-modal" : ""} ${modal === "branchChanges" ? "branch-changes-modal" : ""} ${modal === "gitConflictResolver" ? "git-conflict-modal" : ""}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1} onClick={e => e.stopPropagation()}>
       {modal === "tutorials" && (() => {
         const tutorials = getNekoTutorials();
         const openVideo = (tutorial: NekoTutorial) => {
@@ -10916,16 +11426,12 @@ function App() {
               {!isAccessible ? (
                 <div className="github-auth-update-needed" style={{ margin: "12px 0 16px 0" }}>
                   <div className="github-auth-update-copy">
-                    <b>Repositório não autorizado para @{githubStatus.activeAccount?.login || githubStatus.user?.login || "usuário"}</b>
+                    <b>Repositório sem acesso para @{githubStatus.activeAccount?.login || githubStatus.user?.login || "usuário"}</b>
                     <small>O projeto local possui o remote <b>{githubLinkStatus.linkedRepo}</b>, mas a conta GitHub conectada não possui acesso a ele ou o repositório ainda não foi autorizado no GitHub App.</small>
                   </div>
                   <div className="github-auth-update-actions">
-                    <button className="primary" onClick={() => {
-                      console.log("[GitHub/UI] authorize github clicked");
-                      const targetUrl = githubStatus.installUrl || "https://github.com/apps/nekoai-built-for-creators/installations/new";
-                      void window.neko.githubOpen(targetUrl);
-                    }}>
-                      <GitHubIcon size={14}/> Autorizar no GitHub
+                    <button className="primary" onClick={() => prepareGithubPublish()}>
+                      <GitHubIcon size={14}/> Publicar no GitHub
                     </button>
                     <button className="secondary" onClick={() => {
                       console.log("[GitHub/UI] add account clicked");
@@ -11488,7 +11994,7 @@ function App() {
             <p>Use o código abaixo no GitHub para autorizar o NekoAI.</p>
           </div>
           <button className="close-btn" onClick={() => {
-            const returnModal = pendingGithubIntentRef.current === "clone" ? "githubClone" : (pendingGithubIntentRef.current === "publish" ? "githubPublish" : (projectRef.current ? "github" : "githubClone"));
+            const returnModal = pendingGithubIntentRef.current?.type === "clone" ? "githubClone" : (projectRef.current ? "github" : "githubClone"); setGithubIntent(null);
             setGithubBusy(false);
             setGithubDevice(null);
             setModal(returnModal);
@@ -11510,7 +12016,7 @@ function App() {
           <div className="device-wait"><Loader2 size={15} className="spin"/> Aguardando autorização no GitHub...</div>
           {githubError && <div className="auth-error">{githubError}</div>}
           <button className="secondary" style={{ marginTop: 10 }} onClick={() => {
-            const returnModal = pendingGithubIntentRef.current === "clone" ? "githubClone" : (pendingGithubIntentRef.current === "publish" ? "githubPublish" : (projectRef.current ? "github" : "githubClone"));
+            const returnModal = pendingGithubIntentRef.current?.type === "clone" ? "githubClone" : (projectRef.current ? "github" : "githubClone"); setGithubIntent(null);
             setGithubBusy(false);
             setGithubDevice(null);
             setModal(returnModal);

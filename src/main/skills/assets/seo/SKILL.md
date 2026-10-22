@@ -1,10 +1,19 @@
 ---
 name: seo
-description: Optimize for search engine visibility and ranking. Use when asked to "improve SEO", "optimize for search", "fix meta tags", "add structured data", "sitemap optimization", or "search engine optimization".
+description: "Otimização completa para motores de busca (SEO), Open Graph e prévias sociais. Use quando o usuário pedir 'melhorar SEO', 'otimizar para busca', 'ajustar meta tags', 'aparecer no Google', 'prévia no WhatsApp/Twitter', 'Open Graph', 'robots.txt', 'sitemap.xml', 'schema markup', 'dados estruturados', 'canonical URL' ou indexação. Implementa tags essenciais, semântica e boas práticas de indexação técnica."
 license: MIT
 metadata:
   author: web-quality-skills
-  version: "2.0"
+  version: "2.1.0"
+  triggers:
+    - "melhorar SEO"
+    - "aparecer no Google"
+    - "meta tags"
+    - "sitemap"
+    - "robots.txt"
+    - "Open Graph"
+    - "prévia de link"
+    - "dados estruturados"
 ---
 
 <!-- Adapted from the original open-source skill for an agent that only reads and edits project files: the live-audit workflow, the HTTP security-headers example, the section on agent/crawler discoverability and links to sibling skills were removed; the rest is unchanged. License: see LICENSE.txt in this folder. -->
@@ -227,7 +236,7 @@ Treat title-link rewriting separately from truncation. Google may build a differ
 
 ## Structured data (JSON-LD)
 
-Read [the structured data reference](references/STRUCTURED-DATA.md) when the user requests schema markup or an audit surfaces a structured-data issue. It contains Organization, Article, Product, FAQ, and Breadcrumb examples plus validation links.
+Read [the structured data reference](.agents/skills/seo/references/STRUCTURED-DATA.md) when the user requests schema markup or an audit surfaces a structured-data issue. It contains Organization, Article, Product, FAQ, and Breadcrumb examples plus validation links.
 
 * **Describe visible, accurate content.** Do not add a type or claim solely to obtain a rich result.
 * **Use the most specific applicable type.** Keep identifiers and absolute URLs stable across renders.
@@ -350,3 +359,31 @@ body {
 
 - [Google Search Central](https://developers.google.com/search)
 - [Schema.org](https://schema.org/)
+- [Playbook de Dados Estruturados](.agents/skills/seo/references/STRUCTURED-DATA.md)
+
+---
+
+## Ciclo de Execução de Engenharia
+
+Ao implementar ou otimizar SEO em páginas ou aplicações web:
+
+1. **Inspecionar:**
+   - Analise `index.html` e os componentes de páginas/rotas (`src/pages/`, `src/components/SEO.tsx`, etc.).
+   - Verifique a presença de metatags essenciais (`<title>`, `<meta name="description">`, OpenGraph, Twitter Cards, canonical).
+   - Identifique páginas sem dados estruturados JSON-LD ou com headings fora de ordem hierárquica.
+
+2. **Planejar:**
+   - Defina os esquemas Schema.org mais adequados (Organization, WebSite, SoftwareApplication, Product, FAQPage).
+   - Mapeie palavras-chave sem canibalização e títulos atrativos dentro do limite de 50-60 caracteres.
+
+3. **Implementar:**
+   - Adicione ou atualize tags `<title>` descritivas e metatags dinâmicas.
+   - Injete blocos JSON-LD válidos via `<script type="application/ld+json">`.
+   - Adicione links canônicos absolutos e garanta headings estruturados (`<h1>` único, seguido de `<h2>` e `<h3>`).
+
+4. **Validar:**
+   - Execute o build do projeto (`npm run build` ou `vite build`) para assegurar que não haja tags JSX malformadas.
+   - Verifique a sintaxe JSON dos blocos LD+JSON para evitar erros de parsing.
+
+5. **Reportar:**
+   - Descreva as tags adicionadas, schemas implementados e orientações de rastreamento no Search Console.

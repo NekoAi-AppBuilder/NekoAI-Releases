@@ -39,11 +39,18 @@ export function normalizeActivity(type: string, props: any) {
       ? (isPartError ? "error" : isPartDone ? "completed" : "running")
       : (stage === "before" ? "running" : (props?.state?.status === "error" || Boolean(error) ? "error" : "completed"));
 
+    const skillName = tool === "skill" ? String(input?.name ?? input?.id ?? "") : undefined;
+    const playbook = path.includes(".agents/skills") || path.includes(".agents\\skills")
+      ? path.replace(/.*\.agents[/\\]skills[/\\]/, ".agents/skills/").replace(/\\/g, "/")
+      : undefined;
+
     return {
       type: "neko.activity",
       properties: {
         action: "tool",
         tool,
+        skill: skillName,
+        playbook,
         path,
         command,
         stage,

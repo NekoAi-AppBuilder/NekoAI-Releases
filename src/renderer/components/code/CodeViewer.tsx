@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { Code2 } from "lucide-react";
 import { tokenizeCode, tokenizePlainFallback } from "./highlighter";
 import type { CodeLineTokens } from "./types";
+import { useInterfaceTheme } from "../useInterfaceTheme";
 
 interface CodeViewerProps {
   filePath: string | null;
@@ -9,9 +10,10 @@ interface CodeViewerProps {
 }
 
 export const CodeViewer: React.FC<CodeViewerProps> = ({ filePath, content }) => {
+  const theme = useInterfaceTheme();
   const [lines, setLines] = useState<CodeLineTokens[]>(() => {
     if (!content) return [];
-    return tokenizePlainFallback(content);
+    return tokenizePlainFallback(content, theme);
   });
 
   useEffect(() => {
@@ -23,23 +25,23 @@ export const CodeViewer: React.FC<CodeViewerProps> = ({ filePath, content }) => 
     let isCurrent = true;
 
     // Imediatamente define fallback em texto para zero atraso visual
-    setLines(tokenizePlainFallback(content));
+    setLines(tokenizePlainFallback(content, theme));
 
     // Tokeniza com Shiki em background e aplica os tokens com syntax highlighting
-    tokenizeCode(filePath, content).then((tokenizedLines) => {
+    tokenizeCode(filePath, content, theme).then((tokenizedLines) => {
       if (isCurrent) {
         setLines(tokenizedLines);
       }
     }).catch(() => {
       if (isCurrent) {
-        setLines(tokenizePlainFallback(content));
+        setLines(tokenizePlainFallback(content, theme));
       }
     });
 
     return () => {
       isCurrent = false;
     };
-  }, [filePath, content]);
+  }, [filePath, content, theme]);
 
   // Previne atalhos de edição acidentais (ex.: Ctrl+S do navegador)
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -82,7 +84,7 @@ export const CodeViewer: React.FC<CodeViewerProps> = ({ filePath, content }) => 
                     <span
                       key={tokIdx}
                       style={{
-                        color: token.color || "#d4d4d4",
+                        color: token.color || (theme === "light" ? "#211a2d" : "#d4d4d4"),
                         fontStyle: token.fontStyle === 1 ? "italic" : "normal"
                       }}
                     >

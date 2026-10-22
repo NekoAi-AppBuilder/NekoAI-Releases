@@ -1,8 +1,8 @@
 ---
 name: cro
-description: "When the user wants to optimize, improve, or increase conversions on any marketing page or form — including homepage, landing pages, pricing pages, feature pages, lead capture forms, or contact forms. Also use when the user says 'CRO,' 'conversion rate optimization,' 'this page isn't converting,' 'improve conversions,' 'why isn't this page working,' 'my landing page sucks,' 'form abandonment,' 'nobody's converting,' 'low conversion rate,' or 'this page needs work.' Use this even if the user just shares a URL and asks for feedback."
+description: "Otimização da taxa de conversão (CRO): landing pages de alta conversão, formulários de captura de leads, hierarquia visual, proposta de valor em 5 segundos, prova social e eliminação de atrito no checkout/cadastro. Use quando o usuário disser 'página não converte', 'ninguém clica', 'taxa de conversão baixa', 'aumentar leads', 'muita gente abandona o formulário', 'melhorar checkout', 'landing page não vende', 'otimizar conversão', 'CRO' ou 'page abandonment'."
 metadata:
-  version: 2.0.0
+  version: 2.1.0
 ---
 
 <!-- Adapted from the original open-source skill for an agent that only reads and edits project files: the steps that ask the user questions, the A/B-test ideas, the measurement section and the pointers to sibling skills were removed; the rest is unchanged. License: see LICENSE.txt in this folder. -->
@@ -151,4 +151,28 @@ For key elements (headlines, CTAs), provide 2-3 alternatives with rationale.
 
 ## Form Optimization
 
-For detailed form CRO guidance — including field optimization, multi-step forms, error handling, and form-specific experiments — see [references/form.md](references/form.md).
+For detailed form CRO guidance — including field optimization, multi-step forms, error handling, and form-specific experiments — see [.agents/skills/cro/references/form.md](.agents/skills/cro/references/form.md).
+
+---
+
+## Ciclo de Execução de Engenharia
+
+Ao receber qualquer tarefa de otimização de conversão:
+
+1. **Inspecionar:**
+   - Examine os componentes da página ou formulário (`src/pages/`, `src/components/`).
+   - Identifique pontos de atrito: excesso de campos, CTAs genéricos ("Enviar"), ausência de prova social próxima à ação, ausência de garantia ou clareza de preço/benefício.
+
+2. **Planejar:**
+   - Priorize as ações: (1) Clareza da proposta de valor acima da dobra; (2) Contraste e texto do botão de ação principal; (3) Redução de campos desnecessários no formulário; (4) Inclusão de elementos de confiança (depoimentos, logos, selos).
+
+3. **Implementar:**
+   - Modifique o código da interface: aumente o destaque visual do CTA, transforme botões ambíguos em CTAs orientados a valor ("Começar Gratuitamente", "Calcular Economia"), adicione micro-copy de redução de risco ("Sem necessidade de cartão de crédito").
+   - Reduza atrito em formulários (campos opcionais removidos ou movidos para etapas posteriores).
+
+4. **Validar:**
+   - Execute o build do projeto (`npm run build` ou `vite build`) para assegurar que formulários e botões continuam disparando eventos e submit normalmente.
+   - Verifique que os botões permanecem acessíveis e visíveis em qualquer resolução (mobile/desktop).
+
+5. **Reportar:**
+   - Detalhe as melhorias implementadas no código, os pontos de atrito eliminados e as métricas de conversão que devem ser acompanhadas.

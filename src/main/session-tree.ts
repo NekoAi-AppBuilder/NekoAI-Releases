@@ -12,7 +12,8 @@ export function registerSessionParent(childSessionId: string, parentSessionId: s
 
 export function resolveRootSessionId(
   sessionId: string,
-  isKnownRoot: (sid: string) => boolean
+  isKnownRoot: (sid: string) => boolean,
+  parents: Map<string, string> = sessionParentMap
 ): string {
   if (!sessionId) return "";
   let current = sessionId;
@@ -23,7 +24,7 @@ export function resolveRootSessionId(
     if (isKnownRoot(current)) {
       return current;
     }
-    const parent = sessionParentMap.get(current);
+    const parent = parents.get(current);
     if (!parent) break;
     current = parent;
   }

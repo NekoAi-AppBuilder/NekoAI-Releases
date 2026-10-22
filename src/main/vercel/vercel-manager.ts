@@ -1,3 +1,4 @@
+import { WorkspaceObjects, serializedObject } from "../workspaces/workspace-objects";
 import { EventEmitter } from "node:events";
 import { ChildProcess } from "node:child_process";
 import path from "node:path";
@@ -281,8 +282,8 @@ export class VercelManager extends EventEmitter {
 
   public async setProject(projectPath: string | null): Promise<void> {
     const generation = ++this.projectGeneration;
-    vercelIntentManager.invalidateAll("project changed");
-    vercelLinkIntentManager.invalidateAll("project changed");
+    if (this.state.projectPath) vercelIntentManager.invalidateByPath(this.state.projectPath, "project changed");
+    if (this.state.projectPath) vercelLinkIntentManager.invalidateByPath(this.state.projectPath, "project changed");
     if (!projectPath) {
       this.setState({
         projectPath: null,
@@ -846,4 +847,5 @@ export class VercelManager extends EventEmitter {
   }
 }
 
-export const vercelManager = new VercelManager();
+const sharedVault = serializedObject(new VercelVaultManager());
+export const vercelManager = new WorkspaceObjects(() => new VercelManager(sharedVault), { events: ["state-changed", "log"], accountActions:["connect","disconnect"], accountRefresh: object=>object.initialize(), configure: ["setGitStatusGetter"], dispose: object => object.shutdown() }).proxy;

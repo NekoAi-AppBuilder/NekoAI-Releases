@@ -1,19 +1,17 @@
 ---
 name: web-design-guidelines
-description: Review UI code for Web Interface Guidelines compliance. Use when asked to "review my UI", "check accessibility", "audit design", "review UX", or "check my site against best practices".
+description: "Auditoria e correção completa de acessibilidade (a11y), navegação por teclado, foco visível, contraste, semântica HTML, touch targets e diretrizes de interface web (W3C/WCAG e Web Interface Guidelines). Use quando o usuário disser 'revisar acessibilidade', 'navegação por teclado não funciona', 'foco invisível', 'botões difíceis de clicar', 'leitor de tela não lê', 'falta aria-label', 'acessibilidade ruim', 'melhorar UX e acessibilidade' ou 'audit web design guidelines'."
 license: MIT
 metadata:
   author: vercel
-  version: "1.0.0"
+  version: "1.1.0"
 ---
 
-<!-- Adapted from the original open-source skill for an agent that only reads and edits project files: the rules, which the original skill downloads on each use, are embedded here; three items that only apply to Next.js or to English copy were removed. License: see LICENSE.txt in this folder. -->
+<!-- Adapted from the original open-source skill for an agent that reads, audits AND actively fixes project files: comprehensive rules covering accessibility, keyboard focus, semantic HTML, safe-areas and form UX. License: see LICENSE.txt in this folder. -->
 
-# Web Interface Guidelines
+# Web Interface Guidelines & Acessibilidade Ativa
 
-Review the specified files for compliance.
-
-Read files, check against rules below. Output concise but comprehensive—sacrifice grammar for brevity. High signal-to-noise.
+Audite e **corrija ativamente** o código da interface para total conformidade com acessibilidade, navegabilidade por teclado e diretrizes modernas de UX.
 
 ## Rules
 
@@ -170,26 +168,28 @@ Read files, check against rules below. Output concise but comprehensive—sacrif
 - Animated GIF when compressed video is suitable
 - Gesture-only action without tap/click and keyboard alternative
 
-## Output Format
+## Ciclo de Execução de Engenharia
 
-Group by file. Use `file:line` format (VS Code clickable). Terse findings.
+Não se limite a listar problemas: **inspecione, planeje, implemente as correções no código e valide**.
 
-```text
-## src/Button.tsx
+1. **Inspecionar:**
+   - Varra os componentes de interface (`src/components/`, `src/pages/`, etc.).
+   - Procure violações críticas: botões sem `aria-label`, `<div onClick>` sem teclado/role, inputs sem `<label>`, `:focus` removido sem substituto, textos com contraste insuficiente, imagens sem `alt` ou dimensões.
 
-src/Button.tsx:42 - icon button missing aria-label
-src/Button.tsx:18 - input lacks label
-src/Button.tsx:55 - animation missing prefers-reduced-motion
-src/Button.tsx:67 - transition: all → list properties
+2. **Planejar:**
+   - Agrupe as correções por prioridade de acessibilidade (P1: Teclado & Foco -> P2: Semântica & Labels -> P3: Touch targets e Contrastes -> P4: Animações/Reduced Motion).
+   - Mantenha a identidade visual intacta ao adicionar anéis de foco visíveis (`focus-visible:ring-2 focus-visible:ring-offset-2`).
 
-## src/Modal.tsx
+3. **Implementar:**
+   - Converta `<div onClick>` em `<button type="button">` com classes utilitárias equivalentes.
+   - Adicione `aria-label` descritivos em botões de ícone (ex: fechar modal, menu hambúrguer, carrinho).
+   - Conecte inputs aos labels via `htmlFor` e `id` ou envolvendo o input.
+   - Adicione `prefers-reduced-motion:reduce` nas animações CSS ou Tailwind (`motion-reduce:animate-none`).
+   - Garanta touch targets de pelo menos 44x44px em elementos clicáveis em mobile.
 
-src/Modal.tsx:12 - missing overscroll-behavior: contain
-src/Modal.tsx:34 - "..." → "…"
+4. **Validar:**
+   - Execute o build do projeto (`npm run build` / `vite build`).
+   - Verifique que a árvore DOM e acessibilidade não quebram funcionalidades de clique ou formulários.
 
-## src/Card.tsx
-
-✓ pass
-```
-
-State issue + location. Skip explanation unless fix non-obvious. No preamble.
+5. **Reportar:**
+   - Liste os arquivos e linhas corrigidos em formato limpo (`arquivo:linha - melhoria aplicada`), confirmando as barreiras de acessibilidade superadas.

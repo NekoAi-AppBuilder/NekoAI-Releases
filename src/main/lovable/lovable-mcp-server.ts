@@ -1,3 +1,4 @@
+import { WorkspaceObjects, concreteWorkspaceObject } from "../workspaces/workspace-objects";
 import http from "node:http";
 import crypto from "node:crypto";
 import path from "node:path";
@@ -881,4 +882,4 @@ export class LovableMcpServer {
   }
 }
 
-export const lovableMcpServer = new LovableMcpServer();
+export const lovableMcpServer = new WorkspaceObjects(() => new LovableMcpServer(concreteWorkspaceObject(lovableCloudManager)), { configure: ["setActiveSessionGetter", "setOnJitRequired"], dispose: object => object.stop() }).proxy;
